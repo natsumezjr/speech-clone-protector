@@ -12,8 +12,8 @@ export const mockTaskStatus: TaskStatusResponse = {
   progress: 1,
   stage: 'report_generation',
   message: '报告生成完成',
-  createdAt: '2024-06-01 14:21:36',
-  updatedAt: '2024-06-01 14:23:18',
+  createdAt: '2026-06-01 14:21:36',
+  updatedAt: '2026-06-01 14:23:18',
   error: null,
 }
 
@@ -24,7 +24,7 @@ export const mockResult: TaskResult = {
   dataMode: 'mock',
   verdict: '防护有效',
   score: 92.6,
-  completedAt: '2024-06-01 14:23:18',
+  completedAt: '2026-06-01 14:23:18',
   elapsedSec: 72,
   originalAudio: {
     filename: 'target_speech_demo.wav',
@@ -37,7 +37,7 @@ export const mockResult: TaskResult = {
     fingerprint: 'sha256:8f21c9a4',
   },
   protectedAudio: {
-    filename: 'protected_timbre_20240601.wav',
+    filename: 'protected_timbre_20260601.wav',
     durationSec: 12.34,
     sampleRate: 16000,
     channels: 1,
@@ -53,6 +53,8 @@ export const mockResult: TaskResult = {
     cer: 0.541,
     tokenChangeRate: 0.729,
     semanticDrift: 0.81,
+    insertRate: 0.236,
+    deleteRate: 0.184,
   },
   speaker: {
     simBefore: 0.912,
@@ -102,14 +104,14 @@ export const mockHistoryTasks: HistoryTask[] = [
   {
     taskId: 'mock-task-001',
     filename: 'target_speech_demo.wav',
-    protectedFilename: 'protected_timbre_20240601.wav',
+    protectedFilename: 'protected_timbre_20260601.wav',
     mode: 'joint',
     dataMode: 'mock',
     status: 'completed',
     wer: 0.687,
     simDropRate: 0.862,
     pesq: 3.67,
-    createdAt: '2024-06-01 14:21:36',
+    createdAt: '2026-06-01 14:21:36',
   },
   {
     taskId: 'mock-task-002',
@@ -121,7 +123,7 @@ export const mockHistoryTasks: HistoryTask[] = [
     wer: 0.714,
     simDropRate: 0.881,
     pesq: 3.44,
-    createdAt: '2024-06-02 09:17:03',
+    createdAt: '2026-06-02 09:17:03',
   },
   {
     taskId: 'mock-task-003',
@@ -133,7 +135,7 @@ export const mockHistoryTasks: HistoryTask[] = [
     wer: 0.493,
     simDropRate: 0.721,
     pesq: 4.02,
-    createdAt: '2024-06-03 16:08:44',
+    createdAt: '2026-06-03 16:08:44',
   },
   {
     taskId: 'mock-task-004',
@@ -145,6 +147,6 @@ export const mockHistoryTasks: HistoryTask[] = [
     wer: 0,
     simDropRate: 0,
     pesq: 0,
-    createdAt: '2024-06-04 11:30:12',
+    createdAt: '2026-06-04 11:30:12',
   },
 ]

@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { Panel } from '@/components/common/Panel'
 import { Spinner } from '@/components/common/Spinner'
@@ -12,6 +12,7 @@ export function HistoryPage() {
   const [search, setSearch] = useState('')
   const [status, setStatus] = useState('all')
   const [mode, setMode] = useState('all')
+  const queryClient = useQueryClient()
   const setHistoryTasks = useTaskStore((state) => state.setHistoryTasks)
   const { data = [], isLoading, error } = useQuery({
     queryKey: ['tasks'],
@@ -44,7 +45,7 @@ export function HistoryPage() {
       ) : error ? (
         <Panel className="border-red-400/25 bg-red-950/20 text-red-100">Backend 模式下获取历史任务失败：{error instanceof Error ? error.message : '未知错误'}</Panel>
       ) : (
-        <TaskTable tasks={filtered} />
+        <TaskTable tasks={filtered} onDeleted={() => void queryClient.invalidateQueries({ queryKey: ['tasks'] })} />
       )}
     </div>
   )

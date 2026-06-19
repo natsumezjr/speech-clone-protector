@@ -18,7 +18,6 @@ export const mockClient: ApiClient = {
       bitDepth: 16,
       sizeBytes: file.size,
       format: file.name.split('.').pop()?.toUpperCase() ?? 'WAV',
-      audioUrl: URL.createObjectURL(file),
       uploadedAt: new Date().toLocaleString('zh-CN', { hour12: false }),
       fingerprint: shortHash(`${file.name}-${file.size}`),
     }
@@ -33,7 +32,17 @@ export const mockClient: ApiClient = {
   },
   async getTaskResult() {
     await delay()
-    return mockResult
+    return {
+      ...mockResult,
+      originalAudio: {
+        ...mockResult.originalAudio,
+        objectUrl: URL.createObjectURL(createMockProtectedWavBlob(4, 16000, 196)),
+      },
+      protectedAudio: {
+        ...mockResult.protectedAudio,
+        objectUrl: URL.createObjectURL(createMockProtectedWavBlob(4, 16000, 284)),
+      },
+    }
   },
   async listTasks() {
     await delay()

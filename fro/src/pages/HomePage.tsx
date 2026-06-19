@@ -174,7 +174,7 @@ export function HomePage() {
           <span>全链路审计日志</span>
           <span>符合隐私安全要求</span>
         </div>
-        <span>© 2024 语音克隆防护平台</span>
+        <span>© 2026 语音克隆防护平台</span>
       </footer>
     </div>
   )
@@ -231,13 +231,13 @@ function StrategyPanel({ item }: { item: (typeof strategies)[number] }) {
     >
       <div className="flex items-center gap-3">
         <Icon className={cn('h-6 w-6 shrink-0', item.tone === 'green' ? 'text-emerald-300' : item.tone === 'blue' ? 'text-sky-300' : 'text-violet-300')} />
-        <h3 className="whitespace-nowrap text-[18px] font-black leading-5 text-white">{item.title}</h3>
-        {'tag' in item ? <span className="rounded-[5px] bg-emerald-400/18 px-2 py-1 text-xs font-bold text-emerald-200">{item.tag}</span> : null}
+        <h3 className="whitespace-nowrap text-[22px] font-black leading-5 text-white">{item.title}</h3>
+        {'tag' in item ? <span className="rounded-[5px] bg-emerald-400/18 px-2 py-1 text-sm font-bold text-emerald-200">{item.tag}</span> : null}
       </div>
-      <p className="mt-1 whitespace-nowrap text-[11px] leading-4 text-slate-300">{item.desc}</p>
+      <p className="mt-3 whitespace-nowrap text-[15px] leading-4 text-slate-300">{item.desc}</p>
       <div className="mt-2 space-y-1">
         {item.points.map((point) => (
-          <p key={point} className="flex items-center gap-2 text-[11px] leading-4 text-slate-200">
+          <p key={point} className="flex items-center gap-2 text-[15px] leading-4 text-slate-200">
             <span className={cn('h-1.5 w-1.5 rounded-full', item.tone === 'green' ? 'bg-emerald-300' : item.tone === 'blue' ? 'bg-sky-300' : 'bg-violet-300')} />
             {point}
           </p>

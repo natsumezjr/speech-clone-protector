@@ -1,7 +1,7 @@
 import type { DataMode } from '@/config/runtime'
 import type { AudioFileMeta } from './audio'
 
-export type TaskStatus = 'queued' | 'running' | 'completed' | 'failed'
+export type TaskStatus = 'queued' | 'running' | 'completed' | 'success' | 'failed' | 'error'
 export type ProtectionMode = 'standard' | 'strong' | 'high_fidelity' | 'custom' | 'joint'
 export type ProtectionTarget = 'semantic' | 'timbre'
 export type TaskStage =
@@ -52,10 +52,13 @@ export interface TaskStatusResponse {
 export interface AsrMetrics {
   originalText: string
   protectedText: string
-  wer: number
-  cer: number
-  tokenChangeRate: number
-  semanticDrift: number
+  wer?: number
+  cer?: number
+  tokenChangeRate?: number
+  tokenErrorRate?: number
+  semanticDrift?: number
+  insertRate?: number
+  deleteRate?: number
 }
 
 export interface SpeakerMetrics {
@@ -94,8 +97,21 @@ export interface TaskResult {
   dataMode: DataMode
   verdict: string
   score: number
+  createdAt?: string
+  submittedAt?: string
   completedAt: string
   elapsedSec: number
+  inputSource?: string
+  language?: string
+  processingModel?: string
+  optimizationTarget?: string
+  asrModel?: string
+  artifacts?: Array<{
+    label: string
+    filename: string
+    sizeBytes?: number
+    sizeLabel?: string
+  }>
   originalAudio: AudioFileMeta
   protectedAudio: AudioFileMeta
   asr: AsrMetrics
@@ -124,4 +140,5 @@ export interface HistoryTask {
 
 export interface UploadedFileState extends AudioFileMeta {
   objectUrl?: string
+  rawFile?: File
 }

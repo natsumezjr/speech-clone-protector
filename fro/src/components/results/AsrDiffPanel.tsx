@@ -1,7 +1,6 @@
 import { Badge } from '@/components/common/Badge'
 import { EvidenceCard } from '@/components/cards/EvidenceCard'
 import type { AsrMetrics } from '@/types/task'
-import { percent } from '@/utils/format'
 
 const protectedSegments = [
   { text: '今天', tone: 'same' },
@@ -17,6 +16,12 @@ const protectedSegments = [
 ] as const
 
 export function AsrDiffPanel({ asr }: { asr: AsrMetrics }) {
+  const editStats = getTextEditStats(asr.originalText, asr.protectedText)
+  const cer = asr.cer ?? editStats.cer
+  const tokenErrorRate = asr.tokenErrorRate ?? asr.tokenChangeRate
+  const insertRate = asr.insertRate ?? editStats.insertRate
+  const deleteRate = asr.deleteRate ?? editStats.deleteRate
+
   return (
     <EvidenceCard title="机器理解分析：ASR 转写对比">
       <div className="grid gap-4 lg:grid-cols-[1fr_280px_1fr]">
@@ -29,10 +34,12 @@ export function AsrDiffPanel({ asr }: { asr: AsrMetrics }) {
         </div>
         <div className="grid content-center gap-3">
           {[
-            ['WER', percent(asr.wer)],
-            ['CER', percent(asr.cer)],
-            ['Token 变化率', percent(asr.tokenChangeRate)],
-            ['Semantic Drift', asr.semanticDrift.toFixed(2)],
+            ['WER（词错率）', formatOptionalPercent(asr.wer)],
+            ['CER（字错率）', formatOptionalPercent(cer)],
+            ['Token 错误率', formatOptionalPercent(tokenErrorRate)],
+            ['SD（语义漂移）', formatOptionalPercent(asr.semanticDrift)],
+            ['IR（插入率）', formatOptionalPercent(insertRate)],
+            ['DR（删除率）', formatOptionalPercent(deleteRate)],
           ].map(([label, value]) => (
             <div key={label} className="rounded-xl border border-cyan-300/20 bg-cyan-300/10 p-4 text-center">
               <p className="text-sm text-slate-400">{label}</p>
@@ -68,4 +75,56 @@ export function AsrDiffPanel({ asr }: { asr: AsrMetrics }) {
       </div>
     </EvidenceCard>
   )
+}
+
+function formatOptionalPercent(value: unknown) {
+  const numberValue = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(numberValue)) return '无'
+  return `${(numberValue <= 1 ? numberValue * 100 : numberValue).toFixed(1)}%`
+}
+
+function getTextEditStats(original: string, next: string) {
+  const a = Array.from(original)
+  const b = Array.from(next)
+  if (a.length === 0) {
+    return {
+      cer: undefined,
+      insertRate: undefined,
+      deleteRate: undefined,
+    }
+  }
+
+  const dp = Array.from({ length: a.length + 1 }, () => Array<number>(b.length + 1).fill(0))
+
+  for (let i = a.length - 1; i >= 0; i -= 1) {
+    for (let j = b.length - 1; j >= 0; j -= 1) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1])
+    }
+  }
+
+  let i = 0
+  let j = 0
+  let insertions = 0
+  let deletions = 0
+
+  while (i < a.length || j < b.length) {
+    if (i < a.length && j < b.length && a[i] === b[j]) {
+      i += 1
+      j += 1
+    } else if (j < b.length && (i === a.length || dp[i][j + 1] >= dp[i + 1]?.[j])) {
+      insertions += 1
+      j += 1
+    } else if (i < a.length) {
+      deletions += 1
+      i += 1
+    }
+  }
+
+  const base = a.length
+
+  return {
+    cer: (insertions + deletions) / base,
+    insertRate: insertions / base,
+    deleteRate: deletions / base,
+  }
 }

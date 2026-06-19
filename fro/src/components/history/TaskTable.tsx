@@ -12,14 +12,18 @@ const statusText: Record<TaskStatus, string> = {
   queued: '排队中',
   running: '处理中',
   completed: '已完成',
+  success: '已完成',
   failed: '失败',
+  error: '失败',
 }
 
 const statusTone: Record<TaskStatus, 'cyan' | 'green' | 'orange' | 'red'> = {
   queued: 'cyan',
   running: 'orange',
   completed: 'green',
+  success: 'green',
   failed: 'red',
+  error: 'red',
 }
 
 const modeText: Record<string, string> = {
@@ -30,7 +34,7 @@ const modeText: Record<string, string> = {
   joint: '联合防护',
 }
 
-export function TaskTable({ tasks }: { tasks: HistoryTask[] }) {
+export function TaskTable({ tasks, onDeleted }: { tasks: HistoryTask[]; onDeleted?: () => void }) {
   const navigate = useNavigate()
   const pushToast = useAppStore((state) => state.pushToast)
 
@@ -48,6 +52,7 @@ export function TaskTable({ tasks }: { tasks: HistoryTask[] }) {
     try {
       await deleteTask(taskId)
       pushToast({ kind: 'success', title: '删除请求已提交', description: 'Mock 模式仅展示交互，Backend 模式会调用 DELETE 接口。' })
+      onDeleted?.()
     } catch (error) {
       pushToast({ kind: 'error', title: '删除失败', description: error instanceof Error ? error.message : '请检查后端接口。' })
     }
@@ -88,7 +93,7 @@ export function TaskTable({ tasks }: { tasks: HistoryTask[] }) {
                 <td className="px-4 py-4 text-slate-400">{task.createdAt}</td>
                 <td className="px-4 py-4">
                   <div className="flex gap-2">
-                    <Button variant="ghost" className="h-9 px-2" title="查看结果" onClick={() => navigate('/results/mock-task-001')}>
+                    <Button variant="ghost" className="h-9 px-2" title="查看结果" onClick={() => navigate(`/results/${task.taskId}`)}>
                       <Eye className="h-4 w-4" />
                     </Button>
                     <Button variant="ghost" className="h-9 px-2" title="下载保护音频" onClick={() => void handleDownload(task.taskId)}>

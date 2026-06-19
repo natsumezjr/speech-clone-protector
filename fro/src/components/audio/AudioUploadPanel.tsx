@@ -8,7 +8,9 @@ import { isMockMode } from '@/config/runtime'
 import { uploadFile } from '@/services/apiClient'
 import { useAppStore } from '@/store/appStore'
 import { useTaskStore } from '@/store/taskStore'
+import { formatDurationSeconds, readAudioDuration } from '@/utils/audio'
 import { formatBytes, shortHash } from '@/utils/format'
+import { AudioPlayer } from './AudioPlayer'
 import { AudioWaveform } from './AudioWaveform'
 
 const MAX_AUDIO_SIZE = 200 * 1024 * 1024
@@ -17,6 +19,10 @@ function formatDuration(totalSeconds: number) {
   const minutes = Math.floor(totalSeconds / 60)
   const seconds = totalSeconds % 60
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+}
+
+function revokeObjectUrl(url?: string) {
+  if (url?.startsWith('blob:')) URL.revokeObjectURL(url)
 }
 
 function getRecorderMimeType() {
@@ -38,6 +44,7 @@ export function AudioUploadPanel() {
   const chunksRef = useRef<BlobPart[]>([])
   const timerRef = useRef<number | null>(null)
   const recordedUrlRef = useRef<string | null>(null)
+  const uploadObjectUrlRef = useRef<string | null>(null)
 
   const [activeTab, setActiveTab] = useState<'upload' | 'record'>('upload')
   const [recording, setRecording] = useState(false)
@@ -76,6 +83,8 @@ export function AudioUploadPanel() {
       clearRecordingTimer()
       releaseRecorderStream()
       clearRecordedPreview()
+      revokeObjectUrl(uploadObjectUrlRef.current ?? undefined)
+      uploadObjectUrlRef.current = null
     }
   }, [])
 
@@ -85,31 +94,41 @@ export function AudioUploadPanel() {
       return
     }
 
+    const localObjectUrl = URL.createObjectURL(file)
+    uploadObjectUrlRef.current = localObjectUrl
+    const format = file.name.split('.').pop()?.toUpperCase() ?? file.type.split('/').pop()?.toUpperCase() ?? 'AUDIO'
+    const baseMeta = {
+      filename: file.name,
+      sizeBytes: file.size,
+      format,
+      objectUrl: localObjectUrl,
+      rawFile: file,
+      uploadedAt: new Date().toLocaleString('zh-CN', { hour12: false }),
+      fingerprint: shortHash(`${file.name}-${file.size}-${file.lastModified}`),
+    }
+
+    revokeObjectUrl(uploadedFile?.objectUrl)
+    setUploadedFile(baseMeta)
+
     try {
+      const durationSec = await readAudioDuration(localObjectUrl).catch(() => undefined)
+      const localMeta = durationSec ? { ...baseMeta, durationSec, duration: durationSec } : baseMeta
+      setUploadedFile(localMeta)
+
       if (isMockMode) {
-        setUploadedFile({
-          filename: file.name,
-          durationSec: 12.34,
-          sampleRate: 16000,
-          channels: 1,
-          bitDepth: 16,
-          sizeBytes: file.size,
-          format: file.name.split('.').pop()?.toUpperCase() ?? 'WAV',
-          objectUrl: URL.createObjectURL(file),
-          uploadedAt: new Date().toLocaleString('zh-CN', { hour12: false }),
-          fingerprint: shortHash(`${file.name}-${file.size}`),
-        })
         pushToast({
           kind: 'info',
           title: 'Mock 文件接入完成',
-          description: 'Mock 模式下仅展示文件接入状态，分析结果来自固定演示数据。',
+          description: '已使用本地音频作为预览源，分析结果来自 Mock 演示数据。',
         })
       } else {
         const meta = await uploadFile(file)
-        setUploadedFile({ ...meta, objectUrl: meta.audioUrl })
+        setUploadedFile({ ...localMeta, ...meta, objectUrl: localObjectUrl, rawFile: file })
         pushToast({ kind: 'success', title: '文件上传完成', description: '后端已返回文件元数据。' })
       }
     } catch (error) {
+      setUploadedFile(null)
+      revokeObjectUrl(localObjectUrl)
       pushToast({ kind: 'error', title: '音频接入失败', description: error instanceof Error ? error.message : '请检查后端服务。' })
     }
   }
@@ -272,7 +291,7 @@ export function AudioUploadPanel() {
                 <PlayCircle className="h-4 w-4" />
                 {recordedName}
               </div>
-              <audio className="w-full" controls src={recordedUrl} />
+              <AudioPlayer src={recordedUrl} title="录音预览" filename={recordedName ?? undefined} />
             </div>
           ) : null}
 
@@ -293,10 +312,10 @@ export function AudioUploadPanel() {
           </div>
           <AudioWaveform dense />
           <div className="mt-4 grid grid-cols-2 gap-3 text-xs text-slate-300">
-            <span>时长：{uploadedFile.durationSec}s</span>
-            <span>采样率：{uploadedFile.sampleRate / 1000}kHz</span>
-            <span>声道：{uploadedFile.channels}</span>
-            <span>位深：{uploadedFile.bitDepth} bit</span>
+            <span>时长：{formatDurationSeconds(uploadedFile.durationSec)}</span>
+            <span>采样率：{uploadedFile.sampleRate ? `${uploadedFile.sampleRate / 1000}kHz` : '待后端解析'}</span>
+            <span>声道：{uploadedFile.channels ?? '待后端解析'}</span>
+            <span>位深：{uploadedFile.bitDepth ? `${uploadedFile.bitDepth} bit` : '待后端解析'}</span>
             <span>大小：{formatBytes(uploadedFile.sizeBytes)}</span>
             <span>上传：{uploadedFile.uploadedAt}</span>
           </div>
@@ -312,7 +331,7 @@ export function AudioUploadPanel() {
                 <FileAudio className="h-4 w-4" />
                 播放预览
               </div>
-              <audio className="w-full" controls src={uploadedFile.objectUrl} />
+              <AudioPlayer src={uploadedFile.objectUrl} title="播放预览" filename={uploadedFile.filename} />
             </div>
           ) : (
             <Button variant="secondary" className="mt-4 w-full" icon={<FileAudio className="h-4 w-4" />}>

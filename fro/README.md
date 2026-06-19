@@ -39,12 +39,13 @@ VITE_API_BASE_URL=http://localhost:8000
 - `mock` 模式完全使用前端固定模拟数据，不调用任何后端 API。
 - `backend` 模式完全使用后端 API，不会自动 fallback 到 mock。
 - 两种模式互斥，避免一次任务中混用演示数据和真实后端数据。
+- 当前阶段不接入任务状态轮询，也不接入 SSE。任务创建成功后直接进入结果页，后续进度机制会统一设计。
 
 ## 页面说明
 
 - `/`：首页，展示项目定位、系统流程、三类核心策略、KPI 与作品亮点。
-- `/workspace`：防护工作台，支持音频接入展示、策略配置、任务创建与进度模拟。
-- `/results/:taskId`：结果分析，展示音频对比、ASR 转写 diff、声纹分析、心理声学曲线、综合趋势和导出动作。
+- `/workspace`：防护工作台，支持音频上传/录音接入、策略配置与任务创建；当前不做轮询或定时进度推进。
+- `/results/:taskId`：结果分析，展示音频对比、ASR 转写 diff、六项 ASR 指标、声纹分析、心理声学曲线、综合趋势和导出动作。
 - `/history`：历史任务，支持搜索、状态筛选、模式筛选、查看结果、下载保护音频和删除接口预留。
 
 ## API 对接说明
@@ -68,6 +69,24 @@ VITE_API_BASE_URL=http://localhost:8000
 - `GET /api/tasks/{taskId}/export/csv`
 - `GET /api/tasks/{taskId}/download/evidence`
 
+当前 API 进度：
+
+- `POST /api/files/upload`：backend 模式下上传音频时调用；mock 模式只保存本地预览状态。
+- `POST /api/tasks/protect`：已保留调用；创建成功后直接跳转 `/results/:taskId`。
+- `GET /api/tasks/{taskId}`：接口契约保留，但当前前端不轮询、不定时查询。
+- `GET /api/tasks/{taskId}/events`：SSE 仅文档预留，当前未接入。
+- `GET /api/tasks/{taskId}/result`：结果页读取任务结果，ASR 指标按字段优先、可计算 fallback、否则显示“无”。
+- `POST /api/reports/export`、`GET /api/tasks/{taskId}/export/csv`、`GET /api/tasks/{taskId}/download/evidence`：按钮和 client 预留，当前不生成真实 PDF / CSV / ZIP。
+
+结果页 ASR 区域展示六项指标：
+
+- `WER（词错率）`
+- `CER（字错率）`
+- `Token 错误率`
+- `SD（语义漂移）`
+- `IR（插入率）`
+- `DR（删除率）`
+
 ## 已实现功能
 
 - Vite + React + TypeScript 项目结构。
@@ -78,9 +97,11 @@ VITE_API_BASE_URL=http://localhost:8000
 - React Query 管理结果和历史任务请求。
 - react-hook-form + zod 校验防护策略参数。
 - ECharts 图表：趋势图、雷达图、心理声学阈值曲线。
+- 浏览器录音输入已接入前端闭环：MediaRecorder 录音、生成 File、本地预览，并在 backend 模式下复用上传链路。
+- 结果页 ASR 转写对比区域已展示 6 项指标；缺字段时安全显示“无”，CER / IR / DR 可基于文本 diff 做 fallback。
 - Mock 模式生成合法 WAV Blob，并支持结果页与历史页下载 `protected_voice_mock.wav`。
 - PDF / CSV / ZIP 导出按钮保留接口并给出 toast 提示。
 
 ## 实现边界
 
-前端不实现真实语音防护算法，不调用真实 ASR / TTS / LLM，不包含登录系统，也不提供 Python 后端。页面中的语义漂移、声纹相似度和心理声学指标均为前端演示数据，用于说明系统闭环和评估证据链。
+前端不实现真实语音防护算法，不调用真实 ASR / TTS / LLM，不包含登录系统，也不提供 Python 后端。当前不实现任务状态轮询、SSE、历史任务持久化、PDF / CSV / ZIP 文件生成。页面中的语义漂移、声纹相似度和心理声学指标均为前端演示数据，用于说明系统闭环和评估证据链。

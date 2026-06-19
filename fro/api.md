@@ -13,14 +13,23 @@ http://localhost:8000
 
 api.md 中也明确写了 Base URL 和接口列表。
 
+当前阶段进度（2026-06-19）：
+
+- 当前仓库仍定位为前端原型，不新增后端工程，不实现真实算法。
+- mock/backend 双模式保留；backendClient 继续作为后端 API 预留调用层。
+- WorkspacePage 已删除任务状态轮询、定时推进和周期性 getTaskStatus 调用。
+- mock 模式下创建任务成功后直接进入结果页；backend 模式下创建任务成功后也直接跳转结果页，不在前端主动轮询状态。
+- ResultsPage 的 ASR 转写对比区域已更新为 6 个指标：WER、CER、Token 错误率、SD、IR、DR。
+- PDF / CSV / ZIP、SSE、历史任务持久化、真实 ASR/TTS/声纹/PESQ/SNR/心理声学算法仍不在当前阶段实现范围内。
+
 2. 前后端接口总表
 
 当前 api.md 已列出这些后端预留接口：文件上传、创建防护任务、查询任务状态、查询任务结果、下载保护音频、历史任务、删除任务、导出报告、导出 CSV、下载证据包，以及 SSE 事件流预留。
 
 接口	方法	前端用途	当前状态
 /api/files/upload	POST	上传音频文件，获得 fileId 和音频元信息	后端预留，前端已写调用
-/api/tasks/protect	POST	创建语音防护任务	后端预留，前端已写调用
-/api/tasks/{taskId}	GET	查询任务状态	后端预留，前端已写调用
+/api/tasks/protect	POST	创建语音防护任务	后端预留，前端已写调用；创建成功后直接跳结果页
+/api/tasks/{taskId}	GET	查询任务状态	后端预留；当前前端不轮询、不定时查询
 /api/tasks/{taskId}/events	GET	SSE 实时任务进度	仅文档预留，前端尚未接入
 /api/tasks/{taskId}/result	GET	查询任务分析结果	后端预留，前端已写调用
 /api/tasks/{taskId}/download/protected-audio	GET	下载保护音频	前端 mock 已实现；backend 预留
@@ -39,11 +48,11 @@ Content-Type: multipart/form-data
 
 file: File
 
-前端上传组件限制单文件不超过 200MB，并展示支持 .wav / .mp3 / .flac / .m4a；mock 模式下只展示文件接入状态，分析结果仍来自固定 mock 数据。
+前端上传组件限制单文件不超过 200MB，并展示支持 .wav / .mp3 / .flac / .m4a / .webm；mock 模式下只展示文件接入状态，分析结果仍来自固定 mock 数据。
 
 响应示例
 {
-  "fileId": "file_20240601_0001",
+  "fileId": "file_20260601_0001",
   "filename": "target_speech_demo.wav",
   "durationSec": 12.34,
   "sampleRate": 16000,
@@ -51,8 +60,8 @@ file: File
   "bitDepth": 16,
   "sizeBytes": 1880000,
   "format": "WAV",
-  "audioUrl": "http://localhost:8000/static/audio/file_20240601_0001.wav",
-  "uploadedAt": "2024-06-01 14:21:36",
+  "audioUrl": "http://localhost:8000/static/audio/file_20260601_0001.wav",
+  "uploadedAt": "2026-06-01 14:21:36",
   "fingerprint": "sha256:8f21c9a4"
 }
 后端需要返回的关键点
@@ -65,7 +74,7 @@ POST /api/tasks/protect
 Content-Type: application/json
 请求 JSON 示例
 {
-  "fileId": "file_20240601_0001",
+  "fileId": "file_20260601_0001",
   "mode": "standard",
   "targets": ["semantic", "timbre"],
   "semantic": {
@@ -110,7 +119,7 @@ timbre
 
 响应 JSON 示例
 {
-  "taskId": "task_20240601_142136",
+  "taskId": "task_20260601_142136",
   "status": "queued"
 }
 3.3 查询任务状态
@@ -118,13 +127,13 @@ timbre
 GET /api/tasks/{taskId}
 响应 JSON 示例
 {
-  "taskId": "task_20240601_142136",
+  "taskId": "task_20260601_142136",
   "status": "running",
   "progress": 0.62,
   "stage": "perturbation_optimization",
   "message": "正在进行扰动优化",
-  "createdAt": "2024-06-01 14:21:36",
-  "updatedAt": "2024-06-01 14:22:41",
+  "createdAt": "2026-06-01 14:21:36",
+  "updatedAt": "2026-06-01 14:22:41",
   "error": null
 }
 状态枚举
@@ -144,37 +153,47 @@ report_generation
 progress 建议使用 0 到 1 的浮点数。
 stage 用固定枚举，不要直接返回中文，中文由前端映射。
 
+当前前端进度
+
+该接口仍保留在 ApiClient 类型与 backendClient/mockClient 中，但 WorkspacePage 当前不再主动轮询 GET /api/tasks/{taskId}，也不再用定时器模拟任务进度。
+
+当前阶段的页面行为是：
+
+- mock 模式：createProtectionTask 成功后，前端直接设置本地 completed 状态并跳转结果页；
+- backend 模式：createProtectionTask 成功后，前端直接跳转 /results/{taskId}，由结果页读取 /api/tasks/{taskId}/result；
+- 后续任务进度机制会统一设计，本阶段不接轮询、不接 SSE。
+
 3.4 SSE 任务事件流
 请求
 GET /api/tasks/{taskId}/events
 Accept: text/event-stream
 
-这个接口目前只在 api.md 中作为“预留接口”出现。 当前前端主要还是用定时推进 / 查询状态的方式，尚未正式接入 SSE。
+这个接口目前只在 api.md 中作为“预留接口”出现。当前前端没有接入 SSE，也没有接入轮询或定时推进。后续任务进度机制会统一设计。
 
 SSE 事件示例
 event: task_progress
-data: {"taskId":"task_20240601_142136","status":"running","progress":0.35,"stage":"encoder_loading","message":"正在加载语义编码器与音色编码器"}
+data: {"taskId":"task_20260601_142136","status":"running","progress":0.35,"stage":"encoder_loading","message":"正在加载语义编码器与音色编码器"}
 
 event: task_progress
-data: {"taskId":"task_20240601_142136","status":"running","progress":0.72,"stage":"psychoacoustic_constraint","message":"正在进行心理声学约束优化"}
+data: {"taskId":"task_20260601_142136","status":"running","progress":0.72,"stage":"psychoacoustic_constraint","message":"正在进行心理声学约束优化"}
 
 event: task_completed
-data: {"taskId":"task_20240601_142136","status":"completed","progress":1,"stage":"report_generation","message":"任务完成"}
+data: {"taskId":"task_20260601_142136","status":"completed","progress":1,"stage":"report_generation","message":"任务完成"}
 3.5 查询任务结果
 请求
 GET /api/tasks/{taskId}/result
 响应 JSON 示例
 {
-  "taskId": "task_20240601_142136",
+  "taskId": "task_20260601_142136",
   "status": "completed",
   "mode": "joint",
   "dataMode": "backend",
   "verdict": "防护有效",
   "score": 92.6,
-  "completedAt": "2024-06-01 14:23:18",
+  "completedAt": "2026-06-01 14:23:18",
   "elapsedSec": 72,
   "originalAudio": {
-    "fileId": "file_20240601_0001",
+    "fileId": "file_20260601_0001",
     "filename": "target_speech_demo.wav",
     "durationSec": 12.34,
     "sampleRate": 16000,
@@ -182,12 +201,12 @@ GET /api/tasks/{taskId}/result
     "bitDepth": 16,
     "sizeBytes": 1880000,
     "format": "WAV",
-    "audioUrl": "http://localhost:8000/static/audio/file_20240601_0001.wav",
-    "uploadedAt": "2024-06-01 14:21:36",
+    "audioUrl": "http://localhost:8000/static/audio/file_20260601_0001.wav",
+    "uploadedAt": "2026-06-01 14:21:36",
     "fingerprint": "sha256:8f21c9a4"
   },
   "protectedAudio": {
-    "fileId": "protected_20240601_0001",
+    "fileId": "protected_20260601_0001",
     "filename": "protected_voice.wav",
     "durationSec": 12.34,
     "sampleRate": 16000,
@@ -195,8 +214,8 @@ GET /api/tasks/{taskId}/result
     "bitDepth": 16,
     "sizeBytes": 1900000,
     "format": "WAV",
-    "audioUrl": "http://localhost:8000/static/audio/protected_20240601_0001.wav",
-    "uploadedAt": "2024-06-01 14:23:18",
+    "audioUrl": "http://localhost:8000/static/audio/protected_20260601_0001.wav",
+    "uploadedAt": "2026-06-01 14:23:18",
     "fingerprint": "sha256:42ae19d0"
   },
   "asr": {
@@ -205,7 +224,10 @@ GET /api/tasks/{taskId}/result
     "wer": 0.687,
     "cer": 0.541,
     "tokenChangeRate": 0.729,
-    "semanticDrift": 0.81
+    "tokenErrorRate": 0.729,
+    "semanticDrift": 0.81,
+    "insertRate": 0.236,
+    "deleteRate": 0.184
   },
   "speaker": {
     "simBefore": 0.912,
@@ -266,7 +288,41 @@ GET /api/tasks/{taskId}/result
 }
 注意
 
-当前 mock 数据中已经有这些字段：asr、speaker、quality、charts.psychoacoustic、charts.trend、charts.radarBefore、charts.radarAfter。 后端需要尽量对齐这个结构，否则结果页组件会缺字段。
+当前 mock 数据中已经有这些字段：asr、speaker、quality、charts.psychoacoustic、charts.trend、charts.radarBefore、charts.radarAfter。 后端需要尽量对齐这个结构，否则结果页组件会进入兼容 fallback。
+
+ASR 指标当前展示规则
+
+结果页 ASR 转写对比区域中间展示 6 个指标，两行三列：
+
+1. WER（词错率）
+2. CER（字错率）
+3. Token 错误率
+4. SD（语义漂移）
+5. IR（插入率）
+6. DR（删除率）
+
+字段优先级：
+
+- WER：优先 result.asr.wer；没有字段时显示“无”。
+- CER：优先 result.asr.cer；没有字段但 originalText/protectedText 都存在时，前端用字符级编辑距离计算 fallback；否则显示“无”。
+- Token 错误率：优先 result.asr.tokenErrorRate；没有时兼容 result.asr.tokenChangeRate；两个字段都没有时显示“无”。前端不会从文本自行计算 Token 错误率。
+- SD：优先 result.asr.semanticDrift；没有字段时显示“无”。前端不会用 WER/CER 伪造语义漂移。
+- IR：优先 result.asr.insertRate；没有字段但 originalText/protectedText 都存在时，前端用字符级 diff 计算 fallback；否则显示“无”。
+- DR：优先 result.asr.deleteRate；没有字段但 originalText/protectedText 都存在时，前端用字符级 diff 计算 fallback；否则显示“无”。
+
+当前 TypeScript 兼容字段：
+
+{
+  "originalText": "string",
+  "protectedText": "string",
+  "wer": "number | optional",
+  "cer": "number | optional",
+  "tokenChangeRate": "number | optional",
+  "tokenErrorRate": "number | optional",
+  "semanticDrift": "number | optional",
+  "insertRate": "number | optional",
+  "deleteRate": "number | optional"
+}
 
 3.6 下载保护音频
 请求
@@ -293,7 +349,7 @@ GET /api/tasks
 响应 JSON 示例
 [
   {
-    "taskId": "task_20240601_142136",
+    "taskId": "task_20260601_142136",
     "filename": "target_speech_demo.wav",
     "protectedFilename": "protected_voice.wav",
     "mode": "joint",
@@ -302,10 +358,10 @@ GET /api/tasks
     "wer": 0.687,
     "simDropRate": 0.862,
     "pesq": 3.67,
-    "createdAt": "2024-06-01 14:21:36"
+    "createdAt": "2026-06-01 14:21:36"
   },
   {
-    "taskId": "task_20240602_091703",
+    "taskId": "task_20260602_091703",
     "filename": "campus_interview.wav",
     "protectedFilename": "protected_voice.wav",
     "mode": "strong",
@@ -314,7 +370,7 @@ GET /api/tasks
     "wer": 0.714,
     "simDropRate": 0.881,
     "pesq": 3.44,
-    "createdAt": "2024-06-02 09:17:03"
+    "createdAt": "2026-06-02 09:17:03"
   }
 ]
 前端页面行为
@@ -331,7 +387,7 @@ DELETE /api/tasks/{taskId}
 
 {
   "success": true,
-  "taskId": "task_20240601_142136",
+  "taskId": "task_20260601_142136",
   "message": "任务已删除"
 }
 当前前端行为
@@ -344,11 +400,11 @@ POST /api/reports/export
 Content-Type: application/json
 请求 JSON 示例
 {
-  "taskId": "task_20240601_142136"
+  "taskId": "task_20260601_142136"
 }
 响应
 Content-Type: application/pdf
-Content-Disposition: attachment; filename="voice_protection_report_task_20240601_142136.pdf"
+Content-Disposition: attachment; filename="voice_protection_report_task_20260601_142136.pdf"
 
 返回 PDF Blob。
 
@@ -361,7 +417,7 @@ Content-Disposition: attachment; filename="voice_protection_report_task_20240601
 GET /api/tasks/{taskId}/export/csv
 响应
 Content-Type: text/csv
-Content-Disposition: attachment; filename="task_20240601_142136_metrics.csv"
+Content-Disposition: attachment; filename="task_20260601_142136_metrics.csv"
 
 CSV 示例内容：
 
@@ -369,7 +425,10 @@ metric,value
 wer,0.687
 cer,0.541
 tokenChangeRate,0.729
+tokenErrorRate,0.729
 semanticDrift,0.81
+insertRate,0.236
+deleteRate,0.184
 simBefore,0.912
 simAfter,0.126
 simDropRate,0.862
@@ -384,11 +443,11 @@ mosLqo,3.82
 GET /api/tasks/{taskId}/download/evidence
 响应
 Content-Type: application/zip
-Content-Disposition: attachment; filename="task_20240601_142136_evidence.zip"
+Content-Disposition: attachment; filename="task_20260601_142136_evidence.zip"
 
 建议 ZIP 包结构：
 
-task_20240601_142136_evidence/
+task_20260601_142136_evidence/
   original.wav
   protected.wav
   result.json
@@ -401,28 +460,36 @@ task_20240601_142136_evidence/
 
 当前也是接口预留。
 
-4. 后端最小实现建议
+4. 当前阶段 API 对接进度
 
-如果现在要补一个最小 FastAPI 后端，建议先实现这 5 个接口即可：
+当前阶段只维护前端原型和 API 契约，不新增后端目录，不实现 FastAPI / Express / SQLite / 文件存储 / SSE 服务。
 
-POST /api/files/upload
-POST /api/tasks/protect
-GET /api/tasks/{taskId}
-GET /api/tasks/{taskId}/result
-GET /api/tasks/{taskId}/download/protected-audio
+已完成：
 
-剩下的历史任务、删除、PDF、CSV、ZIP、SSE 可以第二步补。
+- mock/backend 双 client 结构保留。
+- backendClient 继续保留 API 调用路径，便于后续接入真实后端。
+- uploadFile(file) 链路保留，backend 模式下会调用 POST /api/files/upload。
+- createProtectionTask(payload) 链路保留，backend 模式下会调用 POST /api/tasks/protect。
+- getTaskResult(taskId) 链路保留，结果页会调用 GET /api/tasks/{taskId}/result。
+- downloadProtectedAudio(taskId) 链路保留，结果页和历史页可调用 GET /api/tasks/{taskId}/download/protected-audio。
+- 结果页 ASR 指标已改成 6 项安全展示，并兼容缺字段。
+- mock 数据已补齐 wer、cer、tokenChangeRate、semanticDrift、insertRate、deleteRate，保证演示完整。
 
-最小后端数据流：
+当前刻意不做：
 
-上传音频
-→ 返回 fileId
-→ 创建任务
-→ 返回 taskId
-→ 后端模拟/执行防护
-→ 生成 protected wav
-→ 返回 result JSON
-→ 提供 protected-audio 下载
+- 不实现后端服务。
+- 不实现真实算法。
+- 不接 SSE。
+- 不接轮询。
+- 不实现 PDF / CSV / ZIP 导出文件生成。
+- 不实现历史任务持久化。
+- 不实现登录与权限。
+
+任务状态接口当前只作为契约保留：
+
+- /api/tasks/{taskId} 仍在 ApiClient 中存在；
+- WorkspacePage 当前不主动调用该接口；
+- 后续任务进度机制会统一设计后再接入。
 5. 当前还没有实现或存在问题的功能
 5.1 没有真实后端
 
@@ -454,25 +521,33 @@ T-SemAttack 真实语义扰动；
 
 当前这些都是 mock 展示数据。
 
-5.3 录音输入没有实现
+5.3 录音输入已接入前端闭环
 
-上传面板里有“录音输入”tab，但点击后只是提示“录音输入接口预留”，页面文案也写“后续可接入浏览器录音与实时上传能力”。
-
-未实现：
+当前前端已实现浏览器录音输入：
 
 浏览器麦克风权限申请；
 MediaRecorder 录音；
-录音波形；
-录音上传；
-录音转任务。
-5.4 SSE 实时进度没有实现
+停止录音后生成 File；
+生成本地 object URL 供即时预览；
+复用 uploadFile(file) 上传链路；
+Backend 模式下上传成功后保留后端返回的 fileId/audioUrl；
+录音文件可作为后续创建保护任务的输入。
 
-api.md 只把 /api/tasks/{taskId}/events 标为 SSE 事件流预留。
+仍未实现：
+
+真实录音波形分析；
+录音分段上传；
+服务端录音格式转码。
+5.4 任务进度机制暂未实现
+
+api.md 只把 /api/tasks/{taskId}/events 标为 SSE 事件流预留，/api/tasks/{taskId} 状态查询接口也仅作为后端契约保留。
 
 未实现：
 
 前端 EventSource 接入；
 后端事件推送；
+前端任务状态轮询；
+前端定时模拟任务推进；
 任务阶段实时日志；
 loss / progress / stage 实时流式更新。
 5.5 PDF / CSV / ZIP 导出没有真实实现
@@ -496,24 +571,21 @@ API 鉴权；
 
 目前右上角“评委用户”只是展示。
 
-5.7 历史任务“查看结果”存在硬编码问题
+5.7 历史任务查看结果已使用真实 taskId
 
-历史任务表格里，点击查看结果会固定跳转到：
-
-/results/mock-task-001
-
-而不是跳转到当前行的 task.taskId。
-
-这会导致：
-
-mock-task-002 / mock-task-003 无法查看自己的详情；
-backend 模式下历史任务列表即使返回真实 taskId，也无法打开对应结果；
-多任务闭环不完整。
-
-建议修改为：
+历史任务表格里，点击查看结果现在会跳转到：
 
 navigate(`/results/${task.taskId}`)
-5.8 后端错误与任务失败细节还不够细
+
+删除任务成功后也会 invalidate/refetch 历史任务列表。
+
+仍可继续增强：
+
+删除二次确认；
+批量删除；
+历史任务详情抽屉；
+按创建时间/评分排序。
+5.8 后端错误与任务失败细节后续可增强
 
 当前任务状态接口有 error 字段，但前端展示还比较粗。建议后端未来返回更细的错误结构：
 
@@ -534,11 +606,11 @@ navigate(`/results/${task.taskId}`)
 模型加载失败；
 后端任务超时；
 结果文件丢失。
-5.9 缺少真实文件持久化与任务持久化规范
+5.9 真实文件持久化与任务持久化当前不实现
 
 当前接口定义了 fileId 和 taskId，但还没有后端存储规范。
 
-建议后端补：
+如果后续进入后端阶段，可再设计类似结构：
 
 uploads/
   fileId.wav
@@ -557,24 +629,12 @@ files
 tasks
 task_events
 task_results
-6. 下一步实现优先级
+6. 下一步前端优先级
 
-建议按这个顺序补：
+当前不规划后端实现。下一步如果继续做前端，建议只围绕展示稳定性和契约清晰度推进：
 
-修复历史任务查看结果硬编码
-navigate('/results/mock-task-001') 改成 navigate(/results/${task.taskId})。
-写最小 FastAPI 后端
-先返回与 mockResult 同结构的数据。
-先跑通 backend 模式闭环。
-实现真实文件上传和保护音频下载
-上传保存原始音频。
-生成或复制一个 protected wav。
-返回真实 blob。
-实现任务状态轮询
-queued → running → completed。
-先不用 SSE。
-接入真实算法
-先接一个最小保护脚本。
-后续再接 E2E-VGuard / T-SemAttack 分支。
-最后补 PDF / CSV / ZIP / SSE
-这些是展示增强，不是第一优先级。
+1. 清理页面中仍然写死的 mock-task-001 入口，区分演示入口和真实任务入口。
+2. 将结果页 artifacts 展示从 fallback 文案逐步改成后端字段优先、缺失时清晰显示“未生成”。
+3. 将导出按钮在 mock/backend 不可用时统一成明确禁用态或明确 toast，不让用户误以为文件已经真实生成。
+4. 将 API 状态卡片从“可切换假状态”改成只读展示当前 VITE_DATA_MODE 与 VITE_API_BASE_URL。
+5. 继续保持 pnpm build 通过，并用缺字段结果数据验证“无”值展示。

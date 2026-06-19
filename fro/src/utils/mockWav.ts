@@ -1,4 +1,4 @@
-export function createMockProtectedWavBlob(durationSec = 4, sampleRate = 16000) {
+export function createMockProtectedWavBlob(durationSec = 4, sampleRate = 16000, baseFrequency = 226) {
   const channels = 1
   const bitsPerSample = 16
   const bytesPerSample = bitsPerSample / 8
@@ -24,7 +24,7 @@ export function createMockProtectedWavBlob(durationSec = 4, sampleRate = 16000) 
   for (let index = 0; index < samples; index += 1) {
     const t = index / sampleRate
     const envelope = 0.35 + 0.15 * Math.sin(2 * Math.PI * 1.7 * t)
-    const carrier = Math.sin(2 * Math.PI * 226 * t) + 0.42 * Math.sin(2 * Math.PI * 341 * t)
+    const carrier = Math.sin(2 * Math.PI * baseFrequency * t) + 0.42 * Math.sin(2 * Math.PI * (baseFrequency * 1.51) * t)
     const shimmer = 0.08 * Math.sin(2 * Math.PI * 17 * t)
     const value = Math.max(-1, Math.min(1, (carrier * envelope + shimmer) * 0.18))
     view.setInt16(44 + index * 2, value * 0x7fff, true)
