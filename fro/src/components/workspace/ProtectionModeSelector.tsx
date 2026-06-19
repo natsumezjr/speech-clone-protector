@@ -15,15 +15,15 @@ interface ProtectionModeSelectorProps {
 
 export function ProtectionModeSelector({ value, onChange }: ProtectionModeSelectorProps) {
   return (
-    <div className="grid gap-3 sm:grid-cols-2">
+    <div className="grid gap-3 sm:grid-cols-4">
       {protectionModes.map((mode) => (
         <button
           type="button"
           key={mode.value}
           onClick={() => onChange(mode.value)}
           className={cn(
-            'rounded-xl border p-4 text-left transition hover:border-cyan-300/50 hover:bg-cyan-300/8',
-            value === mode.value ? 'border-cyan-300/60 bg-cyan-300/10' : 'border-white/10 bg-slate-950/35',
+            'rounded-lg border p-4 text-left transition hover:border-sky-300/50 hover:bg-sky-300/8',
+            value === mode.value ? 'border-cyan-300/60 bg-sky-300/12' : 'border-white/10 bg-[#050a19]/65',
           )}
         >
           <div className="flex items-center justify-between gap-2">

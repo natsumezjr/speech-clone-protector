@@ -11,7 +11,7 @@ export function RadarChart({ before, after }: RadarChartProps) {
     legend: { data: ['防护前', '防护后'], textStyle: { color: '#cbd5e1' }, top: 0 },
     radar: {
       radius: '64%',
-      indicator: ['音色相似度', '基频特征', '共振峰特征', '韵律特征', '声道特征'].map((name) => ({ name, max: 1 })),
+      indicator: ['Feature 相似度', '基频特征', '共振峰特征', '韵律特征', '声道特征'].map((name) => ({ name, max: 1 })),
       axisName: { color: '#cbd5e1' },
       splitLine: { lineStyle: { color: 'rgba(148,163,184,0.18)' } },
       splitArea: { areaStyle: { color: ['rgba(15,23,42,0.4)', 'rgba(15,23,42,0.18)'] } },

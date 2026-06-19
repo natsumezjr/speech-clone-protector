@@ -4,7 +4,7 @@ const originalText =
   '今天天气很好，我们一起去公园散步吧。沿着湖边走，你可以看到很多漂亮的花，微风吹过来，感觉非常舒服。我们找个地方坐下，聊聊最近的生活和工作，放松一下心情。'
 
 const protectedText =
-  '今天石头很蓝，我们一路去公元散不唬。船长胡边走，你可以买到很多漂多的画，未分叫过来，甘觉非等似醒。我们转个地放坐下，聊聊最没的生高和工件，放松一下先青。'
+  '今天石头很硬，我们一躺去公元跳呀。船长胡边走，你可以买到很多漂多的面，未分叫过来，甘戈羊等似腿。我们转个地放坐下，聊聊最没的生离和工作，放松一下先青。'
 
 export const mockTaskStatus: TaskStatusResponse = {
   taskId: 'mock-task-001',
@@ -37,7 +37,7 @@ export const mockResult: TaskResult = {
     fingerprint: 'sha256:8f21c9a4',
   },
   protectedAudio: {
-    filename: 'protected_voice_mock.wav',
+    filename: 'protected_timbre_20240601.wav',
     durationSec: 12.34,
     sampleRate: 16000,
     channels: 1,
@@ -102,7 +102,7 @@ export const mockHistoryTasks: HistoryTask[] = [
   {
     taskId: 'mock-task-001',
     filename: 'target_speech_demo.wav',
-    protectedFilename: 'protected_voice_mock.wav',
+    protectedFilename: 'protected_timbre_20240601.wav',
     mode: 'joint',
     dataMode: 'mock',
     status: 'completed',

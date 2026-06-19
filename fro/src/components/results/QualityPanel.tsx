@@ -14,7 +14,7 @@ export function QualityPanel({ result }: { result: TaskResult }) {
       <div className="grid gap-5 lg:grid-cols-[0.8fr_1.2fr]">
         <div className="grid content-start gap-3">
           {metrics.map(([label, value, level]) => (
-            <div key={label} className="rounded-xl border border-white/10 bg-slate-950/45 p-4">
+            <div key={label} className="rounded-xl border border-white/10 bg-[#050a19]/70 p-5">
               <p className="text-xs text-slate-400">{label}</p>
               <p className="mt-2 text-2xl font-bold text-cyan-100">{value}</p>
               <p className="mt-1 text-xs text-emerald-200">{level}</p>

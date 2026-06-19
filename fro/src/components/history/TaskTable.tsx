@@ -54,20 +54,16 @@ export function TaskTable({ tasks }: { tasks: HistoryTask[] }) {
   }
 
   if (tasks.length === 0) {
-    return (
-      <div className="rounded-2xl border border-white/10 bg-slate-900/50 p-10 text-center text-slate-400">
-        暂无匹配任务
-      </div>
-    )
+    return <div className="ui-card p-10 text-center text-slate-400">暂无匹配任务</div>
   }
 
   return (
-    <div className="overflow-hidden rounded-2xl border border-white/10 bg-slate-900/55">
+    <div className="ui-card overflow-hidden">
       <div className="overflow-x-auto">
         <table className="w-full min-w-[980px] text-left text-sm">
-          <thead className="border-b border-white/10 bg-slate-950/50 text-xs uppercase text-slate-400">
+          <thead className="border-b border-cyan-300/10 bg-slate-950/32 text-xs uppercase text-slate-400">
             <tr>
-              {['任务 ID', '文件名', '防护模式', '数据模式', '状态', 'WER', '声纹相似度下降', 'PESQ', '创建时间', '操作'].map((head) => (
+              {['任务 ID', '文件名', '防护模式', '数据模式', '状态', 'WER', 'Feature 相似度下降', 'PESQ', '创建时间', '操作'].map((head) => (
                 <th key={head} className="px-4 py-3 font-medium">
                   {head}
                 </th>
@@ -76,7 +72,7 @@ export function TaskTable({ tasks }: { tasks: HistoryTask[] }) {
           </thead>
           <tbody>
             {tasks.map((task) => (
-              <tr key={task.taskId} className="border-b border-white/6 hover:bg-white/[0.03]">
+              <tr key={task.taskId} className="border-b border-cyan-300/8 hover:bg-cyan-400/[0.035]">
                 <td className="px-4 py-4 font-mono text-xs text-cyan-100">{task.taskId}</td>
                 <td className="px-4 py-4 text-white">{task.filename}</td>
                 <td className="px-4 py-4 text-slate-300">{modeText[task.mode]}</td>

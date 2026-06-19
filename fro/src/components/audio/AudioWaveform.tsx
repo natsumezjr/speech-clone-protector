@@ -23,7 +23,7 @@ export function AudioWaveform({ dense = false, variant = 'cyan' }: AudioWaveform
           return (
             <span
               key={index}
-              className={cn('w-full rounded-full bg-gradient-to-t opacity-80', color)}
+              className={cn('min-w-[2px] flex-1 rounded-full bg-gradient-to-t opacity-80', color)}
               style={{ height: `${Math.min(76, height)}%` }}
             />
           )

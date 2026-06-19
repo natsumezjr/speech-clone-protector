@@ -83,14 +83,14 @@ export function ParameterForm({ onSubmitTask, running }: ParameterFormProps) {
   const backendBlocked = isBackendMode && !uploadedFile?.fileId
 
   return (
-    <Panel>
+    <Panel className="h-full border-sky-400/24 bg-[#071226]/88">
       <div className="mb-5 flex items-center justify-between">
-        <h2 className="text-lg font-semibold text-white">防护策略配置</h2>
+        <h2 className="text-2xl font-bold text-white">防护策略配置</h2>
         <Badge tone={isMockMode ? 'cyan' : 'orange'}>{isMockMode ? 'Mock 模式' : 'Backend 模式'}</Badge>
       </div>
-      <form className="space-y-6" onSubmit={handleSubmit(submit)}>
+      <form className="space-y-5" onSubmit={handleSubmit(submit)}>
         <section>
-          <h3 className="mb-3 text-sm font-semibold text-slate-200">保护模式</h3>
+          <h3 className="mb-3 text-base font-bold text-slate-200">保护模式</h3>
           <Controller
             control={control}
             name="mode"
@@ -99,7 +99,7 @@ export function ParameterForm({ onSubmitTask, running }: ParameterFormProps) {
         </section>
 
         <section>
-          <h3 className="mb-3 text-sm font-semibold text-slate-200">防护目标</h3>
+          <h3 className="mb-3 text-base font-bold text-slate-200">防护目标</h3>
           <Controller
             control={control}
             name="targets"
@@ -110,18 +110,21 @@ export function ParameterForm({ onSubmitTask, running }: ParameterFormProps) {
 
         <section className="grid gap-4 md:grid-cols-3">
           <label className="space-y-2 text-sm">
-            <span className="text-slate-300">epsilon / 扰动强度</span>
-            <input className="w-full rounded-lg border border-white/10 bg-slate-950/60 px-3 py-2 text-white" type="number" step="0.01" {...register('epsilon')} />
+            <span className="text-slate-300">ε / 扰动强度</span>
+            <input className="w-full rounded-lg border border-white/10 bg-[#050a19] px-3 py-2.5 text-white" type="number" step="0.01" {...register('epsilon')} />
             {errors.epsilon ? <span className="text-xs text-red-200">范围 0.01 到 0.2</span> : null}
           </label>
           <label className="space-y-2 text-sm">
             <span className="text-slate-300">优化轮数 Steps</span>
-            <input className="w-full rounded-lg border border-white/10 bg-slate-950/60 px-3 py-2 text-white" type="number" {...register('steps')} />
+            <input className="w-full rounded-lg border border-white/10 bg-[#050a19] px-3 py-2.5 text-white" type="number" {...register('steps')} />
             {errors.steps ? <span className="text-xs text-red-200">范围 1 到 500</span> : null}
           </label>
           <label className="space-y-2 text-sm">
-            <span className="text-slate-300">心理声学权重 lambdaPsy</span>
-            <input className="w-full rounded-lg border border-white/10 bg-slate-950/60 px-3 py-2 text-white" type="number" step="0.01" {...register('lambdaPsy')} />
+            <span className="text-slate-300">
+              <span className="font-serif italic tracking-normal text-cyan-100">λ<sub>psy</sub></span>
+              <span className="ml-1">/ 心理声学权重</span>
+            </span>
+            <input className="w-full rounded-lg border border-white/10 bg-[#050a19] px-3 py-2.5 text-white" type="number" step="0.01" {...register('lambdaPsy')} />
             {errors.lambdaPsy ? <span className="text-xs text-red-200">范围 0 到 1</span> : null}
           </label>
         </section>
@@ -131,18 +134,18 @@ export function ParameterForm({ onSubmitTask, running }: ParameterFormProps) {
           高级选项
         </button>
         {showAdvanced ? (
-          <section className="rounded-2xl border border-white/10 bg-slate-950/35 p-4">
+          <section className="rounded-xl border border-white/10 bg-[#050a19]/60 p-4">
             <div className="grid gap-4 md:grid-cols-2">
               <label className="space-y-2 text-sm">
                 <span className="text-slate-300">ASR 模型</span>
-                <select className="w-full rounded-lg border border-white/10 bg-slate-950/80 px-3 py-2 text-white" {...register('asrModel')}>
+                <select className="w-full rounded-lg border border-white/10 bg-[#050a19] px-3 py-2.5 text-white" {...register('asrModel')}>
                   <option>Whisper-large-v3</option>
                   <option>Paraformer-large</option>
                 </select>
               </label>
               <label className="space-y-2 text-sm">
-                <span className="text-slate-300">Timbre 模式</span>
-                <select className="w-full rounded-lg border border-white/10 bg-slate-950/80 px-3 py-2 text-white" {...register('timbreMode')}>
+                <span className="text-slate-300">Feature 模式</span>
+                <select className="w-full rounded-lg border border-white/10 bg-[#050a19] px-3 py-2.5 text-white" {...register('timbreMode')}>
                   <option value="untargeted">Untargeted</option>
                   <option value="targeted">Targeted</option>
                 </select>
@@ -158,7 +161,7 @@ export function ParameterForm({ onSubmitTask, running }: ParameterFormProps) {
           </section>
         ) : null}
 
-        <div className="rounded-xl border border-cyan-300/20 bg-cyan-300/8 p-4 text-xs leading-5 text-cyan-50">
+        <div className="rounded-xl border border-sky-300/20 bg-sky-400/8 p-4 text-xs leading-5 text-cyan-50">
           {isMockMode
             ? 'Mock 模式：使用本地固定模拟数据，快速展示平台流程与评估结果，不调用后端。'
             : 'Backend 模式：调用后端服务执行真实防护流程，结果来自后端返回。两种模式互斥，不混合数据。'}
@@ -167,10 +170,10 @@ export function ParameterForm({ onSubmitTask, running }: ParameterFormProps) {
         {backendBlocked ? <p className="text-sm text-amber-200">Backend 模式下必须先上传文件并获得 fileId 后才能创建任务。</p> : null}
 
         <div className="flex flex-col gap-3 sm:flex-row">
-          <Button disabled={running || backendBlocked} type="submit" icon={<Play className="h-4 w-4" />}>
+          <Button className="h-12 flex-1 text-base" disabled={running || backendBlocked} type="submit" icon={<Play className="h-4 w-4" />}>
             开始生成保护音频
           </Button>
-          <Button disabled={running || (!isMockMode && backendBlocked)} type="submit" variant="secondary" icon={<TestTube2 className="h-4 w-4" />}>
+          <Button className="h-12 flex-1 text-base" disabled={running || (!isMockMode && backendBlocked)} type="submit" variant="secondary" icon={<TestTube2 className="h-4 w-4" />}>
             使用 Mock 数据演示
           </Button>
         </div>

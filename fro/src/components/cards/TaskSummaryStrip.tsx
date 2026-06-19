@@ -14,16 +14,16 @@ export function TaskSummaryStrip({ result }: { result: TaskResult }) {
   ]
 
   return (
-    <Panel className="grid gap-3 p-4 sm:grid-cols-2 lg:grid-cols-7">
+    <Panel className="grid gap-3 border-sky-400/22 bg-[#071226]/88 p-5 sm:grid-cols-2 lg:grid-cols-7">
       {items.map(([label, value]) => (
-        <div key={label} className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
-          <p className="text-xs text-slate-400">{label}</p>
+        <div key={label} className="rounded-xl border border-white/10 bg-white/[0.04] p-4">
+          <p className="text-sm text-slate-400">{label}</p>
           {label === '综合判定' ? (
             <Badge tone="green" className="mt-2">
               {value}
             </Badge>
           ) : (
-            <p className="mt-2 truncate text-sm font-semibold text-white">{value}</p>
+            <p className="mt-2 truncate text-base font-bold text-white">{value}</p>
           )}
         </div>
       ))}

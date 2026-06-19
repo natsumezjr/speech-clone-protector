@@ -33,6 +33,14 @@ select {
   font: inherit;
 }
 
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
 a {
   color: inherit;
   text-decoration: none;
@@ -54,4 +62,104 @@ a {
 
 ::-webkit-scrollbar-track {
   background: rgba(15, 23, 42, 0.85);
+}
+
+.ui-card {
+  border: 1px solid rgba(56, 189, 248, 0.16);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(9, 31, 54, 0.88), rgba(4, 19, 35, 0.9)),
+    #061528;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.035),
+    0 18px 42px rgba(0, 0, 0, 0.2);
+}
+
+.ui-card-strong {
+  border-color: rgba(0, 174, 240, 0.34);
+  background:
+    radial-gradient(circle at 70% 12%, rgba(0, 174, 240, 0.16), transparent 36%),
+    linear-gradient(180deg, rgba(7, 31, 55, 0.95), rgba(3, 18, 33, 0.96));
+}
+
+.scan-panel {
+  background:
+    radial-gradient(circle at 48% 44%, rgba(0, 166, 239, 0.35), transparent 24%),
+    radial-gradient(circle at 52% 48%, rgba(19, 214, 255, 0.18), transparent 35%),
+    linear-gradient(180deg, rgba(4, 18, 33, 0.02), rgba(4, 18, 33, 0.74));
+}
+
+.cyan-button {
+  color: #041223;
+  background: linear-gradient(180deg, #22d3ee 0%, #0ea5e9 100%);
+  box-shadow: 0 0 28px rgba(14, 165, 233, 0.38);
+}
+
+.metric-glow {
+  background:
+    linear-gradient(180deg, rgba(9, 31, 54, 0.88), rgba(5, 23, 42, 0.88)),
+    radial-gradient(circle at 86% 100%, rgba(0, 174, 240, 0.12), transparent 44%);
+}
+
+.hero-shield-float {
+  animation: hero-shield-float 4.8s ease-in-out infinite;
+}
+
+.hero-scene-crop {
+  -webkit-mask-image:
+    linear-gradient(90deg, transparent 0%, rgba(0, 0, 0, 0.72) 12%, #000 25%, #000 75%, rgba(0, 0, 0, 0.72) 88%, transparent 100%),
+    linear-gradient(180deg, #000 0%, #000 68%, rgba(0, 0, 0, 0.58) 84%, transparent 100%);
+  mask-image:
+    linear-gradient(90deg, transparent 0%, rgba(0, 0, 0, 0.72) 12%, #000 25%, #000 75%, rgba(0, 0, 0, 0.72) 88%, transparent 100%),
+    linear-gradient(180deg, #000 0%, #000 68%, rgba(0, 0, 0, 0.58) 84%, transparent 100%);
+  -webkit-mask-composite: source-in;
+  mask-composite: intersect;
+}
+
+.hero-scene-layer {
+  opacity: 0.9;
+  filter: saturate(1.16) brightness(1.08) drop-shadow(0 0 26px rgba(14, 165, 233, 0.42));
+  mix-blend-mode: screen;
+}
+
+.wave-bars rect {
+  animation: wave-bar-pulse 1.55s ease-in-out infinite;
+}
+
+.chart-draw {
+  stroke-dasharray: 220;
+  stroke-dashoffset: 220;
+  animation: chart-draw 2.6s ease-out infinite;
+}
+
+@keyframes hero-shield-float {
+  0%,
+  100% {
+    transform: translateX(-50%) translateY(0);
+  }
+  50% {
+    transform: translateX(-50%) translateY(-7px);
+  }
+}
+
+@keyframes wave-bar-pulse {
+  0%,
+  100% {
+    transform: scaleY(0.78);
+    filter: brightness(0.9);
+  }
+  50% {
+    transform: scaleY(1.18);
+    filter: brightness(1.3);
+  }
+}
+
+@keyframes chart-draw {
+  0% {
+    stroke-dashoffset: 220;
+  }
+  42%,
+  100% {
+    stroke-dashoffset: 0;
+  }
 }

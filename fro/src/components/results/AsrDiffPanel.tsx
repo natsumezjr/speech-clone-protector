@@ -19,13 +19,13 @@ const protectedSegments = [
 export function AsrDiffPanel({ asr }: { asr: AsrMetrics }) {
   return (
     <EvidenceCard title="机器理解分析：ASR 转写对比">
-      <div className="grid gap-4 lg:grid-cols-[1fr_240px_1fr]">
-        <div className="rounded-xl border border-white/10 bg-slate-950/45 p-4">
+      <div className="grid gap-4 lg:grid-cols-[1fr_280px_1fr]">
+        <div className="rounded-xl border border-white/10 bg-[#050a19]/70 p-5">
           <div className="mb-3 flex items-center justify-between">
             <h3 className="text-sm font-semibold text-white">原始转写</h3>
             <Badge tone="green">清晰语义</Badge>
           </div>
-          <p className="text-sm leading-7 text-slate-200">{asr.originalText}</p>
+          <p className="text-base leading-8 text-slate-200">{asr.originalText}</p>
         </div>
         <div className="grid content-center gap-3">
           {[
@@ -34,18 +34,18 @@ export function AsrDiffPanel({ asr }: { asr: AsrMetrics }) {
             ['Token 变化率', percent(asr.tokenChangeRate)],
             ['Semantic Drift', asr.semanticDrift.toFixed(2)],
           ].map(([label, value]) => (
-            <div key={label} className="rounded-xl border border-cyan-300/20 bg-cyan-300/8 p-3 text-center">
-              <p className="text-xs text-slate-400">{label}</p>
-              <p className="mt-1 text-lg font-bold text-cyan-100">{value}</p>
+            <div key={label} className="rounded-xl border border-cyan-300/20 bg-cyan-300/10 p-4 text-center">
+              <p className="text-sm text-slate-400">{label}</p>
+              <p className="mt-1 text-2xl font-black text-cyan-100">{value}</p>
             </div>
           ))}
         </div>
-        <div className="rounded-xl border border-white/10 bg-slate-950/45 p-4">
+        <div className="rounded-xl border border-white/10 bg-[#050a19]/70 p-5">
           <div className="mb-3 flex items-center justify-between">
             <h3 className="text-sm font-semibold text-white">保护后转写</h3>
             <Badge tone="orange">语义漂移</Badge>
           </div>
-          <p className="text-sm leading-7 text-slate-200">
+          <p className="text-base leading-8 text-slate-200">
             {protectedSegments.map((segment, index) => (
               <span
                 key={`${segment.text}-${index}`}

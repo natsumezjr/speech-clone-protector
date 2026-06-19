@@ -42,9 +42,7 @@ export function HistoryPage() {
           <Spinner />
         </Panel>
       ) : error ? (
-        <Panel className="border-red-400/25 bg-red-950/20 text-red-100">
-          Backend 模式下获取历史任务失败：{error instanceof Error ? error.message : '未知错误'}
-        </Panel>
+        <Panel className="border-red-400/25 bg-red-950/20 text-red-100">Backend 模式下获取历史任务失败：{error instanceof Error ? error.message : '未知错误'}</Panel>
       ) : (
         <TaskTable tasks={filtered} />
       )}

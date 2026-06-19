@@ -1,372 +1,577 @@
-你是一个资深前端工程师。请从零创建一个前端项目，项目名称为“语音克隆防护平台”。这是一个面向“全国大学生信息安全竞赛作品赛”评委展示的 Web 前端原型，用于展示主动式语音克隆防护系统。你没有读过项目文档和论文，因此下面会给出完整背景、功能范围、技术栈、页面设计、接口设计和实现边界。请严格按要求实现。
+你现在要继续修改仓库 `speech-clone-protector/fro` 前端。当前页面能运行，但视觉和交互没有达到目标图标准。本次任务不是重新做一个抽象风格，而是**精确按目标图的布局、信息密度、艺术字、居中方式和弹窗交互进行重构**。
 
-一、项目背景
+请先阅读现有项目结构，再修改。不要删除已有 Mock/API 双模式，不要破坏现有下载保护音频功能。
 
-本项目是一个“发布前源头防护”的语音安全平台。目标不是检测已经生成的深度伪造音频，而是在用户公开发布自己的语音前，对原始语音注入人耳不明显感知的保护扰动，使未授权语音克隆系统、ASR 系统或基于 LLM 的语音系统难以稳定提取原始说话人的语义内容和音色身份特征。
+一、本次必须完成的硬性功能
 
-平台面向评委展示，因此重点是“系统闭环”和“可解释可视化”，不是普通的上传文件工具。前端需要清晰展示：
+1. 录音输入必须真实实现
 
-1. 原始音频进入系统。
-2. 系统执行语义防护和音色防护。
-3. 系统加入心理声学约束，使扰动尽量不影响人耳听感。
-4. 输出保护音频。
-5. 展示机器语义理解被干扰、声纹相似度下降、听感质量仍可接受。
-6. 支持下载保护音频。
-7. 支持后续快速对接真实后端 API。
+* 不能再只是“接口预留”。
+* 点击“录音输入”tab 后，展示真实录音面板。
+* 使用浏览器系统麦克风能力：
 
-二、技术背景说明
+  * `navigator.mediaDevices.getUserMedia({ audio: true })`
+  * `MediaRecorder`
+* 必须支持：
 
-请把下面的概念转化为前端页面中的模块、文案、指标和图表，不需要实现真实算法。
+  * 请求麦克风权限
+  * 开始录音
+  * 停止录音
+  * 重录
+  * 录音计时
+  * 录音完成后试听
+  * 录音完成后生成 Blob/File，并作为音频输入源
+* 录音结果要与上传文件走同一套后续任务流程。
+* 如果用户拒绝麦克风权限，显示清晰错误提示，不要页面崩溃。
+* 如果浏览器不支持 MediaRecorder，显示“不支持浏览器录音，请使用上传音频”。
 
-1. 语义防护
+2. 历史任务必须区分 Mock / API 模式
 
-现代 ASR、语音大模型和 LLM-based TTS 通常会先通过 speech tokenizer 或语义编码器，把连续语音波形转换为语义表示或离散 token。研究表明，微小扰动可能导致 tokenizer 编码结果发生明显偏移，使 ASR 或 LALM 的语义理解结果出现错误。
+* Mock 模式下，历史任务可以硬编码。
+* API 模式下，历史任务必须通过接口动态获取，不能继续使用 mock 历史任务。
+* API 模式下：
 
-前端表达方式：
+  * `GET /api/tasks` 获取历史任务列表
+  * `DELETE /api/tasks/{taskId}` 删除任务
+  * 下载按钮调用后端下载接口
+  * 查看结果跳转 `/results/${task.taskId}`
+* 历史任务表格里的“查看结果”不能再固定跳转 `/results/mock-task-001`。
 
-* 使用“语义防护”“语义分支”“ASR / Tokenizer / LALM 理解干扰”等词。
-* 展示 ASR 转写对比。
-* 展示 WER、CER、Token 变化率、Semantic Drift Score 等 mock 指标。
-* 页面中可以出现 S3 Tokenizer、HuBERT、Whisper、MFCC 等作为“代理语义编码器”标签，但只作为展示，不做真实推理。
+3. 暂不实现 SSE / WebSocket / 事件推送
 
-2. 音色防护
+* 不要实现 `/api/tasks/{taskId}/events`。
+* 任务执行过程使用：
 
-语音克隆系统需要从参考音频中提取说话人的音色、声纹、风格或 speaker embedding。防护系统通过扰动音色相关特征，使机器难以稳定建模原始说话人身份。
+  * loading modal
+  * 前端状态机
+  * backend 模式下轮询 `GET /api/tasks/{taskId}`
+* 如果后端没有返回具体阶段，就显示“处理中，请稍后”。
 
-前端表达方式：
+4. 音频上传和生成保护音频时必须弹出白色加载框
+   这是本次必须实现的交互，不是可选项。
 
-* 使用“音色防护”“声纹相似度下降”“Speaker Embedding”“Timbre Encoder”等词。
-* 展示原始音频和保护音频的声纹相似度变化。
-* 展示 SIM 分数、Embedding Distance、雷达图等 mock 指标。
-* 可出现 WavLM、ECAPA-TDNN、CosyVoice Encoder、Style Encoder 等展示标签，但不做真实推理。
+上传音频时：
 
-3. 心理声学约束
+* 用户选择文件、拖拽文件，或者录音完成后点击“使用该录音”时，立即弹出居中的白色加载框。
+* 弹窗样式：
 
-防护扰动不能明显破坏人耳听感。系统会尽量把扰动隐藏在人耳不敏感的时间-频率区域内，兼顾安全性和可用性。
+  * 背景遮罩：黑色半透明，`rgba(0,0,0,0.45)`
+  * 弹窗主体：白色卡片，宽 420px，高 220px 左右
+  * 圆角：20px
+  * 阴影：大范围柔和阴影
+  * 中间是蓝色旋转 loading 圈
+  * 标题：`音频上传中`
+  * 副标题：`正在解析音频元信息，请稍后...`
+  * 下面可以显示小字：`请勿关闭页面`
+* Mock 模式：
 
-前端表达方式：
+  * 至少显示 600ms 到 1000ms，模拟上传解析。
+  * 弹窗消失后展示已上传文件卡片。
+* API 模式：
 
-* 使用“心理声学约束”“听感保真”“掩蔽阈值”“不可感知性”等词。
-* 展示 SNR、PESQ、MOS-LQO 等 mock 指标。
-* 展示扰动谱低于掩蔽阈值的可视化曲线。
+  * 弹窗一直显示到 `/api/files/upload` 成功或失败。
+  * 成功后关闭弹窗。
+  * 失败后关闭弹窗并显示错误 toast。
 
-4. E2E-VGuard 相关思想
+生成保护音频时：
 
-该方向强调端到端语音克隆场景。攻击者可能只上传无标注音频，后端自动 ASR 转写，再进行 TTS 训练或零样本克隆。因此防护需要同时考虑：
+* 用户点击“开始生成保护音频”或“使用 Mock 数据演示”后，弹出白色加载框。
+* 弹窗样式同上传弹窗，但文案不同：
 
-* 音色身份保护。
-* ASR / pronunciation / 语义理解干扰。
-* 心理声学约束。
-* 黑盒迁移展示。
-* 商业 API / 开源 WebUI 风险场景。
+  * 标题：`正在生成保护音频`
+  * 副标题根据阶段变化：
 
-5. T-SemAttack 相关思想
+    * `文件预处理中...`
+    * `编码器加载中...`
+    * `扰动优化中...`
+    * `心理声学约束处理中...`
+    * `结果评估中...`
+    * `报告生成中...`
+  * 蓝色 spinner 必须持续旋转
+  * 下方显示当前阶段小标签，例如 `阶段 3 / 6`
+* Mock 模式：
 
-该方向强调 speech tokenizer 本身是语音大模型链路中的安全瓶颈。微小扰动会造成语义编码器表示漂移、token 变化、LALM 注意力失衡，最终导致 ASR 或 LALM 语义理解错误。
+  * 用 4 到 8 秒模拟完整流程。
+  * 弹窗内阶段文案逐步变化。
+  * 完成后自动跳转 `/results/mock-task-001`。
+* API 模式：
 
-前端需要借鉴这个思想，将“语义分支”从单纯 ASR 攻击扩展为：
+  * 先调用 `POST /api/tasks/protect`。
+  * 成功拿到 `taskId` 后，轮询 `GET /api/tasks/{taskId}`。
+  * 任务 completed 后关闭弹窗并跳转 `/results/${taskId}`。
+  * 任务 failed 后关闭弹窗并显示失败原因。
+* 不要只在按钮上转圈，必须是页面中央白色弹窗 + 蓝色转圈。
 
-* Speech Tokenizer Encoder
-* HuBERT
-* Whisper
-* MFCC
-* Representation Loss
-* Semantic Drift
-* Error Tokens
-* ASR / LALM Understanding
+建议新增组件：
 
-但注意：只做前端展示，不做真实攻击算法，不实现真实模型调用。
+* `GlobalLoadingModal`
+* props:
 
-三、项目目标
+  * `open`
+  * `title`
+  * `description`
+  * `stageLabel`
+  * `progressText`
+  * `mode: "upload" | "protect"`
+* 该组件放在全局层级，保证所有页面都能调用。
 
-从零创建一个可运行的 Vite 前端项目。技术栈固定为：
+二、总体视觉重构目标
 
-* React
-* TypeScript
-* Vite
-* pnpm
-* Tailwind CSS
-* shadcn/ui
-* lucide-react
-* @tanstack/react-query
-* zustand
-* react-hook-form
-* zod
-* axios
-* wavesurfer.js
-* echarts
+当前页面的问题：
 
-项目必须支持两种数据模式：
+* 首页主视觉不够，像普通卡片堆砌。
+* 防护工作台左侧上传区下方大量留白。
+* 页面内容没有严格居中。
+* 大标题没有艺术字效果。
+* 卡片高度、间距、边界没有统一。
+* 工作台和结果页没有目标图中的高信息密度。
+* 目标图的“科技安全大屏 + 企业级平台”质感没有还原。
 
-1. mock 模式
+本次要改成：
 
-   * 完全使用前端 mock 数据。
-   * 不调用任何后端 API。
-   * 所有页面、图表、任务状态、结果数据都来自本地 mock。
-   * 下载保护音频必须实现，可以通过前端生成一个 mock WAV Blob 或使用 public 目录中的 demo wav。
-   * mock 就是 mock，不要混用用户真实上传音频和 mock 分析结果。
+* 深色赛博安全 + 企业级平台风格
+* 页面最大宽度居中
+* 卡片高密度排列
+* 每个页面都有明确视觉中心
+* 大标题具备艺术字效果
+* 所有区块对齐
+* 没有大片无意义空白
+* 上传、录音、任务执行都有明确状态反馈
 
-2. backend 模式
+三、全局布局规则
 
-   * 所有数据通过后端 API 获取。
-   * 前端只留出接口和 API client，不需要后端真实存在。
-   * 后端不可用时显示清晰错误提示。
-   * 不要自动 fallback 到 mock，避免混淆。
-   * 下载保护音频通过后端下载接口获取。
+1. 页面基础容器
 
-模式通过环境变量控制：
+* 全局背景：深蓝黑渐变
 
-VITE_DATA_MODE=mock
-VITE_API_BASE_URL=http://localhost:8000
+  * `#020617`
+  * `#07111f`
+  * `#0b1220`
+* 页面主内容最大宽度：
 
-要求：
+  * 首页：`max-width: 1560px`
+  * 工作台：`max-width: 1520px`
+  * 结果页：`max-width: 1520px`
+  * 历史页：`max-width: 1520px`
+* 主内容必须水平居中：
 
-* 如果 VITE_DATA_MODE=mock，使用 mockClient。
-* 如果 VITE_DATA_MODE=backend，使用 backendClient。
-* 禁止在一次任务中同时使用 mock 数据和 backend 数据。
-* UI 可以显示当前模式，但不要让用户误以为 mock 和 backend 可以混合运行。
+  * `margin: 0 auto`
+* 左右 padding：
 
-四、页面范围
+  * 大屏 `32px`
+  * 中屏 `24px`
+  * 小屏 `16px`
 
-实现 4 个页面：
+2. 顶部导航
+   高度：`72px`
 
-1. 首页 `/`
-2. 防护工作台 `/workspace`
-3. 结果分析 `/results/:taskId`
-4. 历史任务 `/history`
+结构：
 
-不做登录页。右上角可以保留“评委用户”作为展示身份。登录接口可以预留类型和 API client 方法，但不实现页面和认证流程。
+* 左侧宽约 `330px`
 
-五、整体视觉风格
+  * Logo 48x48
+  * 标题：语音克隆防护平台
+  * 副标题：发布前源头防护
+  * V2.0 badge
+* 中间导航居中
 
-采用“A 深色赛博安全 + B 企业级隐私保护平台”的混合风格。
+  * 首页
+  * 防护工作台
+  * 结果分析
+  * 历史任务
+* 右侧宽约 `330px`
 
-关键词：
+  * 系统防护中
+  * 通知 icon
+  * 评委用户
 
-* 深色背景
-* 深蓝、黑蓝、青色、蓝色、绿色为主
-* 少量紫色和橙色强调
-* 卡片式布局
-* 玻璃态 / 半透明 panel
-* 细边框
-* 轻微 glow
-* 声波、盾牌、token、网络节点、频谱图元素
-* 评委视角：专业、可信、完整、可解释
-* 不要做成游戏 UI 或过度黑客风
-* 不要使用夸张 emoji
-* 不要使用花哨动效影响可读性
+样式：
 
-页面应有统一顶栏：
+* 顶栏背景：`rgba(2, 6, 23, 0.82)`
+* backdrop blur
+* 底部边框：`1px solid rgba(56,189,248,0.12)`
+* 当前导航项：
 
-左侧：
+  * 青蓝下划线
+  * 背景轻微高亮
+  * 边框发光
+* 不要让导航偏左或偏右，必须整体平衡。
 
-* shield / waveform 风格 logo
-* 标题：语音克隆防护平台
-* 小版本 badge：V2.0
+四、字体与艺术字具体要求
 
-中间导航：
+1. 字体分层
+   请建立以下字体 token：
 
-* 首页
-* 防护工作台
-* 结果分析
-* 历史任务
+* `--font-ui-zh`
 
-右侧：
+  * 用于正文、表格、按钮、说明文字
+  * 首选：Noto Sans SC / Source Han Sans / system-ui fallback
 
-* 状态 badge：系统防护中
-* 通知图标
-* 用户：评委用户
+* `--font-display-zh`
 
-六、首页设计
+  * 用于首页大标题和页面主标题
+  * 首选：优设标题黑
+  * 如果没有字体文件，用 Source Han Sans Heavy / Noto Sans SC Black 作为 fallback
 
-首页目标：让评委 10 秒内理解项目是什么、为什么重要、系统能力是什么。
+* `--font-tech-en`
 
-主要模块：
+  * 用于英文标签、数字、指标、Mock/API、Task ID
+  * 建议：Orbitron / Exo 2 / Audiowide
+
+2. 首页大标题必须单独做 HeroTitle 组件
+   不要直接写普通 h1。
+
+HeroTitle 结构：
+
+* 第一行：`发布前保护你的声音，`
+* 第二行：`降低语音克隆风险`
+* 第一行白色，第二行青色/蓝色渐变
+* 字号：
+
+  * 大屏：`64px ~ 76px`
+  * 中屏：`52px`
+  * 小屏：`40px`
+* 字重：900
+* 行高：0.98 到 1.05
+* 字距：`-0.04em` 到 `-0.02em`
+* 标题整体宽度约 `620px`
+
+艺术字效果：
+
+* 主文字层：纯白或浅蓝白
+* 高亮层：青蓝渐变
+* 文字阴影：
+
+  * 白色标题：轻微深蓝阴影
+  * 高亮标题：青色外发光
+* 可用 CSS：
+
+  * `background-clip: text`
+  * `color: transparent`
+  * `text-shadow`
+  * `filter: drop-shadow(...)`
+* 可以用伪元素 `::before` / `::after` 做模糊辉光层。
+* 不要过度霓虹，不要影响可读性。
+
+3. 页面标题
+   每个页面顶部的英文小标签，例如：
+
+* `Protection Workspace`
+* `Result Evidence`
+* `Task History`
+
+样式：
+
+* 小胶囊 badge
+* 青蓝边框
+* 背景 `rgba(14,165,233,0.14)`
+* 字体用 `--font-tech-en`
+* 大标题下面使用中文标题：
+
+  * 防护工作台
+  * 结果分析
+  * 历史任务
+
+五、首页精确布局
+
+首页必须按目标图改，不要保留当前简单版。
 
 1. Hero 区
+   高度：约 `520px ~ 600px`
 
-标题：
-发布前保护你的声音，降低语音克隆风险
+使用 12 列 grid：
 
-副标题：
-融合语义防护与音色防护的双重机制，在保证听感质量的同时干扰语音理解与音色建模，有效抵御非授权的语音克隆与滥用。
+* 左侧：5列
+* 中间：4列
+* 右侧：3列
 
-按钮：
+左侧内容：
 
-* 开始防护：跳转 `/workspace`
-* 查看演示：跳转 `/results/demo-task`
+* 顶部 4 个小标签横排：
 
-标签：
+  * 端到端可验证
+  * 多模型自适应
+  * 听感友好
+  * 高效易用
+* HeroTitle 大标题
+* 一段说明文案，宽度约 `560px`
+* 两个按钮：
 
-* 端到端可验证
-* 多模型自适应
-* 听感友好
-* 高效易用
+  * 主按钮：开始防护
+  * 次按钮：查看演示
+* 按钮下方再放一排小图标能力点
 
-2. 中央流程图
+中间内容：
+必须有主视觉，不允许空。
+做一个 `HeroShieldStage` 组件：
 
-用原创 UI 画出流程，不要复制论文图。
+* 中央大盾牌图标
+* 盾牌内部有波形
+* 背后有同心圆环
+* 下方有蓝色发光底座
+* 背景有细微网格和粒子线
+* 不需要图片资源，可以用 CSS + SVG + lucide icon 做
+* 大小约 `420px x 360px`
+* 居中放置
 
-流程：
-原始音频 → 保护性扰动 → 保护音频 → 下游影响
-
-下游影响包括：
-
-* ASR 语音识别：识别准确率下降
-* Tokenizer 分词器：表示偏移增大
-* LLM 语言模型：理解偏差增大
-* 克隆系统 / TTS：声纹相似度下降
-
-3. 三个核心策略卡片
+右侧内容：
+竖向 3 张策略卡：
 
 * 语义防护
-
-  * 干扰语义表示
-  * 降低 ASR / LALM 理解准确率
-  * 多模型语义编码器
-  * token 变化与语义漂移
-
 * 音色防护
-
-  * 削弱声纹特征
-  * 降低说话人相似度
-  * 抑制音色建模
-  * 阻断克隆条件提取
-
 * 心理声学约束
 
-  * 控制扰动可感知性
-  * 掩蔽阈值建模
-  * 听感保真优化
+每张卡：
 
-4. KPI 卡片
+* 高度约 `150px`
+* 圆角 18
+* 内边距 24
+* 左侧 icon
+* 标题
+* 简短说明
+* 3 个 bullet
+* 右侧小型装饰图：
 
-使用 mock 指标：
+  * 语义防护：节点网络
+  * 音色防护：竖向波形
+  * 心理声学：耳朵/声波
+
+2. Hero 下方流程卡
+   位置：
+
+* 放在 hero 下半部或紧接 hero 下方
+* 宽度尽量接近整行
+* 高度约 `170px`
+
+内容：
+
+* 原始音频
+* 保护性扰动
+* 保护音频
+* 下游系统影响
+
+下游系统影响包含 4 个小卡：
+
+* ASR：识别准确率下降
+* Tokenizer：表示偏移增大
+* LLM：理解偏差增大
+* 克隆系统/TTS：声纹相似度下降
+
+每个小卡要有：
+
+* icon
+* 标签
+* 小波形/小装饰
+* 红色或绿色指标数字
+
+3. KPI 指标行
+   6 张横向卡片：
 
 * ASR 干扰：WER 68.7%
 * 声纹相似度下降：86.2%
 * 听感保真：PESQ 3.67
-* 对抗评估：多模型平均成功率 85.6%
+* 对抗评估：85.6%
 * 任务通过率：98.7%
 * 平均处理时长：72s
 
-5. 作品亮点卡片
+每张卡：
 
-标题：作品亮点
+* 等宽
+* 高度 110px
+* 数字大，说明小
+* 右侧放 mini sparkline 或小 icon
 
-内容：
+4. 下方内容区
+   三列布局：
 
-* 提出语义与音色双重防护框架，兼顾安全与可用。
-* 引入心理声学约束，扰动不可感知、听感友好。
-* 通过 ASR、Tokenizer、LLM、TTS 多层指标展示防护效果。
-* 前端支持 Mock / Backend 快速切换，便于竞赛演示和真实后端对接。
+* 左侧 4 张核心能力卡，2x2
+* 中间趋势图
+* 右侧作品亮点
 
-七、防护工作台页面设计
+作品亮点卡必须有：
 
-路径：`/workspace`
+* 星形 icon
+* 4 条 bullet
+* 底部绿色强调条：`安全可信 · 听感友好 · 高效可用`
 
-目标：展示用户如何提交防护任务。
+六、防护工作台精确布局
 
-布局：左中右三栏 + 底部任务状态。
+当前工作台左侧大量空白，必须重做。
 
-1. 左侧：音频接入
+页面顶部：
 
-标题：音频接入
+* 小胶囊：`Protection Workspace`
+* 大标题：防护工作台
+* 副标题：提交音频，配置语义防护与音色防护策略，并观察端到端防护任务如何生成证据链。
 
-tab：
+主体使用三栏 grid：
+
+* 左栏：`minmax(340px, 0.9fr)`
+* 中栏：`minmax(520px, 1.3fr)`
+* 右栏：`minmax(380px, 1fr)`
+* gap：24px
+* 三栏顶部对齐
+* 三栏卡片高度尽量接近，不要左栏短一大截
+
+1. 左栏：AudioInputPanel
+   高度至少 `640px`，不要只有上传框。
+
+内容从上到下：
+
+A. 标题行
+
+* 标题：音频接入
+* 右侧状态 badge：
+
+  * Mock 模式显示 Mock
+  * API 模式显示 API
+
+B. Tab
 
 * 上传音频
-* 录音输入（仅展示，提示“接口预留”）
+* 录音输入
+* tab 宽度等分
+* 当前 tab 高亮青蓝背景
 
-上传区域：
+C. 上传音频 tab
 
-* 拖拽音频文件到此处，或点击上传
-* 支持 .wav / .mp3 / .flac / .m4a
-* 单文件 ≤ 200MB
+* 拖拽上传框：
 
-mock 模式要求：
+  * 高度 180px
+  * 虚线边框
+  * 云上传 icon
+  * 文案：拖拽音频文件到此处，或点击上传
+  * 格式说明
+* 上传后显示文件卡：
 
-* 上传行为可以只保存文件名和前端 object URL 作为展示，但不要将该真实上传音频与 mock 分析结果混用。
-* mock 任务使用固定 mock 结果。
-* 如果用户上传了文件，显示“Mock 模式下仅展示文件接入状态，分析结果来自固定演示数据”。
+  * 文件名
+  * 播放按钮
+  * waveform
+  * 文件元信息 grid：
 
-文件卡片：
+    * 时长
+    * 采样率
+    * 声道
+    * 位深
+    * 大小
+    * 格式
+    * 上传时间
+    * 指纹
+* 如果未上传，也要显示“待上传状态卡”填补空间：
 
-* 文件名
-* 时长
-* 采样率
-* 声道
-* 位深
-* 文件大小
-* 上传时间
-* 文件指纹 mock hash
-* 波形预览
-* 播放按钮
+  * 支持格式
+  * 最大文件大小
+  * 建议音频长度
+  * 建议清晰语音
+  * 数据模式说明
 
-可以使用 wavesurfer.js 画波形；如果实现复杂，可先用 SVG / CSS mock waveform，但代码结构要支持后续替换为 wavesurfer。
+D. 录音输入 tab
+必须实现真实录音。
+布局：
 
-2. 中间：防护策略配置
+* 麦克风权限状态卡
+* 中央大圆形麦克风按钮
+* 录音计时器 `00:00`
+* 状态：
 
-标题：防护策略配置
+  * 未授权
+  * 待录音
+  * 录音中
+  * 已完成
+  * 录音失败
+* 按钮：
 
-保护模式：
+  * 请求麦克风权限
+  * 开始录音
+  * 停止录音
+  * 重录
+  * 使用该录音
+* 录音完成后：
 
-* 标准保护：平衡安全与听感
-* 强保护：更强安全性，略降听感
-* 高保真：更优听感，安全性适中
-* 高级自定义：自由调整参数
+  * 展示音频播放器
+  * 展示 waveform 或模拟 waveform
+  * 展示 Blob 大小、录制时长、格式
+* 点击“使用该录音”时，触发上传流程，并弹出白色“音频上传中”加载框。
 
-防护目标：
+E. 底部提示卡
+
+* 建议：请使用本人或公开授权音频测试。
+* Mock 模式说明：Mock 模式下结果来自固定演示数据。
+* API 模式说明：API 模式下上传结果由后端返回。
+
+2. 中栏：ProtectionConfigPanel
+   高度与左栏接近。
+
+内容：
+A. 标题行：防护策略配置
+B. 保护模式 2x2：
+
+* 标准保护
+* 强保护
+* 高保真
+* 高级自定义
+  当前选中卡片边框青蓝，背景稍亮。
+
+C. 防护目标：
 
 * 语义防护
 * 音色防护
 * 联合防护（推荐）
+  联合防护默认选中。
 
-默认选中：联合防护（推荐）
+D. 参数配置：
+使用三列 compact input：
 
-参数配置：
+* epsilon / 扰动强度：0.08
+* 优化轮数 Steps：20
+* 心理声学权重 lambdaPsy：0.15
 
-* epsilon / 扰动强度，默认 0.08
-* 优化轮数 Steps，默认 20
-* 心理声学权重 lambdaPsy，默认 0.15
-* ASR 模型，默认 Whisper-large-v3 或 Paraformer-large
-* 语义编码器集合，显示 S3 Tokenizer / HuBERT / Whisper / MFCC
-* Timbre 模式，默认 Untargeted，可选 Targeted
-* 音色编码器集合，显示 WavLM / ECAPA-TDNN / CosyVoice Encoder / Style Encoder
+E. 高级选项区域：
 
-高级选项可以折叠展示。
+* ASR 模型 select：
 
-模式说明：
+  * Whisper-large-v3
+  * Paraformer-large
+  * FunASR
+* Timbre 模式 select：
 
-* Mock 模式：使用本地固定模拟数据，快速展示平台流程与评估结果，不调用后端。
-* Backend 模式：调用后端服务执行真实防护流程，结果来自后端返回。
-* 两种模式互斥，不混合数据。
+  * Untargeted
+  * Targeted
+* 编码器标签：
 
-任务执行：
+  * S3 Tokenizer
+  * HuBERT
+  * Whisper
+  * MFCC
+  * WavLM
+  * ECAPA-TDNN
+  * CosyVoice Encoder
+  * Style Encoder
+
+F. 模式说明卡：
+
+* Mock 模式：使用本地固定模拟数据，快速展示流程，不调用后端。
+* API 模式：调用后端接口，所有数据来自后端。
+* 两者互斥，不混用。
+
+G. 执行按钮区：
 
 * 主按钮：开始生成保护音频
 * 次按钮：使用 Mock 数据演示
+  点击后必须弹出白色“正在生成保护音频”加载框。
 
-mock 模式下：
+3. 右栏：ArchitecturePanel
+   高度与左右栏接近。
 
-* 点击“开始生成保护音频”或“使用 Mock 数据演示”都创建 mock task。
-* 展示任务状态进度。
-* 进度完成后跳转 `/results/mock-task-001`。
+内容：
+A. 标题：系统架构概览
+B. 顶部三段流程：
 
-backend 模式下：
+* 输入音频 x
+* 防护优化引擎
+* 保护音频 x'
 
-* 调用 `POST /api/tasks/protect` 创建任务。
-* 轮询 `GET /api/tasks/{taskId}` 或通过 SSE `GET /api/tasks/{taskId}/events` 更新状态。
-* 完成后跳转结果页。
-
-3. 右侧：系统架构概览
-
-用卡片画一个小型原创架构图：
-
-输入音频 x → 防护优化引擎 → 保护音频 x'
-
-防护优化引擎下面分三支：
-
+C. 三个子模块卡：
 语义分支：
 
 * ASR 系统
@@ -389,699 +594,316 @@ backend 模式下：
 * 听感优化
 * 最小化可感知差异
 
-底部显示联合优化目标的展示公式，不需要真实计算：
-L = λ_sem L_sem + λ_timbre L_timbre + λ_psy L_psy + λ_2 ||δ||_2
+D. 联合优化目标公式卡：
+`L = λ_sem L_sem + λ_timbre L_timbre + λ_psy L_psy + λ_2 ||δ||_2`
 
-4. 底部：任务状态
+E. API 状态/模式卡：
 
-阶段：
+* 当前模式：Mock 或 API
+* 如果 Mock：显示“本地演示数据”
+* 如果 API：显示 base URL 和接口状态区域
 
-1. 文件预处理
-2. 编码器加载
-3. 扰动优化
-4. 心理声学约束
-5. 结果评估
-6. 报告生成
+4. 底部：TaskStatusPanel
+   整行横跨三栏。
+   高度约 `220px`
 
-每个阶段显示：
+左侧：
 
-* 等待开始
-* 进行中
-* 已完成
-* 失败
+* 6 个阶段卡片横向排列：
 
-右侧结果产物：
+  * 文件预处理
+  * 编码器加载
+  * 扰动优化
+  * 心理声学约束
+  * 结果评估
+  * 报告生成
+* 每个阶段有 icon、状态、连接线
 
-* 保护音频 .wav：必须可下载
-* 评估报告 .pdf：接口预留
-* 详细数据 .csv：接口预留
-* 证据包 .zip：接口预留
+右侧：
 
-八、结果分析页面设计
+* 结果产物：
 
-路径：`/results/:taskId`
+  * 保护音频 .wav
+  * 评估报告 .pdf
+  * 详细数据 .csv
+  * 证据包 .zip
+* 操作日志入口
 
-目标：展示防护是否有效，给评委形成证据链。
+七、结果分析页精确布局
 
-1. 顶部 summary strip
+页面顶部：
 
-字段：
+* 小胶囊：`Result Evidence`
+* 大标题：结果分析
+* 副标题：以 ASR 转写、语义漂移、声纹相似度和心理声学指标形成可解释的评估证据链。
+
+1. SummaryStrip
+   整行横向 7 个卡片：
 
 * 任务 ID
-* 任务状态：已完成
+* 任务状态
 * 完成时间
 * 处理耗时
-* 防护模式：联合防护（推荐）
-* 综合判定：防护有效
-* 综合得分：92.6
-
-2. 原始音频 vs 保护音频
-
-两个音频卡片：
-
-原始音频：
-
-* 文件名 target_speech_demo.wav
-* 波形
-* 播放按钮
-* 时长 12.34s
-* 采样率 16kHz
-* 格式 WAV
-* 大小 1.88MB
-* 描述：原始录音，包含清晰语义内容与可克隆声纹特征。
-
-保护音频：
-
-* 文件名 protected_voice_mock.wav
-* 波形
-* 播放按钮
-* 时长 12.34s
-* 采样率 16kHz
-* 格式 WAV
-* 大小 1.90MB
-* 描述：防护后音频，语义受保护，声纹相似度显著降低，听感基本保持。
-
-mock 模式下：
-
-* 保护音频必须能下载。
-* 可以通过前端生成一个 mock WAV Blob，文件名 `protected_voice_mock.wav`。
-* 如果做播放器也使用这个 mock WAV Blob。
-
-backend 模式下：
-
-* 从后端 result 返回 audio URL 或调用下载接口。
-
-3. 机器理解分析：ASR 转写对比
-
-左侧：原始转写
-示例：
-今天天气很好，我们一起去公园散步吧。沿着湖边走，你可以看到很多漂亮的花，微风吹过来，感觉非常舒服。我们找个地方坐下，聊聊最近的生活和工作，放松一下心情。
-
-右侧：保护后转写
-示例：
-今天石头很蓝，我们一路去公元散不唬。船长胡边走，你可以买到很多漂多的画，未分叫过来，甘觉非等似醒。我们转个地放坐下，聊聊最没的生高和工件，放松一下先青。
-
-中间指标：
-
-* WER：68.7%
-* CER：54.1%
-* Token 变化率：72.9%
-* Semantic Drift：0.81
-
-实现一个简单 diff 高亮组件：
-
-* 新增内容：绿色
-* 删除内容：红色
-* 替换内容：橙色
-  如果真实 diff 太复杂，可以使用预标注 mock segments。
-
-4. 声纹 / 音色分析
-
-指标：
-
-* 防护前声纹相似度：0.912
-* 防护后声纹相似度：0.126
-* 下降：86.2%
-* Embedding 距离：0.214 → 1.387
-* 提升：548.1%
-
-图表：
-
-* 雷达图：音色相似度、基频特征、共振峰特征、韵律特征、声道特征
-* 柱状图或卡片展示前后变化
-
-5. 感知质量评估
-
-指标：
-
-* SNR：21.8 dB，优秀
-* PESQ：3.67，良好
-* MOS-LQO：3.82 / 5，良好
-
-图表：
-
-* 心理声学阈值分析
-* x 轴：频率
-* y 轴：强度 dB
-* 两条曲线：掩蔽阈值、保护干扰谱
-* 表达“扰动大多低于掩蔽阈值”
-
-6. 综合指标趋势
-
-用 ECharts 展示 4 到 5 个小图：
-
-* ASR 干扰 WER
-* 声纹相似度
-* 听感质量 MOS-LQO
-* PESQ
-* 任务耗时
-
-7. 结果解读
-
-标题：结果解读（自动生成）
-
-内容：
-
-* 语义层面：WER 68.7%，关键语义被显著干扰，机器理解难度提升。
-* 声纹层面：相似度从 0.912 降至 0.126，已有效破坏可克隆性。
-* 听感层面：PESQ=3.67，MOS-LQO=3.82，整体听感保持良好，满足可用性要求。
-* 综合结论：各项指标达到演示阈值，判定为“防护有效”。
-
-8. 操作与导出
-
-按钮：
-
-* 下载保护音频：必须实现
-* 导出评估报告 PDF：接口预留，点击显示 toast “后端接口预留”
-* 导出详细数据 CSV：接口预留，点击显示 toast “后端接口预留”
-* 下载证据包 ZIP：接口预留，点击显示 toast “后端接口预留”
-* 重新执行任务：跳转 `/workspace`
-
-九、历史任务页面设计
-
-路径：`/history`
-
-轻量版即可。用于展示完整平台闭环。
-
-内容：
-
-* 搜索框
-* 状态筛选：全部 / 已完成 / 处理中 / 失败
-* 模式筛选：标准保护 / 强保护 / 高保真 / 联合防护
-* 任务表格
-
-表格字段：
-
-* 任务 ID
-* 文件名
 * 防护模式
-* 数据模式：Mock / Backend
-* 状态
+* 综合判定
+* 综合得分
+
+高度：110px
+卡片等高，对齐。
+
+2. 音频对比区
+   两列：
+
+* 原始音频
+* 保护音频
+
+每张卡高度约 280px：
+
+* icon + 标题 + 文件名
+* waveform 黑色内嵌条
+* 元数据行
+* 描述
+* 播放按钮
+* Mock WAV 试听字样
+
+3. 关键指标行
+   4 张卡：
+
+* WER 68.7%
+* Token 变化率 72.9%
+* 声纹相似度下降 86.2%
+* MOS-LQO 3.82
+
+4. ASR 转写对比
+   三列：
+
+* 左：原始转写
+* 中：指标卡竖排
+
+  * WER
+  * CER
+  * Token 变化率
+  * Semantic Drift
+* 右：保护后转写
+
+保护后转写要使用 diff 高亮：
+
+* 新增：绿色
+* 删除：红色
+* 替换：橙色/黄色
+
+5. 声纹 / 音色分析
+   两列：
+
+* 左：雷达图
+* 右：
+
+  * 声纹相似度前后进度条
+  * 下降 86.2%
+  * Embedding 距离 0.214 → 1.387
+  * 解释说明卡
+
+6. 感知质量评估
+   两列：
+
+* 左：SNR / PESQ / MOS-LQO 三张纵向指标卡
+* 右：心理声学阈值曲线图
+
+7. 综合指标趋势
+   整行大图：
+
 * WER
-* 声纹相似度下降
+* 声纹相似度
+* MOS-LQO
 * PESQ
-* 创建时间
-* 操作：查看结果 / 下载保护音频 / 删除
-
-mock 模式：
-
-* 使用固定历史任务数组。
-* 查看结果跳转 `/results/mock-task-001`。
-* 下载保护音频必须可用。
-
-backend 模式：
-
-* 调用 `GET /api/tasks` 获取列表。
-* 删除调用 `DELETE /api/tasks/{taskId}`。
-* 下载调用后端下载接口。
-
-十、接口设计
-
-请在前端定义完整 TypeScript 类型和 API client。即使后端不存在，也要保证接口结构清晰。
-
-目录建议：
-
-src/
-app/
-assets/
-components/
-layout/
-charts/
-audio/
-cards/
-common/
-config/
-runtime.ts
-data/
-mockData.ts
-hooks/
-lib/
-pages/
-HomePage.tsx
-WorkspacePage.tsx
-ResultsPage.tsx
-HistoryPage.tsx
-services/
-apiClient.ts
-mockClient.ts
-backendClient.ts
-store/
-appStore.ts
-taskStore.ts
-types/
-api.ts
-task.ts
-audio.ts
-utils/
-download.ts
-mockWav.ts
-format.ts
-main.tsx
-router.tsx
-index.css
-
-环境配置：
-
-.env.example:
-VITE_DATA_MODE=mock
-VITE_API_BASE_URL=http://localhost:8000
-
-runtime.ts：
-
-* 读取 import.meta.env.VITE_DATA_MODE
-* 只允许 mock 或 backend
-* 导出 dataMode、apiBaseUrl、isMockMode、isBackendMode
-
-统一 service：
-
-apiClient.ts：
-
-* 根据 runtime 选择 mockClient 或 backendClient
-* 不允许混合
-* 导出 uploadFile、createProtectionTask、getTaskStatus、getTaskResult、listTasks、deleteTask、downloadProtectedAudio、exportReport、exportCsv、downloadEvidenceZip 等函数
-
-后端接口预留：
-
-POST /api/files/upload
-请求：multipart/form-data
-响应：
-{
-"fileId": "file_001",
-"filename": "target_speech_demo.wav",
-"durationSec": 12.34,
-"sampleRate": 16000,
-"channels": 1,
-"bitDepth": 16,
-"sizeBytes": 1880000,
-"format": "wav",
-"audioUrl": "..."
-}
-
-POST /api/tasks/protect
-请求：
-{
-"fileId": "file_001",
-"mode": "standard | strong | high_fidelity | custom",
-"targets": ["semantic", "timbre"],
-"semantic": {
-"enabled": true,
-"asrModel": "whisper-large-v3",
-"encoders": ["s3-tokenizer", "hubert", "whisper", "mfcc"],
-"lambdaSemantic": 1.0
-},
-"timbre": {
-"enabled": true,
-"mode": "untargeted | targeted",
-"encoders": ["wavlm", "ecapa-tdnn", "cosyvoice", "styletts2"],
-"lambdaTimbre": 1.0
-},
-"psychoacoustic": {
-"enabled": true,
-"lambdaPsy": 0.15
-},
-"optimization": {
-"epsilon": 0.08,
-"steps": 20
-}
-}
-
-响应：
-{
-"taskId": "task_001",
-"status": "queued"
-}
-
-GET /api/tasks/{taskId}
-响应：
-{
-"taskId": "task_001",
-"status": "queued | running | completed | failed",
-"progress": 0.65,
-"stage": "perturbation_optimization",
-"message": "正在进行扰动优化",
-"createdAt": "...",
-"updatedAt": "...",
-"error": null
-}
-
-GET /api/tasks/{taskId}/events
-
-* SSE 接口预留
-* 前端可以先不实现 SSE，只实现轮询
-* 代码结构要方便以后接入 SSE
-
-GET /api/tasks/{taskId}/result
-响应：
-{
-"taskId": "task_001",
-"verdict": "protected",
-"score": 92.6,
-"originalAudio": {...},
-"protectedAudio": {...},
-"asr": {
-"originalText": "...",
-"protectedText": "...",
-"wer": 0.687,
-"cer": 0.541,
-"tokenChangeRate": 0.729,
-"semanticDrift": 0.81
-},
-"speaker": {
-"simBefore": 0.912,
-"simAfter": 0.126,
-"simDropRate": 0.862,
-"embeddingDistanceBefore": 0.214,
-"embeddingDistanceAfter": 1.387
-},
-"quality": {
-"snr": 21.8,
-"pesq": 3.67,
-"mosLqo": 3.82
-},
-"charts": {
-"psychoacoustic": [...],
-"trend": [...]
-}
-}
-
-GET /api/tasks/{taskId}/download/protected-audio
-
-* 返回 wav blob
-* mock 模式必须实现本地 wav blob 下载
-* backend 模式请求后端 blob
-
-GET /api/tasks
-响应：历史任务列表
-
-DELETE /api/tasks/{taskId}
-删除任务
-
-POST /api/reports/export
-接口预留
-
-GET /api/tasks/{taskId}/export/csv
-接口预留
-
-GET /api/tasks/{taskId}/download/evidence
-接口预留
-
-十一、Mock 数据要求
-
-mock 数据必须完整、可信、适合评委展示。
-
-固定 mock task：
-
-taskId: mock-task-001
-filename: target_speech_demo.wav
-protectedFilename: protected_voice_mock.wav
-status: completed
-mode: joint
-dataMode: mock
-duration: 12.34s
-sampleRate: 16000
-language: 中文普通话
-createdAt: 2024-06-01 14:21:36
-completedAt: 2024-06-01 14:23:18
-elapsed: 72s
-score: 92.6
-verdict: 防护有效
-
-ASR:
-originalText:
-今天天气很好，我们一起去公园散步吧。沿着湖边走，你可以看到很多漂亮的花，微风吹过来，感觉非常舒服。我们找个地方坐下，聊聊最近的生活和工作，放松一下心情。
-
-protectedText:
-今天石头很蓝，我们一路去公元散不唬。船长胡边走，你可以买到很多漂多的画，未分叫过来，甘觉非等似醒。我们转个地放坐下，聊聊最没的生高和工件，放松一下先青。
-
-wer: 0.687
-cer: 0.541
-tokenChangeRate: 0.729
-semanticDrift: 0.81
-
-Speaker:
-simBefore: 0.912
-simAfter: 0.126
-simDropRate: 0.862
-embeddingDistanceBefore: 0.214
-embeddingDistanceAfter: 1.387
-
-Quality:
-snr: 21.8
-pesq: 3.67
-mosLqo: 3.82
-
-Trends:
-生成 20 个点，用于趋势图，数值要合理，不要完全随机失真。
-
-十二、下载保护音频实现
-
-这是必须实现的功能。
-
-mock 模式：
-
-* 实现 `createMockProtectedWavBlob()`。
-* 生成一个合法 WAV Blob，16kHz，mono，16-bit PCM，时长可为 3 到 5 秒。
-* 内容可以是低幅度合成音 + 轻微调制，不需要是真实语音。
-* 下载文件名：`protected_voice_mock.wav`。
-* 结果页和历史任务页的“下载保护音频”都调用该函数。
-
-backend 模式：
-
-* 调用 `GET /api/tasks/{taskId}/download/protected-audio`。
-* 使用 axios 获取 blob。
-* 下载文件名从 response header 或 result metadata 获取。
-* 后端失败时显示 toast。
-
-PDF / CSV / ZIP：
-
-* 不需要真实生成。
-* 保留按钮和函数。
-* mock 模式点击显示 toast：“该导出项为后端接口预留。”
-* backend 模式调用接口，失败时显示错误。
-
-十三、组件要求
-
-请尽量拆分组件，避免把所有代码写在一个页面里。
-
-建议组件：
-
-Layout:
-
-* AppShell
-* TopNav
-* PageHeader
-* StatusBadge
-
-Audio:
-
-* AudioUploadPanel
-* AudioWaveform
-* AudioCompareCard
-* MockAudioPlayer
-
-Cards:
-
-* MetricCard
-* StrategyCard
-* FeatureCard
-* EvidenceCard
-* TaskSummaryStrip
-
-Charts:
-
-* TrendChart
-* RadarChart
-* PsychoacousticChart
-* MiniSparkline
-* SimilarityBar
-
-Workspace:
-
-* ProtectionModeSelector
-* ProtectionTargetSelector
-* ParameterForm
-* ArchitectureOverview
-* TaskProgressStepper
-
-Results:
-
-* AsrDiffPanel
-* SpeakerAnalysisPanel
-* QualityPanel
-* ResultInterpretation
-* ExportActions
-
-History:
-
-* TaskTable
-* TaskFilters
-
-十四、状态管理
-
-使用 zustand 保存：
-
-* 当前 dataMode
-* 当前上传文件信息
-* 当前任务状态
-* 当前任务结果
-* 历史任务列表
-
-使用 @tanstack/react-query 管理异步请求：
-
-* listTasks
-* getTaskStatus
-* getTaskResult
-* backend API 请求
-* mock 请求也可以用 Promise + setTimeout 模拟延迟
-
-十五、表单校验
-
-使用 react-hook-form + zod。
-
-校验：
-
-* epsilon: 0.01 到 0.2
-* steps: 1 到 500
-* lambdaPsy: 0 到 1
-* 防护目标至少选择一个
-* backend 模式下必须有 fileId 后才能创建任务
-* mock 模式下可直接创建 mock task，但仍应显示用户是否上传文件
-
-十六、交互细节
 
-* 所有按钮有 hover / active 状态。
-* 使用 toast 展示成功、失败、接口预留。
-* 任务执行进度用模拟定时器推进。
-* 进度完成后自动跳转结果页。
-* 历史任务页点击“查看结果”跳转结果页。
-* 顶栏导航 active 状态要正确。
-* 空状态要好看。
-* 错误状态要清晰。
-* loading skeleton 或 spinner 要有。
-* 页面要响应式，至少保证 1440px 桌面下效果最佳；平板和小屏可以纵向堆叠。
-
-十七、样式实现建议
-
-Tailwind 主题色：
-
-background:
-
-* #020617
-* #07111f
-* #0b1220
-
-primary cyan:
-
-* #06b6d4
-* #22d3ee
-* #38bdf8
-
-green:
-
-* #22c55e
-* #10b981
-
-blue:
-
-* #3b82f6
-
-purple:
-
-* #8b5cf6
-
-orange:
-
-* #f59e0b
-
-danger:
-
-* #ef4444
-
-卡片：
-
-* bg-slate-900/60
-* border-cyan-500/20
-* backdrop-blur
-* rounded-2xl
-* shadow with subtle cyan glow
-
-字体：
-
-* 中文优先使用系统 sans-serif。
-* 不要引入外部在线字体，避免网络依赖。
-
-十八、README 要求
-
-生成 README.md，内容包括：
-
-1. 项目简介
-2. 技术栈
-3. 安装方式
-
-使用 pnpm：
-
-pnpm install
-pnpm dev
-pnpm build
-
-4. 环境变量说明
-
-VITE_DATA_MODE=mock
-VITE_API_BASE_URL=http://localhost:8000
-
-5. Mock / Backend 模式说明
-
-强调：
-
-* mock 模式完全使用前端模拟数据。
-* backend 模式完全使用后端 API。
-* 两者不混合。
-
-6. 页面说明
-7. API 对接说明
-8. 已实现功能
-9. 预留接口
-10. 真实算法不在前端实现
-
-十九、验收标准
-
-请保证：
-
-1. `pnpm install` 后可以正常运行。
-2. `pnpm dev` 可以打开页面。
-3. 4 个页面都可访问。
-4. 首页视觉接近高质量竞赛展示大屏。
-5. 防护工作台可以创建 mock 任务并跳转结果页。
-6. 结果页展示完整评估证据链。
-7. 历史任务页可以查看 mock 历史任务。
-8. 下载保护音频功能真实可用。
-9. PDF / CSV / ZIP 导出按钮保留接口并给出提示。
-10. `.env` 可以切换 mock / backend。
-11. backend 模式下不会混用 mock 数据。
-12. TypeScript 类型完整，没有明显 any 滥用。
-13. 组件拆分合理。
-14. README 完整。
-
-二十、实现边界
-
-不要做：
-
-* 不要实现真实语音防护算法。
-* 不要调用真实 ASR / TTS / LLM。
-* 不要写 Python 后端。
-* 不要做登录系统。
-* 不要混合 mock 数据和 backend 数据。
-* 不要把论文原图直接塞进页面。
-* 不要把页面做成简单后台模板。
-
-必须做：
-
-* 从零创建完整 Vite + React + TypeScript 项目。
-* 使用 pnpm。
-* 使用 Tailwind + shadcn/ui 风格。
-* 使用 ECharts 展示图表。
-* 使用 lucide-react 图标。
-* 使用严格类型定义。
-* 支持 mock/backend 双 client。
-* 实现保护音频下载。
-* 输出完整 README。
+8. 结果解读
+   2x2 四条结论卡：
+
+* 语义层面
+* 声纹层面
+* 听感层面
+* 综合结论
+
+9. 底部操作栏
+   固定在结果页底部内容区域，不要悬浮遮挡：
+
+* 下载保护音频
+* 导出评估报告 PDF
+* 导出详细数据 CSV
+* 下载证据包 ZIP
+* 重新执行任务
+
+八、历史任务页精确布局
+
+顶部：
+
+* 小胶囊：`Task History`
+* 大标题：历史任务
+* 副标题：轻量化展示任务闭环，支持结果查看、保护音频下载与后端删除接口预留。
+
+工具条：
+
+* 整行卡片
+* 左侧搜索框，占宽 65%
+* 右侧两个 select：
+
+  * 全部状态
+  * 全部模式
+
+表格：
+
+* 卡片式表格，不要普通白底表格。
+* 表头背景略深。
+* 行高约 78px。
+* 字体统一。
+* 操作按钮：
+
+  * 查看
+  * 下载
+  * 删除
+
+规则：
+
+* Mock 模式：使用 mock 历史任务数组。
+* API 模式：调用 `GET /api/tasks`。
+* 删除任务：
+
+  * Mock 模式：本地删除。
+  * API 模式：调用 `DELETE /api/tasks/{taskId}`。
+* 查看结果：永远跳转 `/results/${task.taskId}`。
+* 下载保护音频：调用统一 `downloadProtectedAudio(task.taskId)`。
+
+九、白色加载弹窗具体组件规范
+
+新增组件：`GlobalLoadingModal`
+
+视觉：
+
+* 遮罩层：
+
+  * fixed inset-0
+  * background rgba(0,0,0,0.45)
+  * backdrop blur 2px
+  * z-index 足够高
+* 白色弹窗：
+
+  * width 420px
+  * min-height 220px
+  * background #ffffff
+  * border-radius 20px
+  * box-shadow 0 24px 80px rgba(0,0,0,0.28)
+  * 居中
+* spinner：
+
+  * 蓝色圆环
+  * 直径 48px
+  * border 4px
+  * 一段透明，一段 #0284c7 或 #0ea5e9
+  * 持续旋转
+* 标题：
+
+  * 深色 `#0f172a`
+  * 20px
+  * font-weight 800
+* 副标题：
+
+  * `#475569`
+  * 14px
+* 阶段标签：
+
+  * 胶囊样式
+  * 背景 `#e0f2fe`
+  * 文字 `#0369a1`
+* 底部提示：
+
+  * `请勿关闭页面`
+
+上传弹窗文案：
+
+* title：音频上传中
+* description：正在解析音频元信息，请稍后...
+* stageLabel：文件接入
+
+保护弹窗文案：
+
+* title：正在生成保护音频
+* description：根据当前阶段变化
+* stageLabel：阶段 1 / 6 到 阶段 6 / 6
+
+十、Mock / API 任务执行状态机
+
+Mock 模式保护流程：
+
+* 0s：文件预处理
+* 1s：编码器加载
+* 2s：扰动优化
+* 4s：心理声学约束
+* 5s：结果评估
+* 6s：报告生成
+* 6.5s：跳转 `/results/mock-task-001`
+
+API 模式保护流程：
+
+1. 检查是否有 fileId。
+2. 如果没有，提示用户先上传或录音。
+3. 显示白色保护弹窗。
+4. 调用 `POST /api/tasks/protect`。
+5. 得到 taskId 后开始轮询 `GET /api/tasks/{taskId}`。
+6. 如果 status 是 running，更新弹窗文案。
+7. 如果 completed，关闭弹窗，跳转 `/results/${taskId}`。
+8. 如果 failed，关闭弹窗，toast 显示错误。
+
+十一、需要新增或重构的组件
+
+必须新增或明确重构：
+
+* `HeroTitle`
+* `HeroShieldStage`
+* `HomeWorkflowPanel`
+* `StrategyHighlightCard`
+* `MetricCard`
+* `AudioInputPanel`
+* `AudioUploadTab`
+* `AudioRecorderTab`
+* `GlobalLoadingModal`
+* `ProtectionConfigPanel`
+* `ArchitecturePanel`
+* `TaskStatusPanel`
+* `ResultsSummaryStrip`
+* `AudioCompareSection`
+* `AsrDiffSection`
+* `SpeakerAnalysisSection`
+* `QualityEvaluationSection`
+* `ResultTrendSection`
+* `ResultActionBar`
+* `HistoryTaskTable`
+
+十二、验收标准
+
+完成后请自检：
+
+1. 首页是否接近目标图：左大标题、中盾牌主视觉、右三张能力卡，下方 KPI 和作品亮点完整？
+2. 首页大标题是否有真正艺术字效果，而不是普通 h1？
+3. 防护工作台左侧是否还有大片空白？如果有，继续补。
+4. 防护工作台三栏是否顶部对齐、高度接近、信息密度足够？
+5. 上传音频时是否弹出白色加载框 + 蓝色转圈？
+6. 生成保护音频时是否弹出白色加载框 + 蓝色转圈 + 阶段文案？
+7. 录音输入是否真能调用系统麦克风、录音、停止、试听、作为输入提交？
+8. 结果页是否像分析仪表盘，而不是长列表？
+9. 历史任务 API 模式是否动态获取？
+10. 是否完全没有实现 SSE / WebSocket？
+11. Mock 模式与 API 模式是否仍然互斥？
+12. 页面整体是否居中，最大宽度是否统一？
+13. 所有卡片边界、间距、圆角、阴影是否统一？
+
+本次请优先完成：
+
+1. 全局视觉重构；
+2. 首页按目标图还原；
+3. 工作台三栏高密度重排；
+4. 录音输入真实实现；
+5. 上传和保护白色加载弹窗；
+6. 历史任务 API 动态化。
+
+不要只改文案，不要只换颜色。必须调整布局结构和组件结构。
