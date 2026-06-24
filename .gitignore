@@ -1,0 +1,27 @@
+# Package managers
+.pnpm-store/
+node_modules/
+
+# Runtime
+.runtime/
+seme2e-runtime/
+logs/
+
+# Build output
+dist/
+dist-ssr/
+
+# Environment files
+.env
+.env.local
+.api_key
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

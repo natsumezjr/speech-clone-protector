@@ -1,6 +1,7 @@
 import { mockHistoryTasks, mockResult, mockTaskStatus } from '@/data/mockData'
 import type { ApiClient } from '@/types/api'
 import type { AudioFileMeta } from '@/types/audio'
+import type { CloneVoiceRequest } from '@/types/task'
 import { createMockProtectedWavBlob } from '@/utils/mockWav'
 import { shortHash } from '@/utils/format'
 
@@ -41,6 +42,37 @@ export const mockClient: ApiClient = {
       protectedAudio: {
         ...mockResult.protectedAudio,
         objectUrl: URL.createObjectURL(createMockProtectedWavBlob(4, 16000, 284)),
+      },
+    }
+  },
+  async cloneVoice(taskId: string, payload: CloneVoiceRequest) {
+    await delay(700)
+    return {
+      cloneId: `mock-clone-${Date.now()}`,
+      taskId,
+      status: 'partial',
+      source: 'mock_clone_client',
+      message: 'Mock 模式返回可播放的克隆测试音频。',
+      request: payload,
+      originalCloneAudio: {
+        filename: 'mock_original_clone.wav',
+        durationSec: 4,
+        sampleRate: 16000,
+        channels: 1,
+        bitDepth: 16,
+        sizeBytes: 128000,
+        format: 'WAV',
+        objectUrl: URL.createObjectURL(createMockProtectedWavBlob(4, 16000, 210)),
+      },
+      protectedCloneAudio: {
+        filename: 'mock_protected_clone.wav',
+        durationSec: 4,
+        sampleRate: 16000,
+        channels: 1,
+        bitDepth: 16,
+        sizeBytes: 128000,
+        format: 'WAV',
+        objectUrl: URL.createObjectURL(createMockProtectedWavBlob(4, 16000, 320)),
       },
     }
   },

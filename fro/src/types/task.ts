@@ -114,6 +114,7 @@ export interface TaskResult {
   }>
   originalAudio: AudioFileMeta
   protectedAudio: AudioFileMeta
+  cloneResults?: CloneVoiceResult[]
   asr: AsrMetrics
   speaker: SpeakerMetrics
   quality: QualityMetrics
@@ -123,6 +124,25 @@ export interface TaskResult {
     radarBefore: number[]
     radarAfter: number[]
   }
+}
+
+export interface CloneVoiceRequest {
+  text: string
+  model: string
+  language?: string
+  speed?: number
+  speakerPrompt?: string
+}
+
+export interface CloneVoiceResult {
+  cloneId: string
+  taskId: string
+  status: 'queued' | 'running' | 'completed' | 'success' | 'partial' | 'failed' | 'error'
+  source?: string
+  message?: string
+  request: CloneVoiceRequest
+  originalCloneAudio: AudioFileMeta
+  protectedCloneAudio: AudioFileMeta
 }
 
 export interface HistoryTask {

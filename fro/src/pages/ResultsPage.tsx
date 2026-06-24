@@ -1,8 +1,10 @@
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate, useParams } from 'react-router-dom'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import {
+  ChevronLeft,
+  ChevronRight,
   CheckCircle2,
   ClipboardList,
   Clock3,
@@ -17,12 +19,14 @@ import {
   RefreshCw,
   ShieldCheck,
   Sparkles,
+  TestTube2,
   Volume2,
+  X,
 } from 'lucide-react'
-import { downloadEvidenceZip, downloadProtectedAudio, exportCsv, exportReport, getTaskResult } from '@/services/apiClient'
+import { cloneVoice, downloadEvidenceZip, downloadProtectedAudio, exportCsv, exportReport, getTaskResult } from '@/services/apiClient'
 import { useAppStore } from '@/store/appStore'
 import { useTaskStore } from '@/store/taskStore'
-import type { TaskResult, TrendPoint } from '@/types/task'
+import type { CloneVoiceRequest, CloneVoiceResult, TaskResult, TrendPoint } from '@/types/task'
 import type { AudioFileMeta } from '@/types/audio'
 import { downloadBlob } from '@/utils/download'
 import { cn } from '@/lib/utils'
@@ -154,7 +158,21 @@ function SectionTitle({ children, info }: { children: ReactNode; info?: boolean 
 
 function AudioCompare({ result }: { result: TaskResult }) {
   const uploadedFile = useTaskStore((state) => state.uploadedFile)
+  const pushToast = useAppStore((state) => state.pushToast)
+  const sliderRef = useRef<HTMLDivElement | null>(null)
   const [protectedObjectUrl, setProtectedObjectUrl] = useState<string>()
+  const [activeSlide, setActiveSlide] = useState(0)
+  const [cloneModalOpen, setCloneModalOpen] = useState(false)
+  const [cloneLoading, setCloneLoading] = useState(false)
+  const [cloneError, setCloneError] = useState<string>()
+  const [cloneResult, setCloneResult] = useState<CloneVoiceResult | undefined>(() => result.cloneResults?.at(-1))
+  const [cloneForm, setCloneForm] = useState<CloneVoiceRequest>({
+    text: result.asr.originalText || '请使用这段文字生成克隆测试语音。',
+    model: 'XTTS-v2',
+    language: 'zh',
+    speed: 1,
+    speakerPrompt: '',
+  })
   const originalAudio = {
     ...result.originalAudio,
     objectUrl: result.originalAudio.objectUrl ?? uploadedFile?.objectUrl,
@@ -171,11 +189,15 @@ function AudioCompare({ result }: { result: TaskResult }) {
   useEffect(() => {
     const originalUrl = result.originalAudio.objectUrl
     const protectedUrl = result.protectedAudio.objectUrl
+    const originalCloneUrl = cloneResult?.originalCloneAudio.objectUrl
+    const protectedCloneUrl = cloneResult?.protectedCloneAudio.objectUrl
     return () => {
       if (originalUrl?.startsWith('blob:')) URL.revokeObjectURL(originalUrl)
       if (protectedUrl?.startsWith('blob:')) URL.revokeObjectURL(protectedUrl)
+      if (originalCloneUrl?.startsWith('blob:')) URL.revokeObjectURL(originalCloneUrl)
+      if (protectedCloneUrl?.startsWith('blob:')) URL.revokeObjectURL(protectedCloneUrl)
     }
-  }, [result.originalAudio.objectUrl, result.protectedAudio.objectUrl])
+  }, [cloneResult?.originalCloneAudio.objectUrl, cloneResult?.protectedCloneAudio.objectUrl, result.originalAudio.objectUrl, result.protectedAudio.objectUrl])
 
   const loadProtectedAudio = async () => {
     if (getAudioSource(protectedAudio)) return getAudioSource(protectedAudio)
@@ -188,15 +210,208 @@ function AudioCompare({ result }: { result: TaskResult }) {
     return objectUrl
   }
 
+  const goToSlide = (index: number, openWhenMissing = true) => {
+    setActiveSlide(index)
+    sliderRef.current?.scrollTo({ left: sliderRef.current.clientWidth * index, behavior: 'smooth' })
+    if (openWhenMissing && index === 1 && !cloneResult && !cloneLoading) setCloneModalOpen(true)
+  }
+
+  const handleSlideScroll = () => {
+    const node = sliderRef.current
+    if (!node) return
+    const nextSlide = node.scrollLeft > node.clientWidth * 0.55 ? 1 : 0
+    if (nextSlide !== activeSlide) setActiveSlide(nextSlide)
+    if (nextSlide === 1 && !cloneResult && !cloneLoading) setCloneModalOpen(true)
+  }
+
+  const validateCloneForm = () => {
+    if (!cloneForm.text.trim()) return '请输入用于语音克隆的文本。'
+    if (!cloneForm.model.trim()) return '请输入或选择语音克隆模型。'
+    if (!Number.isFinite(cloneForm.speed) || Number(cloneForm.speed) < 0.5 || Number(cloneForm.speed) > 2) return '语速需要在 0.5 到 2.0 之间。'
+    return undefined
+  }
+
+  const submitCloneTest = async () => {
+    const validationError = validateCloneForm()
+    if (validationError) {
+      setCloneError(validationError)
+      setCloneModalOpen(true)
+      goToSlide(1)
+      return
+    }
+
+    try {
+      setCloneLoading(true)
+      setCloneError(undefined)
+      setCloneModalOpen(false)
+      goToSlide(1, false)
+      const nextResult = await cloneVoice(result.taskId, { ...cloneForm, text: cloneForm.text.trim(), model: cloneForm.model.trim() })
+      setCloneResult(nextResult)
+      pushToast({ kind: 'success', title: '语音克隆测试完成', description: nextResult.message ?? nextResult.cloneId })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '语音克隆测试失败，请检查表单或后端服务。'
+      setCloneError(message)
+      setCloneModalOpen(true)
+      pushToast({ kind: 'error', title: '语音克隆测试失败', description: message })
+    } finally {
+      setCloneLoading(false)
+    }
+  }
+
   return (
     <section className="ui-card p-5">
-      <SectionTitle info>原始音频 vs 保护音频</SectionTitle>
-      <div className="mt-5 grid grid-cols-[1fr_58px_1fr] items-center gap-6">
-        <AudioCard title="原始音频（未保护）" audio={originalAudio} color="#00aef0" />
-        <div className="grid h-12 w-12 place-items-center rounded-full border border-cyan-300/28 bg-slate-950/70 text-[18px] font-black text-white shadow-[0_0_24px_rgba(56,189,248,0.12)]">VS</div>
-        <AudioCard title="保护音频（已防护）" audio={protectedAudio} color="#22c55e" green onPlayRequest={loadProtectedAudio} />
+      <div className="flex items-center justify-between gap-3">
+        <SectionTitle info>原始音频 vs 保护音频</SectionTitle>
+        <div className="flex items-center gap-2">
+          <button type="button" onClick={() => goToSlide(0)} className={cn('grid h-9 w-9 place-items-center rounded-[7px] border border-cyan-300/14 text-slate-300', activeSlide === 0 && 'bg-cyan-400/14 text-cyan-200')} title="查看原始音频与保护音频">
+            <ChevronLeft className="h-4 w-4" />
+          </button>
+          <button type="button" onClick={() => goToSlide(1)} className={cn('grid h-9 w-9 place-items-center rounded-[7px] border border-cyan-300/14 text-slate-300', activeSlide === 1 && 'bg-cyan-400/14 text-cyan-200')} title="查看克隆测试音频">
+            <ChevronRight className="h-4 w-4" />
+          </button>
+          <button type="button" onClick={() => setCloneModalOpen(true)} className="inline-flex h-9 items-center gap-2 rounded-[7px] border border-cyan-300/18 bg-cyan-400/10 px-3 text-sm font-black text-cyan-100 hover:bg-cyan-400/16">
+            <TestTube2 className="h-4 w-4" />
+            语音克隆测试
+          </button>
+        </div>
       </div>
+      <div ref={sliderRef} onScroll={handleSlideScroll} className="mt-5 flex snap-x snap-mandatory overflow-x-auto scroll-smooth [scrollbar-width:none]">
+        <div className="grid min-w-full snap-start grid-cols-[1fr_58px_1fr] items-center gap-6 pr-1">
+          <AudioCard title="原始音频（未保护）" audio={originalAudio} color="#00aef0" />
+          <div className="grid h-12 w-12 place-items-center rounded-full border border-cyan-300/28 bg-slate-950/70 text-[18px] font-black text-white shadow-[0_0_24px_rgba(56,189,248,0.12)]">VS</div>
+          <AudioCard title="保护音频（已防护）" audio={protectedAudio} color="#22c55e" green onPlayRequest={loadProtectedAudio} />
+        </div>
+        <div className="grid min-w-full snap-start grid-cols-[1fr_58px_1fr] items-center gap-6 pl-1">
+          {cloneLoading ? (
+            <>
+              <CloneLoadingCard title="克隆原语音" />
+              <div className="grid h-12 w-12 place-items-center rounded-full border border-violet-300/28 bg-slate-950/70 text-[18px] font-black text-white">VS</div>
+              <CloneLoadingCard title="克隆保护语音" />
+            </>
+          ) : cloneResult ? (
+            <>
+              <AudioCard title="克隆原语音" audio={cloneResult.originalCloneAudio} color="#a78bfa" />
+              <div className="grid h-12 w-12 place-items-center rounded-full border border-violet-300/28 bg-slate-950/70 text-[18px] font-black text-white">VS</div>
+              <AudioCard title="克隆保护语音" audio={cloneResult.protectedCloneAudio} color="#f59e0b" />
+            </>
+          ) : (
+            <>
+              <CloneEmptyCard title="克隆原语音" />
+              <div className="grid h-12 w-12 place-items-center rounded-full border border-violet-300/28 bg-slate-950/70 text-[18px] font-black text-white">VS</div>
+              <CloneEmptyCard title="克隆保护语音" />
+            </>
+          )}
+        </div>
+      </div>
+      {cloneModalOpen ? (
+        <CloneVoiceModal
+          form={cloneForm}
+          error={cloneError}
+          loading={cloneLoading}
+          onChange={setCloneForm}
+          onClose={() => setCloneModalOpen(false)}
+          onSubmit={() => void submitCloneTest()}
+        />
+      ) : null}
     </section>
+  )
+}
+
+function CloneLoadingCard({ title }: { title: string }) {
+  return (
+    <div className="grid h-[252px] place-items-center rounded-[9px] border border-violet-300/18 bg-violet-400/8 p-5 text-center">
+      <div>
+        <Loader2 className="mx-auto h-9 w-9 animate-spin text-violet-200" />
+        <p className="mt-4 text-sm font-black text-slate-100">{title}</p>
+        <p className="mt-2 text-xs text-slate-400">正在等待后端返回克隆音频...</p>
+      </div>
+    </div>
+  )
+}
+
+function CloneEmptyCard({ title }: { title: string }) {
+  return (
+    <div className="grid h-[252px] place-items-center rounded-[9px] border border-violet-300/18 bg-slate-950/18 p-5 text-center">
+      <div>
+        <TestTube2 className="mx-auto h-9 w-9 text-violet-200" />
+        <p className="mt-4 text-sm font-black text-slate-100">{title}</p>
+        <p className="mt-2 text-xs text-slate-400">需要先填写克隆测试表单。</p>
+      </div>
+    </div>
+  )
+}
+
+function CloneVoiceModal({
+  form,
+  error,
+  loading,
+  onChange,
+  onClose,
+  onSubmit,
+}: {
+  form: CloneVoiceRequest
+  error?: string
+  loading: boolean
+  onChange: (form: CloneVoiceRequest) => void
+  onClose: () => void
+  onSubmit: () => void
+}) {
+  return (
+    <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/68 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="语音克隆测试表单">
+      <div className="ui-card w-full max-w-[620px] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.46)]">
+        <div className="mb-4 flex items-center justify-between">
+          <div>
+            <h3 className="text-[20px] font-black text-white">语音克隆测试</h3>
+            <p className="mt-1 text-xs text-slate-500">POST /api/tasks/{'{taskId}'}/clone-voice</p>
+          </div>
+          <button type="button" onClick={onClose} className="grid h-9 w-9 place-items-center rounded-full border border-cyan-300/14 bg-white/[0.035] text-slate-300 hover:text-white" aria-label="关闭语音克隆测试表单">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <label className="block text-sm font-bold text-slate-300">
+          克隆文本
+          <textarea
+            value={form.text}
+            onChange={(event) => onChange({ ...form, text: event.target.value })}
+            className="mt-2 min-h-[126px] w-full resize-none rounded-[7px] border border-cyan-300/14 bg-slate-950/70 px-3 py-3 text-sm leading-6 text-slate-100 outline-none transition focus:border-cyan-300"
+          />
+        </label>
+        <div className="mt-4 grid grid-cols-[1fr_150px_120px] gap-3">
+          <label className="text-sm font-bold text-slate-300">
+            克隆模型
+            <input value={form.model} onChange={(event) => onChange({ ...form, model: event.target.value })} className="mt-2 h-10 w-full rounded-[7px] border border-cyan-300/14 bg-slate-950/70 px-3 text-slate-100 outline-none focus:border-cyan-300" />
+          </label>
+          <label className="text-sm font-bold text-slate-300">
+            语言
+            <select value={form.language ?? 'auto'} onChange={(event) => onChange({ ...form, language: event.target.value })} className="mt-2 h-10 w-full rounded-[7px] border border-cyan-300/14 bg-slate-950/70 px-3 text-slate-100 outline-none focus:border-cyan-300">
+              {['zh', 'en', 'auto'].map((item) => (
+                <option key={item} value={item} className="bg-slate-950 text-slate-100">
+                  {item}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="text-sm font-bold text-slate-300">
+            语速
+            <input type="number" min={0.5} max={2} step={0.05} value={form.speed ?? 1} onChange={(event) => onChange({ ...form, speed: Number(event.target.value) })} className="mt-2 h-10 w-full rounded-[7px] border border-cyan-300/14 bg-slate-950/70 px-3 text-slate-100 outline-none focus:border-cyan-300" />
+          </label>
+        </div>
+        <label className="mt-4 block text-sm font-bold text-slate-300">
+          模型补充参数
+          <input value={form.speakerPrompt ?? ''} onChange={(event) => onChange({ ...form, speakerPrompt: event.target.value })} className="mt-2 h-10 w-full rounded-[7px] border border-cyan-300/14 bg-slate-950/70 px-3 text-slate-100 outline-none focus:border-cyan-300" placeholder="可选：speaker prompt / speaker id / voice id" />
+        </label>
+        {error ? <p className="mt-4 rounded-[7px] border border-red-300/20 bg-red-400/10 px-3 py-2 text-sm text-red-100">{error}</p> : null}
+        <div className="mt-5 flex justify-end gap-3">
+          <button type="button" onClick={onClose} className="h-10 rounded-[7px] border border-cyan-300/14 bg-white/[0.035] px-4 text-sm font-bold text-slate-300">
+            取消
+          </button>
+          <button type="button" onClick={onSubmit} disabled={loading} className="cyan-button inline-flex h-10 min-w-[128px] items-center justify-center gap-2 rounded-[7px] px-4 text-sm font-black disabled:opacity-60">
+            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <TestTube2 className="h-4 w-4" />}
+            开始测试
+          </button>
+        </div>
+      </div>
+    </div>
   )
 }
 
@@ -606,7 +821,7 @@ function Aside({ result }: { result: TaskResult }) {
         ))}
         <p className="mt-2 grid grid-cols-[78px_1fr] text-[13px] leading-5">
           <span className="text-slate-500">参数配置</span>
-          <button className="text-left font-bold text-cyan-300">查看详情 ›</button>
+          <button type="button" onClick={() => pushToast({ kind: 'info', title: '参数配置', description: '可通过任务详情接口查看完整参数：GET /api/tasks/{taskId}/details。' })} className="text-left font-bold text-cyan-300">查看详情 ›</button>
         </p>
       </div>
 

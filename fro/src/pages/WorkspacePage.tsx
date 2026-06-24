@@ -402,6 +402,7 @@ function AudioAccessCard() {
 }
 
 function StrategyConfigCard({ running, onStart, onMock }: { running: boolean; onStart: (payload: ProtectionTaskRequest) => void; onMock: () => void }) {
+  const pushToast = useAppStore((state) => state.pushToast)
   const [selectedMode, setSelectedMode] = useState(3)
   const [selectedTargets, setSelectedTargets] = useState<Array<'semantic' | 'timbre' | 'joint'>>(['semantic'])
   const [lambdaModalOpen, setLambdaModalOpen] = useState(false)
@@ -441,7 +442,11 @@ function StrategyConfigCard({ running, onStart, onMock }: { running: boolean; on
           防护策略配置
           <Info className="h-4 w-4 text-slate-500" />
         </h2>
-        <button className="rounded-[6px] border border-cyan-300/14 bg-white/[0.03] px-3 py-2 text-sm text-slate-300">
+        <button
+          type="button"
+          onClick={() => pushToast({ kind: 'info', title: '策略模板', description: '当前页面已内置标准、强保护、高保真与高级自定义模板。' })}
+          className="rounded-[6px] border border-cyan-300/14 bg-white/[0.03] px-3 py-2 text-sm text-slate-300"
+        >
           <Settings className="mr-1 inline h-4 w-4" />
           策略模板
         </button>
@@ -453,7 +458,7 @@ function StrategyConfigCard({ running, onStart, onMock }: { running: boolean; on
             ['标准保护', '平衡安全与听感'],
             ['强保护', '更强安全性，略降听感'],
             ['高保真', '更优听感，安全性适中'],
-            ['高级自定义', '自由调整各项参数'],
+            ['高级自定义', '自由调整参数'],
           ].map(([name, sub], index) => (
             <button
               key={name}
@@ -476,7 +481,7 @@ function StrategyConfigCard({ running, onStart, onMock }: { running: boolean; on
           {[
             ['语义防护', '降低 ASR/LLM 理解概率', ShieldCheck, 'green', 'semantic'],
             ['Feature 特征防护', '阻断声学特征重建', Waves, 'blue', 'timbre'],
-            ['联合防护（推荐）', '语义 + Feature 联合防护', ShieldCheck, 'cyan', 'joint'],
+            ['联合防护（推荐）', '语义 + 特征联合防护', ShieldCheck, 'cyan', 'joint'],
           ].map(([name, sub, Icon, tone, target]) => {
             const selected = selectedTargets.includes(target as 'semantic' | 'timbre' | 'joint')
             return (
@@ -574,8 +579,16 @@ function StrategyConfigCard({ running, onStart, onMock }: { running: boolean; on
 }
 
 function ArchitectureCard() {
-  const [mode, setMode] = useState<'mock' | 'api'>(isMockMode ? 'mock' : 'api')
+  const pushToast = useAppStore((state) => state.pushToast)
+  const mode = isMockMode ? 'mock' : 'api'
   const apiStatusLabel = mode === 'api' ? '已配置' : 'Mock'
+  const notifyMode = (target: 'mock' | 'api') => {
+    if (target === mode) {
+      pushToast({ kind: 'info', title: '当前运行模式', description: target === 'api' ? `Backend：${apiBaseUrl}` : 'Mock Client' })
+      return
+    }
+    pushToast({ kind: 'info', title: '需要重启前端', description: `请设置 VITE_DATA_MODE=${target === 'api' ? 'backend' : 'mock'} 后重启 dev server。` })
+  }
 
   return (
     <section className="grid gap-3">
@@ -585,7 +598,7 @@ function ArchitectureCard() {
             <h2 className="text-[21px] font-black text-white">系统架构概览</h2>
             <p className="mt-2 text-sm text-slate-400">端到端语音克隆防护流程（E2E-VGuard）</p>
           </div>
-          <button className="text-sm font-bold text-cyan-300">查看详情 ›</button>
+          <button type="button" onClick={() => pushToast({ kind: 'info', title: '系统架构', description: '左侧上传音频，中间生成保护音频，右侧结果页可执行克隆测试与评估导出。' })} className="text-sm font-bold text-cyan-300">查看详情 ›</button>
         </div>
         <div className="grid grid-cols-[118px_36px_132px_36px_128px] items-center gap-2">
           <ArchBox title="输入音频" sub={<VariableSymbol name="x" />} icon={<Waves className="h-10 w-10 text-sky-200" />} />
@@ -608,11 +621,11 @@ function ArchitectureCard() {
 
       <div className="grid grid-cols-[1fr_238px] gap-3">
         <div className="ui-card p-4">
-          <h3 className="font-black text-lime-300">当前前端支持 Mock / API 快速切换</h3>
-          <p className="mt-2 text-sm leading-6 text-slate-400">您可使用 Mock 数据快速体验完整流程，或切换到后端 API 获得真实防护结果。</p>
+          <h3 className="font-black text-lime-300">当前前端运行模式</h3>
+          <p className="mt-2 text-sm leading-6 text-slate-400">运行模式由 VITE_DATA_MODE 控制；当前默认走后端 API，Mock 入口保留用于演示。</p>
           <div className="mt-4 inline-flex rounded-full border border-cyan-300/14 bg-slate-950/30 p-1">
-            <button type="button" onClick={() => setMode('mock')} className={cn('rounded-full px-5 py-2 text-sm font-black', mode === 'mock' ? 'bg-cyan-400 text-slate-950' : 'text-slate-400')}>Mock 模式</button>
-            <button type="button" onClick={() => setMode('api')} className={cn('rounded-full px-5 py-2 text-sm font-black', mode === 'api' ? 'bg-cyan-400 text-slate-950' : 'text-slate-400')}>API 模式</button>
+            <button type="button" onClick={() => notifyMode('mock')} className={cn('rounded-full px-5 py-2 text-sm font-black', mode === 'mock' ? 'bg-cyan-400 text-slate-950' : 'text-slate-400')}>Mock 模式</button>
+            <button type="button" onClick={() => notifyMode('api')} className={cn('rounded-full px-5 py-2 text-sm font-black', mode === 'api' ? 'bg-cyan-400 text-slate-950' : 'text-slate-400')}>API 模式</button>
           </div>
         </div>
         <div className="ui-card p-4">
@@ -620,7 +633,7 @@ function ArchitectureCard() {
             API 状态
             <span className={cn('rounded px-2 py-1 text-xs', mode === 'api' ? 'bg-emerald-400/14 text-emerald-300' : 'bg-cyan-400/14 text-cyan-300')}>{apiStatusLabel}</span>
           </h3>
-          {['POST /api/files/upload', 'POST /api/tasks/protect', 'GET /api/tasks/{id}'].map((item) => (
+          {['POST /api/files/upload', 'POST /api/tasks/protect', 'GET /api/tasks/{id}', 'POST /api/tasks/{id}/clone-voice'].map((item) => (
             <p key={item} className="mt-3 flex justify-between border-b border-cyan-300/8 pb-2 text-xs text-slate-300">
               <span>{item.split(' ')[1]}</span>
               <span className={mode === 'api' ? 'text-emerald-300' : 'text-cyan-300'}>{item.split(' ')[0]}</span>
