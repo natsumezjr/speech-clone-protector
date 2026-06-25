@@ -34,7 +34,7 @@ export function Toaster() {
               <Icon className="mt-0.5 h-5 w-5 shrink-0" />
               <div className="min-w-0 flex-1">
                 <p className="text-sm font-semibold">{toast.title}</p>
-                {toast.description ? <p className="mt-1 text-xs leading-5 opacity-80">{toast.description}</p> : null}
+                {toast.description ? <p className="mt-1 max-h-[140px] overflow-y-auto whitespace-pre-line break-words pr-1 text-xs leading-5 opacity-80">{toast.description}</p> : null}
               </div>
               <button
                 aria-label="关闭提示"

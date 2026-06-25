@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-  Box,
   CheckSquare,
   ChevronDown,
   Copy,
@@ -22,42 +21,128 @@ import {
   X,
 } from 'lucide-react'
 
-import { createProtectionTask, uploadFile } from '@/services/apiClient'
+import { createProtectionTask, getCapabilities, getTaskStatus, uploadFile } from '@/services/apiClient'
 import { useAppStore } from '@/store/appStore'
 import { useTaskStore } from '@/store/taskStore'
-import type { ProtectionTaskRequest, TaskStatusResponse } from '@/types/task'
-import { apiBaseUrl, isBackendMode, isMockMode } from '@/config/runtime'
+import type { CapabilitiesResponse, NumericConfigRange, ProtectionMode, ProtectionRuntimeConfig, ProtectionTarget, ProtectionTaskRequest, RuntimeModelOption, TaskStatusResponse } from '@/types/task'
+import { apiBaseUrl } from '@/config/runtime'
 import { cn } from '@/lib/utils'
 import { AudioPlayer } from '@/components/audio/AudioPlayer'
+import { MathText } from '@/components/common/MathText'
+import { formatTaskFailure } from '@/utils/apiError'
 import { formatDurationSeconds, getAudioDuration, getRecordedExtension, getRecorderMimeType, readAudioDuration } from '@/utils/audio'
 import { formatBytes, shortHash } from '@/utils/format'
 
-const MAX_AUDIO_SIZE = 200 * 1024 * 1024
+const TASK_STATUS_POLL_MS = 1000
 
-const defaultPayload: ProtectionTaskRequest = {
-  mode: 'custom',
-  targets: ['semantic', 'timbre'],
-  semantic: { enabled: true, asrModel: 'Paraformer-large', encoders: ['S3', 'Whisper', 'MFCC'], lambdaSemantic: 0.15 },
-  timbre: { enabled: true, mode: 'untargeted', encoders: ['HuBERT'], lambdaTimbre: 0.2 },
-  psychoacoustic: { enabled: true, lambdaPsy: 0.15 },
-  optimization: { epsilon: 0.08, steps: 20 },
+const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))
+
+function configFromCapabilities(capabilities: CapabilitiesResponse | null): ProtectionRuntimeConfig | undefined {
+  if (!capabilities) return undefined
+  if (capabilities.config) return capabilities.config
+  if (capabilities.defaults && capabilities.ranges && capabilities.models) {
+    return {
+      defaults: capabilities.defaults,
+      ranges: capabilities.ranges,
+      models: capabilities.models,
+      constraints: capabilities.constraints,
+    }
+  }
+  return undefined
 }
 
-function ProtectionLoadingModal({ progress }: { progress: number }) {
+type UiModelOption = {
+  label: string
+  value: string
+  backendValue?: string
+  status?: string
+  reason?: string | null
+}
+
+function optionItems(options?: Array<string | RuntimeModelOption>): UiModelOption[] {
+  return (options ?? []).map((option) => (typeof option === 'string' ? { label: option, value: option } : { label: option.label ?? option.value, value: option.value, backendValue: option.backendValue, status: option.status, reason: option.reason }))
+}
+
+function optionValues(options?: Array<string | RuntimeModelOption>) {
+  return (options ?? []).map((option) => (typeof option === 'string' ? option : option.value)).filter(Boolean)
+}
+
+function pctFromRange(value: number, range: NumericConfigRange) {
+  if (range.max <= range.min) return 0
+  return ((value - range.min) / (range.max - range.min)) * 100
+}
+
+function clampToRange(value: number, range: NumericConfigRange) {
+  return Math.max(range.min, Math.min(range.max, value))
+}
+
+function numericFromPreset(value: unknown, fallback: number, range: NumericConfigRange) {
+  return clampToRange(typeof value === 'number' && Number.isFinite(value) ? value : fallback, range)
+}
+
+function decimalPlacesFromStep(step: number) {
+  if (!Number.isFinite(step) || step <= 0) return 3
+  const normalized = step.toString().toLowerCase()
+  if (normalized.includes('e-')) return Number(normalized.split('e-')[1])
+  const decimal = normalized.split('.')[1]
+  return decimal ? decimal.length : 0
+}
+
+function formatParameterValue(value: number, range: NumericConfigRange) {
+  if (!Number.isFinite(value)) return ''
+  const decimals = Math.min(8, Math.max(0, decimalPlacesFromStep(range.step)))
+  const fixed = value.toFixed(decimals)
+  return fixed.replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '')
+}
+
+function formatScientificParameterValue(value: number) {
+  if (!Number.isFinite(value)) return ''
+  if (value === 0) return '0'
+  return value.toExponential(2).replace(/\.?0+e/, 'e').replace('e-0', 'e-').replace('e+0', 'e+')
+}
+
+function clampProgress(value: unknown) {
+  const progress = typeof value === 'number' && Number.isFinite(value) ? value : 0
+  return Math.max(0, Math.min(1, progress))
+}
+
+function isDoneStatus(status: TaskStatusResponse) {
+  return status.status === 'completed' || status.status === 'success'
+}
+
+function isFailedStatus(status: TaskStatusResponse) {
+  return status.status === 'failed' || status.status === 'error'
+}
+
+function isTransientTaskNotFound(error: unknown) {
+  const message = error instanceof Error ? error.message : ''
+  return /task not found/i.test(message) || /TASK_NOT_FOUND/.test(message)
+}
+
+function ProtectionProgressBar({ progress, status }: { progress: number; status?: TaskStatusResponse | null }) {
+  const stepLabel =
+    typeof status?.currentStep === 'number' && typeof status.totalSteps === 'number'
+      ? `优化步 ${status.currentStep}/${status.totalSteps}`
+      : status?.stage
   return (
-    <div className="fixed inset-0 z-[80] grid place-items-center bg-slate-950/60 px-4 backdrop-blur-sm" role="alertdialog" aria-live="assertive" aria-label="正在生成保护音频">
-      <div className="ui-card w-full max-w-sm p-8 text-center">
-        <div className="mx-auto grid h-16 w-16 place-items-center rounded-full border border-cyan-300/18 bg-cyan-400/10">
-          <Loader2 className="h-9 w-9 animate-spin text-cyan-300" />
+    <section className="ui-card p-4">
+      <div className="flex items-center gap-3">
+        <Loader2 className="h-5 w-5 animate-spin shrink-0 text-cyan-300" />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center justify-between gap-3">
+            <h3 className="text-sm font-black text-white">正在生成保护音频</h3>
+            <p className="font-mono text-xs text-slate-400 shrink-0">{Math.round(progress * 100)}%</p>
+          </div>
+          <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-800">
+            <div className="h-full rounded-full bg-cyan-400 transition-all duration-500" style={{ width: `${Math.max(4, Math.round(progress * 100))}%` }} />
+          </div>
+          <div className="mt-1.5 flex items-center gap-4">
+            {stepLabel ? <p className="text-xs font-semibold text-cyan-200">{stepLabel}</p> : null}
+            {status?.message ? <p className="truncate text-xs leading-5 text-slate-400">{status.message}</p> : null}
+          </div>
         </div>
-        <h3 className="mt-5 text-lg font-black text-white">正在生成保护音频</h3>
-        <p className="mt-2 text-sm leading-6 text-slate-300">系统正在执行语义防护、Feature 特征防护与听感约束，请稍候。</p>
-        <div className="mt-5 h-2 overflow-hidden rounded-full bg-slate-800">
-          <div className="h-full rounded-full bg-cyan-400 transition-all duration-300" style={{ width: `${Math.max(8, Math.round(progress * 100))}%` }} />
-        </div>
-        <p className="mt-2 font-mono text-xs text-slate-500">{Math.round(progress * 100)}%</p>
       </div>
-    </div>
+    </section>
   )
 }
 
@@ -67,18 +152,77 @@ function revokeObjectUrl(url?: string) {
 
 export function WorkspacePage() {
   const navigate = useNavigate()
+  const mountedRef = useRef(true)
   const [progress, setProgress] = useState(0)
   const [running, setRunning] = useState(false)
   const [taskId, setTaskId] = useState<string>()
   const [taskStatus, setTaskStatus] = useState<TaskStatusResponse | null>(null)
+  const [capabilities, setCapabilities] = useState<CapabilitiesResponse | null>(null)
+  const [configError, setConfigError] = useState<string | null>(null)
 
   const pushToast = useAppStore((state) => state.pushToast)
   const uploadedFile = useTaskStore((state) => state.uploadedFile)
   const setCurrentTaskStatus = useTaskStore((state) => state.setCurrentTaskStatus)
+  const runtimeConfig = configFromCapabilities(capabilities)
 
-  const startTask = async (payload: ProtectionTaskRequest = defaultPayload) => {
-    if (isBackendMode && !uploadedFile?.fileId) {
-      pushToast({ kind: 'error', title: '无法创建任务', description: 'Backend 模式下请先上传音频并等待后端返回 fileId。' })
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
+
+  useEffect(() => {
+    let active = true
+    getCapabilities()
+      .then((payload) => {
+        if (!active) return
+        setCapabilities(payload)
+        if (!configFromCapabilities(payload)) {
+          setConfigError('后端 capabilities 未返回运行时参数配置。')
+        }
+      })
+      .catch((error) => {
+        if (!active) return
+        setCapabilities(null)
+        setConfigError(error instanceof Error ? error.message : '无法读取后端参数配置。')
+      })
+    return () => {
+      active = false
+    }
+  }, [])
+
+  const applyStatus = (status: TaskStatusResponse) => {
+    if (!mountedRef.current) return
+    const nextProgress = isDoneStatus(status) ? 1 : clampProgress(status.progress)
+    setProgress(nextProgress)
+    setTaskStatus(status)
+    setCurrentTaskStatus(status)
+  }
+
+  const waitForBackendTask = async (createdTaskId: string) => {
+    const startedAt = Date.now()
+    while (mountedRef.current) {
+      let latest: TaskStatusResponse
+      try {
+        latest = await getTaskStatus(createdTaskId)
+      } catch (error) {
+        if (Date.now() - startedAt < 5000 && isTransientTaskNotFound(error)) {
+          await wait(250)
+          continue
+        }
+        throw error
+      }
+      applyStatus(latest)
+      if (isDoneStatus(latest) || isFailedStatus(latest)) return latest
+      await wait(TASK_STATUS_POLL_MS)
+    }
+    return null
+  }
+
+  const startTask = async (payload: ProtectionTaskRequest) => {
+    if (!uploadedFile?.fileId) {
+pushToast({ kind: 'error', title: '无法创建任务', description: '后端模式下请先上传音频并等待后端返回 fileId。' })
       return
     }
 
@@ -89,28 +233,15 @@ export function WorkspacePage() {
 
       const created = await createProtectionTask({ ...payload, fileId: uploadedFile?.fileId ?? payload.fileId })
       setTaskId(created.taskId)
-      pushToast({ kind: 'success', title: '任务已创建', description: isMockMode ? 'Mock 演示结果已准备。' : `任务 ID：${created.taskId}` })
+      pushToast({ kind: 'success', title: '任务已创建', description: `任务 ID：${created.taskId}` })
 
-      if (isMockMode) {
-        const now = new Date().toLocaleString('zh-CN', { hour12: false })
-        const status: TaskStatusResponse = {
-          taskId: created.taskId,
-          status: 'completed',
-          progress: 1,
-          stage: 'report_generation',
-          message: 'Mock 演示任务完成',
-          createdAt: now,
-          updatedAt: now,
-          error: null,
-        }
-        setProgress(1)
+      const finalStatus = await waitForBackendTask(created.taskId)
+      if (!finalStatus) return
+      if (isFailedStatus(finalStatus)) {
         setRunning(false)
-        setCurrentTaskStatus(status)
-        setTaskStatus(status)
-        navigate(`/results/${created.taskId}`)
+        pushToast({ kind: 'error', title: '任务执行失败', description: formatTaskFailure(finalStatus) })
         return
       }
-
       setRunning(false)
       navigate(`/results/${created.taskId}`)
     } catch (error) {
@@ -122,18 +253,18 @@ export function WorkspacePage() {
   return (
     <div className="space-y-3">
       <div className="grid grid-cols-[448px_1fr_514px] gap-3 max-2xl:grid-cols-[448px_1fr_514px] max-xl:grid-cols-1">
-        <AudioAccessCard />
-        <StrategyConfigCard running={running} onStart={(payload) => void startTask(payload)} onMock={() => navigate('/results/mock-task-001')} />
+        <AudioAccessCard maxAudioSizeBytes={runtimeConfig?.constraints?.maxAudioSizeBytes} />
+        <StrategyConfigCard running={running} runtimeConfig={runtimeConfig} configError={configError} onStart={(payload) => void startTask(payload)} />
         <ArchitectureCard />
       </div>
 
       <TaskStatusStrip progress={progress} running={running} taskId={taskId} status={taskStatus} />
-      {running ? <ProtectionLoadingModal progress={progress} /> : null}
+      {running ? <ProtectionProgressBar progress={progress} status={taskStatus} /> : null}
     </div>
   )
 }
 
-function AudioAccessCard() {
+function AudioAccessCard({ maxAudioSizeBytes }: { maxAudioSizeBytes?: number }) {
   const inputRef = useRef<HTMLInputElement | null>(null)
   const recorderRef = useRef<MediaRecorder | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
@@ -175,8 +306,8 @@ function AudioAccessCard() {
 
   const handleFile = async (file?: File) => {
     if (!file) return
-    if (file.size > MAX_AUDIO_SIZE) {
-      pushToast({ kind: 'error', title: '文件过大', description: '单文件大小不能超过 200MB。' })
+    if (maxAudioSizeBytes && file.size > maxAudioSizeBytes) {
+      pushToast({ kind: 'error', title: '文件过大', description: `单文件大小不能超过 ${formatBytes(maxAudioSizeBytes)}。` })
       return
     }
 
@@ -199,11 +330,6 @@ function AudioAccessCard() {
       const durationSec = await readAudioDuration(objectUrl).catch(() => undefined)
       const localMeta = durationSec ? { ...baseMeta, durationSec, duration: durationSec } : baseMeta
       setUploadedFile(localMeta)
-
-      if (isMockMode) {
-        pushToast({ kind: 'success', title: '音频已接入', description: `${file.name} 可立即播放预览。` })
-        return
-      }
 
       const backendMeta = await uploadFile(file)
       setUploadedFile({ ...localMeta, ...backendMeta, objectUrl, rawFile: file })
@@ -282,6 +408,7 @@ function AudioAccessCard() {
     format: '-',
   }
   const duration = getAudioDuration(uploadedFile)
+  const maxAudioSizeLabel = maxAudioSizeBytes ? formatBytes(maxAudioSizeBytes) : '后端配置'
 
   return (
     <section className="ui-card min-h-[730px] p-4">
@@ -308,7 +435,7 @@ function AudioAccessCard() {
 
       {inputMode === 'upload' ? (
         <div
-          className="mt-5 grid min-h-[227px] place-items-center rounded-[12px] border border-dashed border-cyan-300/55 bg-sky-400/5 text-center transition hover:border-cyan-200 hover:bg-cyan-400/10"
+          className="mt-5 grid h-[300px] place-items-center rounded-[12px] border border-dashed border-cyan-300/55 bg-sky-400/5 text-center transition hover:border-cyan-200 hover:bg-cyan-400/10"
           onDragOver={(event) => event.preventDefault()}
           onDrop={(event) => {
             event.preventDefault()
@@ -321,7 +448,7 @@ function AudioAccessCard() {
             <p className="mt-3 text-[15px] leading-6 text-slate-300">
               支持 .wav / .flac / .mp3 / .m4a / .webm
               <br />
-              单文件 ≤ 200MB
+              单文件 ≤ {maxAudioSizeLabel}
             </p>
             <input ref={inputRef} type="file" accept=".wav,.mp3,.flac,.m4a,.webm,audio/*" className="hidden" onChange={(event) => void handleFile(event.target.files?.[0])} />
             <span onClick={() => inputRef.current?.click()} className="mt-6 inline-flex h-11 min-w-[180px] items-center justify-center gap-2 rounded-full bg-cyan-300 px-5 text-[17px] font-medium text-slate-950 shadow-[0_0_28px_rgba(34,211,238,0.25)] cursor-pointer">
@@ -331,7 +458,7 @@ function AudioAccessCard() {
           </div>
         </div>
       ) : (
-        <div className="mt-5 grid min-h-[227px] place-items-center rounded-[12px] border border-dashed border-cyan-300/55 bg-sky-400/5 text-center transition hover:border-cyan-200 hover:bg-cyan-400/10">
+        <div className="mt-5 grid h-[300px] place-items-center rounded-[12px] border border-dashed border-cyan-300/55 bg-sky-400/5 text-center transition hover:border-cyan-200 hover:bg-cyan-400/10">
           <div className="flex w-full flex-col items-center px-6 pt-6 pb-6 text-center">
             <button
               type="button"
@@ -401,37 +528,171 @@ function AudioAccessCard() {
   )
 }
 
-function StrategyConfigCard({ running, onStart, onMock }: { running: boolean; onStart: (payload: ProtectionTaskRequest) => void; onMock: () => void }) {
+function StrategyConfigCard({
+  running,
+  runtimeConfig,
+  configError,
+  onStart,
+}: {
+  running: boolean
+  runtimeConfig?: ProtectionRuntimeConfig
+  configError?: string | null
+  onStart: (payload: ProtectionTaskRequest) => void
+}) {
   const pushToast = useAppStore((state) => state.pushToast)
-  const [selectedMode, setSelectedMode] = useState(3)
-  const [selectedTargets, setSelectedTargets] = useState<Array<'semantic' | 'timbre' | 'joint'>>(['semantic'])
+  const [selectedMode, setSelectedMode] = useState<Exclude<ProtectionMode, 'joint'>>('standard')
+  const [selectedTarget, setSelectedTarget] = useState<ProtectionTarget | 'joint'>('joint')
   const [lambdaModalOpen, setLambdaModalOpen] = useState(false)
-  const [epsilon, setEpsilon] = useState(0.08)
-  const [steps, setSteps] = useState(20)
-  const [lambdaSem, setLambdaSem] = useState(0.18)
-  const [lambdaFeat, setLambdaFeat] = useState(0.22)
-  const [lambdaPsy, setLambdaPsy] = useState(0.12)
-  const [lambdaL2, setLambdaL2] = useState(0.01)
-  const [asrModel, setAsrModel] = useState('Paraformer-large')
-  const [featureModel, setFeatureModel] = useState('HuBERT (Base)')
+  const [epsilon, setEpsilon] = useState(0)
+  const [steps, setSteps] = useState(0)
+  const [lambdaSem, setLambdaSem] = useState(0)
+  const [lambdaFeat, setLambdaFeat] = useState(0)
+  const [lambdaPsy, setLambdaPsy] = useState(0)
+  const [lambdaL2, setLambdaL2] = useState(0)
+  const [selectedSemanticEncoders, setSelectedSemanticEncoders] = useState<string[]>([])
+  const [selectedFeatureModels, setSelectedFeatureModels] = useState<string[]>([])
+  const [modelModalOpen, setModelModalOpen] = useState(false)
 
-  const toggleTarget = (target: 'semantic' | 'timbre' | 'joint') => {
-    setSelectedTargets((current) => {
-      if (current.includes(target)) return current.length === 1 ? current : current.filter((item) => item !== target)
-      return [...current, target]
-    })
+  const applyPreset = (mode: Exclude<ProtectionMode, 'joint'>, config: ProtectionRuntimeConfig) => {
+    const defaults = config.defaults
+    const ranges = config.ranges
+    const preset = config.modePresets?.[mode]
+    setEpsilon(numericFromPreset(preset?.optimization?.epsilon, defaults.optimization.epsilon, ranges.epsilon))
+    setSteps(Math.max(1, Math.round(numericFromPreset(preset?.optimization?.steps, defaults.optimization.steps, ranges.steps))))
+    setLambdaSem(numericFromPreset(preset?.semantic?.weightSemantic, defaults.semantic.weightSemantic ?? ranges.weightSemantic.min, ranges.weightSemantic))
+    setLambdaFeat(numericFromPreset(preset?.timbre?.weightFeature, defaults.timbre.weightFeature ?? ranges.weightFeature.min, ranges.weightFeature))
+    setLambdaPsy(numericFromPreset(preset?.psychoacoustic?.weightPsy, defaults.psychoacoustic.weightPsy ?? ranges.weightPsy.min, ranges.weightPsy))
+    setLambdaL2(numericFromPreset(preset?.optimization?.weightL2 ?? defaults.optimization.weightL2, defaults.optimization.weightL2 ?? ranges.weightL2.min, ranges.weightL2))
+  }
+
+  useEffect(() => {
+    if (!runtimeConfig) return
+    const timeoutId = window.setTimeout(() => {
+      const defaults = runtimeConfig.defaults
+      const semanticOptions = optionValues(runtimeConfig.formSchema?.modelOptions?.semanticEncoders ?? runtimeConfig.models.semantic)
+      const featureOptions = optionValues(runtimeConfig.formSchema?.modelOptions?.timbreEncoders ?? runtimeConfig.models.timbre ?? runtimeConfig.models.feature)
+      const semanticEnabled = defaults.semantic.enabled || defaults.targets.includes('semantic')
+      const timbreEnabled = defaults.timbre.enabled || defaults.targets.includes('timbre')
+      const defaultMode = defaults.mode
+
+      setSelectedMode(defaultMode)
+      setSelectedTarget(defaultMode === 'custom' ? 'joint' : semanticEnabled && timbreEnabled ? 'joint' : semanticEnabled ? 'semantic' : timbreEnabled ? 'timbre' : 'joint')
+      applyPreset(defaultMode, runtimeConfig)
+      setSelectedSemanticEncoders(defaults.semantic.encoders?.length ? defaults.semantic.encoders : semanticOptions)
+      setSelectedFeatureModels(defaults.timbre.encoders.length ? defaults.timbre.encoders : featureOptions)
+    }, 0)
+    return () => window.clearTimeout(timeoutId)
+  }, [runtimeConfig])
+
+  if (!runtimeConfig) {
+    return (
+      <section className="ui-card min-h-[730px] p-5">
+        <div className="mb-6 flex items-center justify-between">
+          <h2 className="flex items-center gap-2 text-[21px] font-black text-white">
+            防护策略配置
+            <Info className="h-4 w-4 text-slate-500" />
+          </h2>
+          <span className="rounded-[6px] border border-cyan-300/14 bg-white/[0.03] px-3 py-2 text-sm text-slate-300">
+            capabilities
+          </span>
+        </div>
+        <div className="grid min-h-[560px] place-items-center rounded-[7px] border border-cyan-300/14 bg-slate-950/20 p-6 text-center">
+          <div>
+            {configError ? <Info className="mx-auto h-10 w-10 text-amber-300" /> : <Loader2 className="mx-auto h-10 w-10 animate-spin text-cyan-300" />}
+            <p className="mt-4 text-base font-black text-white">{configError ? '后端参数配置读取失败' : '正在读取后端参数配置'}</p>
+            <p className="mt-2 text-sm leading-6 text-slate-400">{configError || '默认参数、有效范围和模型列表将由 /api/capabilities 返回。'}</p>
+          </div>
+        </div>
+        <div className="mt-5 grid gap-3">
+          <button disabled className="cyan-button inline-flex h-[50px] items-center justify-center gap-2 rounded-[7px] text-[16px] font-black opacity-60">
+            <ShieldCheck className="h-5 w-5" />
+            开始生成保护音频
+          </button>
+        </div>
+      </section>
+    )
+  }
+
+  const epsilonRange = runtimeConfig.ranges.epsilon
+  const stepsRange = runtimeConfig.ranges.steps
+  const lambdaSemRange = runtimeConfig.ranges.weightSemantic
+  const lambdaFeatRange = runtimeConfig.ranges.weightFeature
+  const lambdaPsyRange = runtimeConfig.ranges.weightPsy
+  const lambdaL2Range = runtimeConfig.ranges.weightL2
+  const semanticOptionItems = optionItems(runtimeConfig.formSchema?.modelOptions?.semanticEncoders ?? runtimeConfig.models.semantic)
+  const featureOptionItems = optionItems(runtimeConfig.formSchema?.modelOptions?.timbreEncoders ?? runtimeConfig.models.timbre ?? runtimeConfig.models.feature)
+  const semanticOptions = semanticOptionItems.map((option) => option.value)
+  const featureOptions = featureOptionItems.map((option) => option.value)
+  const modeOptions = runtimeConfig.modes ?? [
+    { value: 'standard', label: '标准保护', description: '平衡安全与听感', targetPolicy: 'selectable' },
+    { value: 'strong', label: '强保护', description: '更强安全性，略降听感', targetPolicy: 'selectable' },
+    { value: 'high_fidelity', label: '高保真', description: '更优听感，安全性适中', targetPolicy: 'selectable' },
+    { value: 'custom', label: '自定义', description: '自由调整参数，仅允许联合', targetPolicy: 'joint_only' },
+  ]
+  const targetOptions = runtimeConfig.targets ?? [
+    { value: 'semantic', label: '语义防护', description: '降低 ASR/LLM 理解概率' },
+    { value: 'timbre', label: '语音特征防护', description: '阻断声学特征重建' },
+    { value: 'joint', label: '联合防护', description: '语义 + 语音特征联合防护' },
+  ]
+  const targetIconMap = {
+    semantic: { Icon: ShieldCheck, tone: 'green' },
+    timbre: { Icon: Waves, tone: 'blue' },
+    joint: { Icon: ShieldCheck, tone: 'cyan' },
+  } as const
+  const targetLocked = selectedMode === 'custom'
+
+  const handleModeChange = (mode: string) => {
+    const nextMode = mode as Exclude<ProtectionMode, 'joint'>
+    setSelectedMode(nextMode)
+    if (nextMode === 'custom') setSelectedTarget('joint')
+    applyPreset(nextMode, runtimeConfig)
+  }
+
+  const switchToCustom = () => {
+    if (selectedMode !== 'custom') {
+      setSelectedMode('custom')
+      setSelectedTarget('joint')
+      pushToast({ id: 'workspace-custom-mode-switch', kind: 'info', title: '已切换自定义', description: '参数配置仅在自定义联合模式生效。', dedupeMs: 2500 })
+    }
+  }
+
+  const updateNumber = (setter: (value: number) => void) => (value: number) => {
+    switchToCustom()
+    setter(value)
+  }
+
+  const toggleOption = (value: string, selected: string[], setter: (value: string[]) => void) => {
+    switchToCustom()
+    const next = selected.includes(value) ? selected.filter((item) => item !== value) : [...selected, value]
+    setter(next.length ? next : [value])
+  }
+
+  const openModelModal = () => {
+    switchToCustom()
+    setModelModalOpen(true)
   }
 
   const buildPayload = (): ProtectionTaskRequest => {
-    const semanticEnabled = selectedTargets.includes('semantic') || selectedTargets.includes('joint')
-    const featureEnabled = selectedTargets.includes('timbre') || selectedTargets.includes('joint')
+    const semanticEnabled = selectedTarget === 'semantic' || selectedTarget === 'joint'
+    const featureEnabled = selectedTarget === 'timbre' || selectedTarget === 'joint'
+    const safeSteps = Math.max(1, Math.round(clampToRange(steps, stepsRange)))
+    const safeSemanticEncoders = selectedSemanticEncoders.length ? selectedSemanticEncoders : semanticOptions
+    const safeFeatureModels = selectedFeatureModels.length ? selectedFeatureModels : featureOptions
     return {
-      mode: selectedMode === 0 ? 'standard' : selectedMode === 1 ? 'strong' : selectedMode === 2 ? 'high_fidelity' : 'custom',
+      mode: selectedMode,
+      profile: runtimeConfig.activeDefaultProfile ?? 'formal',
       targets: [semanticEnabled ? 'semantic' : null, featureEnabled ? 'timbre' : null].filter(Boolean) as Array<'semantic' | 'timbre'>,
-      semantic: { enabled: semanticEnabled, asrModel, encoders: ['S3', 'Whisper', 'MFCC'], lambdaSemantic: lambdaSem },
-      timbre: { enabled: featureEnabled, mode: 'untargeted', encoders: [featureModel], lambdaTimbre: lambdaFeat },
-      psychoacoustic: { enabled: true, lambdaPsy },
-      optimization: { epsilon, steps },
+      semantic: {
+        enabled: semanticEnabled,
+        encoders: safeSemanticEncoders,
+        tokenizerPath: runtimeConfig.defaults.semantic.tokenizerPath,
+        hubertPath: runtimeConfig.defaults.semantic.hubertPath,
+        whisperPath: runtimeConfig.defaults.semantic.whisperPath,
+        weightSemantic: clampToRange(lambdaSem, lambdaSemRange),
+      },
+      timbre: { enabled: featureEnabled, mode: 'untargeted', encoders: safeFeatureModels, weightFeature: clampToRange(lambdaFeat, lambdaFeatRange) },
+      psychoacoustic: { enabled: true, weightPsy: clampToRange(lambdaPsy, lambdaPsyRange) },
+      optimization: { epsilon: clampToRange(epsilon, epsilonRange), steps: safeSteps, weightL2: clampToRange(lambdaL2, lambdaL2Range) },
     }
   }
 
@@ -454,65 +715,61 @@ function StrategyConfigCard({ running, onStart, onMock }: { running: boolean; on
 
       <ConfigBlock title="保护模式">
         <div className="grid grid-cols-4 gap-2.5">
-          {[
-            ['标准保护', '平衡安全与听感'],
-            ['强保护', '更强安全性，略降听感'],
-            ['高保真', '更优听感，安全性适中'],
-            ['高级自定义', '自由调整参数'],
-          ].map(([name, sub], index) => (
+          {modeOptions.map((mode) => (
             <button
-              key={name}
+              key={mode.value}
               type="button"
-              onClick={() => setSelectedMode(index)}
+              onClick={() => handleModeChange(mode.value)}
               className={cn(
                 'h-[70px] rounded-[6px] border bg-slate-950/18 px-3 text-left',
-                index === selectedMode ? 'border-cyan-400 bg-cyan-400/8 text-cyan-200' : 'border-cyan-300/12 text-slate-300',
+                mode.value === selectedMode ? 'border-cyan-400 bg-cyan-400/8 text-cyan-200' : 'border-cyan-300/12 text-slate-300',
               )}
             >
-              <p className="font-black">{name}</p>
-              <p className="mt-1 text-xs text-slate-500">{sub}</p>
+              <p className="font-black">{mode.label}</p>
+              <p className="mt-1 text-xs text-slate-500">{mode.description}</p>
             </button>
           ))}
         </div>
       </ConfigBlock>
 
-      <ConfigBlock title="防护目标（可多选）">
+      <ConfigBlock title="防护目标" helper={targetLocked ? '固定联合' : '三模式任选'}>
         <div className="grid grid-cols-3 gap-2.5">
-          {[
-            ['语义防护', '降低 ASR/LLM 理解概率', ShieldCheck, 'green', 'semantic'],
-            ['Feature 特征防护', '阻断声学特征重建', Waves, 'blue', 'timbre'],
-            ['联合防护（推荐）', '语义 + 特征联合防护', ShieldCheck, 'cyan', 'joint'],
-          ].map(([name, sub, Icon, tone, target]) => {
-            const selected = selectedTargets.includes(target as 'semantic' | 'timbre' | 'joint')
+          {targetOptions.map((target) => {
+            const targetValue = target.value as ProtectionTarget | 'joint'
+            const selected = selectedTarget === targetValue
+            const { Icon, tone } = targetIconMap[targetValue] ?? targetIconMap.joint
+            const disabled = targetLocked && targetValue !== 'joint'
             return (
             <button
-              key={String(name)}
+              key={target.value}
               type="button"
-              onClick={() => toggleTarget(target as 'semantic' | 'timbre' | 'joint')}
+              disabled={disabled}
+              onClick={() => setSelectedTarget(targetValue)}
               className={cn(
                 'h-[74px] rounded-[6px] border px-3 py-2 text-left',
                 selected ? 'border-cyan-400 bg-cyan-400/10' : 'border-cyan-300/12 bg-slate-950/18',
+                disabled && 'cursor-not-allowed opacity-45',
               )}
             >
               <p className="flex items-center gap-2 text-[14px] font-black leading-4 text-slate-100">
                 <Icon className={cn('h-5 w-5', tone === 'green' && 'text-emerald-300', tone === 'blue' && 'text-sky-300', tone === 'cyan' && 'text-cyan-300')} />
-                {name as string}
+                {target.label}
               </p>
-              <p className="mt-1 text-[11px] leading-4 text-slate-500">{sub as string}</p>
+              <p className="mt-1 text-[11px] leading-4 text-slate-500">{target.description}</p>
             </button>
             )
           })}
         </div>
       </ConfigBlock>
 
-      <ConfigBlock title="参数配置" helper="对抗优化与听感约束相关参数（高级自定义模式生效）">
+      <ConfigBlock title="参数配置" helper="自定义生效">
         <div className="space-y-5">
-          <SliderRow label="ε（扰动强度）" value={epsilon.toFixed(2)} pct={(epsilon / 0.12) * 100} min={0.01} max={0.12} step={0.01} numericValue={epsilon} onChange={setEpsilon} />
-          <SliderRow label="优化轮数（Steps）" value={String(steps)} pct={(steps / 40) * 100} min={8} max={40} step={1} numericValue={steps} onChange={setSteps} />
+          <SliderRow label="ε（扰动强度）" value={formatParameterValue(epsilon, epsilonRange)} pct={pctFromRange(epsilon, epsilonRange)} min={epsilonRange.min} max={epsilonRange.max} step={epsilonRange.step} numericValue={epsilon} onChange={updateNumber(setEpsilon)} />
+          <SliderRow label="优化轮数（Steps）" value={String(steps)} pct={pctFromRange(steps, stepsRange)} min={stepsRange.min} max={stepsRange.max} step={stepsRange.step} numericValue={steps} onChange={updateNumber((value) => setSteps(Math.round(value)))} />
         </div>
-        <div className="mt-5 grid grid-cols-2 gap-3">
-          <SelectInput label="ASR 模型" value={asrModel} onChange={setAsrModel} options={['Paraformer-large', 'Whisper-large-v3', 'Conformer-CTC']} />
-          <SelectInput label="Feature 编码器（声学特征分支）" value={featureModel} onChange={setFeatureModel} options={['HuBERT (Base)', 'WavLM-large', 'ECAPA-TDNN']} />
+        <div className="mt-5 grid grid-cols-1 gap-2.5 min-[1460px]:grid-cols-2">
+          <ModelSelectSummary label="语义编码器" values={selectedSemanticEncoders} options={semanticOptionItems} onOpen={openModelModal} />
+          <ModelSelectSummary label="特征编码器" values={selectedFeatureModels} options={featureOptionItems} onOpen={openModelModal} />
         </div>
         <button
           type="button"
@@ -525,10 +782,30 @@ function StrategyConfigCard({ running, onStart, onMock }: { running: boolean; on
         <div className="mt-5 rounded-[7px] border border-cyan-300/16 bg-sky-400/10 p-3 text-[12px] leading-5 text-slate-300">
           <p className="font-bold text-cyan-200">参数说明</p>
           <p>
-            <MathTerm>ε</MathTerm> 控制保护扰动的最大幅度，Steps 控制优化迭代次数；lamda 权重在高级选项弹窗中调节。建议先保持默认权重，再根据 ASR 干扰、Feature 相似度与听感质量进行微调。
+            <MathTerm>ε</MathTerm> 控制保护扰动的最大幅度，Steps 控制优化迭代次数；lamda 权重在高级选项弹窗中调节。建议先保持默认权重，再根据语义扰动、Feature 相似度与听感质量进行微调。
           </p>
         </div>
       </ConfigBlock>
+
+      {modelModalOpen ? (
+        <ModelConfigModal
+          semanticValues={selectedSemanticEncoders}
+          semanticOptions={semanticOptionItems}
+          featureValues={selectedFeatureModels}
+          featureOptions={featureOptionItems}
+          onToggleSemantic={(value) => toggleOption(value, selectedSemanticEncoders, setSelectedSemanticEncoders)}
+          onToggleFeature={(value) => toggleOption(value, selectedFeatureModels, setSelectedFeatureModels)}
+          onSelectAllSemantic={() => {
+            switchToCustom()
+            setSelectedSemanticEncoders(semanticOptions)
+          }}
+          onSelectAllFeature={() => {
+            switchToCustom()
+            setSelectedFeatureModels(featureOptions)
+          }}
+          onClose={() => setModelModalOpen(false)}
+        />
+      ) : null}
 
       {lambdaModalOpen ? (
         <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/68 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="lamda 高级参数">
@@ -546,10 +823,10 @@ function StrategyConfigCard({ running, onStart, onMock }: { running: boolean; on
               <OptimizationFormula className="text-[18px]" />
             </div>
             <div className="space-y-4">
-              <SliderRow label={<LambdaLabel name="sem" text="语义权重" />} labelText="lambda sem 语义权重" value={lambdaSem.toFixed(2)} pct={(lambdaSem / 0.3) * 100} min={0.01} max={0.3} step={0.01} numericValue={lambdaSem} onChange={setLambdaSem} />
-              <SliderRow label={<LambdaLabel name="feat" text="Feature 权重" />} labelText="lambda feat Feature 权重" value={lambdaFeat.toFixed(2)} pct={(lambdaFeat / 0.35) * 100} min={0.01} max={0.35} step={0.01} numericValue={lambdaFeat} onChange={setLambdaFeat} />
-              <SliderRow label={<LambdaLabel name="psy" text="听感约束" />} labelText="lambda psy 听感约束" value={lambdaPsy.toFixed(2)} pct={(lambdaPsy / 0.25) * 100} min={0.01} max={0.25} step={0.01} numericValue={lambdaPsy} onChange={setLambdaPsy} />
-              <SliderRow label={<LambdaLabel name="2" text="L2 正则" />} labelText="lambda 2 L2 正则" value={lambdaL2.toFixed(2)} pct={(lambdaL2 / 0.08) * 100} min={0.0} max={0.08} step={0.01} numericValue={lambdaL2} onChange={setLambdaL2} />
+              <SliderRow label={<LambdaLabel name="sem" text="语义权重" />} labelText="lambda sem 语义权重" value={formatParameterValue(lambdaSem, lambdaSemRange)} pct={pctFromRange(lambdaSem, lambdaSemRange)} min={lambdaSemRange.min} max={lambdaSemRange.max} step={lambdaSemRange.step} numericValue={lambdaSem} onChange={updateNumber(setLambdaSem)} />
+              <SliderRow label={<LambdaLabel name="feat" text="Feature 权重" />} labelText="lambda feat Feature 权重" value={formatParameterValue(lambdaFeat, lambdaFeatRange)} pct={pctFromRange(lambdaFeat, lambdaFeatRange)} min={lambdaFeatRange.min} max={lambdaFeatRange.max} step={lambdaFeatRange.step} numericValue={lambdaFeat} onChange={updateNumber(setLambdaFeat)} />
+              <SliderRow label={<LambdaLabel name="psy" text="听感约束" />} labelText="lambda psy 听感约束" value={formatScientificParameterValue(lambdaPsy)} pct={pctFromRange(lambdaPsy, lambdaPsyRange)} min={lambdaPsyRange.min} max={lambdaPsyRange.max} step={lambdaPsyRange.step} numericValue={lambdaPsy} onChange={updateNumber(setLambdaPsy)} />
+              <SliderRow label={<LambdaLabel name="2" text="L2 正则" />} labelText="lambda 2 L2 正则" value={formatParameterValue(lambdaL2, lambdaL2Range)} pct={pctFromRange(lambdaL2, lambdaL2Range)} min={lambdaL2Range.min} max={lambdaL2Range.max} step={lambdaL2Range.step} numericValue={lambdaL2} onChange={updateNumber(setLambdaL2)} />
             </div>
             <div className="mt-5 flex justify-end">
               <button type="button" onClick={() => setLambdaModalOpen(false)} className="cyan-button h-9 min-w-[112px] rounded-[6px] text-sm font-black">
@@ -562,14 +839,10 @@ function StrategyConfigCard({ running, onStart, onMock }: { running: boolean; on
 
       <div className="mt-5">
         <h3 className="mb-3 text-[15px] font-black text-white">任务执行</h3>
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid gap-3">
           <button disabled={running} onClick={() => onStart(buildPayload())} className="cyan-button inline-flex h-[50px] items-center justify-center gap-2 rounded-[7px] text-[16px] font-black disabled:opacity-60">
             {running ? <Loader2 className="h-5 w-5 animate-spin" /> : <ShieldCheck className="h-5 w-5" />}
             开始生成保护音频
-          </button>
-          <button onClick={onMock} className="inline-flex h-[50px] items-center justify-center gap-2 rounded-[7px] border border-cyan-300/18 bg-white/[0.03] text-[16px] font-bold text-slate-200">
-            <Box className="h-5 w-5" />
-            使用 Mock 数据演示
           </button>
         </div>
         <p className="mt-3 text-center text-xs text-slate-500">预计耗时：30~120 秒（视音频长度与参数复杂度）</p>
@@ -580,15 +853,6 @@ function StrategyConfigCard({ running, onStart, onMock }: { running: boolean; on
 
 function ArchitectureCard() {
   const pushToast = useAppStore((state) => state.pushToast)
-  const mode = isMockMode ? 'mock' : 'api'
-  const apiStatusLabel = mode === 'api' ? '已配置' : 'Mock'
-  const notifyMode = (target: 'mock' | 'api') => {
-    if (target === mode) {
-      pushToast({ kind: 'info', title: '当前运行模式', description: target === 'api' ? `Backend：${apiBaseUrl}` : 'Mock Client' })
-      return
-    }
-    pushToast({ kind: 'info', title: '需要重启前端', description: `请设置 VITE_DATA_MODE=${target === 'api' ? 'backend' : 'mock'} 后重启 dev server。` })
-  }
 
   return (
     <section className="grid gap-3">
@@ -608,44 +872,67 @@ function ArchitectureCard() {
           <ArchBox title="保护音频" sub={<VariableSymbol name="x" prime />} icon={<Waves className="h-10 w-10 text-sky-200" />} />
         </div>
         <div className="mt-8 grid grid-cols-3 gap-3">
-          <Branch title="语义分支" color="green" items={['ASR 系统', '多模型语义编码', '表示空间约束', '...']} />
+          <Branch title="语义分支" color="green" items={['语义理解模型', '多模型语义编码', '表示空间约束', '...']} />
           <Branch title="Feature 分支" color="blue" items={['Feature Encoder', '声学特征约束', '说话人不可恢复', '...']} />
           <Branch title="听感约束" color="purple" items={['心理声学模型', '掩蔽阈值建模', '听感优化', '...']} />
         </div>
         <div className="mt-6 rounded-[7px] border border-cyan-300/20 bg-sky-400/10 p-4 text-center text-sm text-slate-300">
           <span className="mr-3 text-slate-400">联合优化目标</span>
           <OptimizationFormula />
-          <p className="mt-2 text-xs text-slate-400">可以在高级自定义中调整实际 λ 参数</p>
+          <p className="mt-2 text-xs text-slate-400">可以在自定义中调整实际 λ 参数</p>
         </div>
       </div>
 
       <div className="grid grid-cols-[1fr_238px] gap-3">
-        <div className="ui-card p-4">
-          <h3 className="font-black text-lime-300">当前前端运行模式</h3>
-          <p className="mt-2 text-sm leading-6 text-slate-400">运行模式由 VITE_DATA_MODE 控制；当前默认走后端 API，Mock 入口保留用于演示。</p>
-          <div className="mt-4 inline-flex rounded-full border border-cyan-300/14 bg-slate-950/30 p-1">
-            <button type="button" onClick={() => notifyMode('mock')} className={cn('rounded-full px-5 py-2 text-sm font-black', mode === 'mock' ? 'bg-cyan-400 text-slate-950' : 'text-slate-400')}>Mock 模式</button>
-            <button type="button" onClick={() => notifyMode('api')} className={cn('rounded-full px-5 py-2 text-sm font-black', mode === 'api' ? 'bg-cyan-400 text-slate-950' : 'text-slate-400')}>API 模式</button>
+        <div className="ui-card h-[260px] overflow-hidden p-4">
+          <h3 className="font-black text-lime-300">损失函数说明</h3>
+          <div className="mt-3 max-h-[208px] overflow-y-auto pr-2 text-sm leading-6 text-slate-300">
+            <div className="space-y-3">
+              <LossTerm formula="L_{\mathrm{sem}}" title="语义损失">
+                拉开原始音频与保护音频在语义编码器或 speech tokenizer 表示空间中的距离，降低 ASR / LLM 对语音内容的稳定理解。
+              </LossTerm>
+              <LossTerm formula="L_{\mathrm{feat}}" title="特征/音色损失">
+                扰动说话人相关特征，使攻击者更难从保护音频中恢复原说话人的音色表示。
+              </LossTerm>
+              <LossTerm formula="L_{\mathrm{psy}}" title="心理声学损失">
+                约束扰动尽量落在人耳不敏感或可被原语音掩蔽的区域，降低可感知噪声。
+              </LossTerm>
+              <LossTerm formula="\lVert \delta \rVert_{2}" title="扰动范数约束">
+                限制整体扰动大小，避免保护音频被过度破坏。
+              </LossTerm>
+            </div>
           </div>
         </div>
         <div className="ui-card p-4">
           <h3 className="flex items-center justify-between font-black text-white">
             API 状态
-            <span className={cn('rounded px-2 py-1 text-xs', mode === 'api' ? 'bg-emerald-400/14 text-emerald-300' : 'bg-cyan-400/14 text-cyan-300')}>{apiStatusLabel}</span>
+            <span className="rounded bg-emerald-400/14 px-2 py-1 text-xs text-emerald-300">已配置</span>
           </h3>
           {['POST /api/files/upload', 'POST /api/tasks/protect', 'GET /api/tasks/{id}', 'POST /api/tasks/{id}/clone-voice'].map((item) => (
             <p key={item} className="mt-3 flex justify-between border-b border-cyan-300/8 pb-2 text-xs text-slate-300">
               <span>{item.split(' ')[1]}</span>
-              <span className={mode === 'api' ? 'text-emerald-300' : 'text-cyan-300'}>{item.split(' ')[0]}</span>
+              <span className="text-emerald-300">{item.split(' ')[0]}</span>
             </p>
           ))}
           <p className="mt-3 flex items-center justify-between text-xs text-slate-400">
-            服务地址：{mode === 'api' ? apiBaseUrl : 'Mock Client'}
+            服务地址：{apiBaseUrl}
             <Copy className="h-4 w-4" />
           </p>
         </div>
       </div>
     </section>
+  )
+}
+
+function LossTerm({ formula, title, children }: { formula: string; title: string; children: ReactNode }) {
+  return (
+    <div className="rounded-[7px] border border-cyan-300/10 bg-slate-950/24 px-3 py-2.5">
+      <p className="flex items-center gap-2 font-black text-slate-100">
+        <MathText formula={formula} className="text-cyan-200" />
+        {title}
+      </p>
+      <p className="mt-1 text-xs leading-5 text-slate-400">{children}</p>
+    </div>
   )
 }
 
@@ -758,7 +1045,26 @@ function SliderRow({
         </div>
       </div>
       </div>
-      <span className={cn('rounded-[6px] border border-cyan-300/16 bg-slate-950/32 py-1.5 text-center font-mono text-slate-200', compact ? 'px-1.5' : 'px-3')}>{value}</span>
+      <input
+        type="number"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(event) => {
+          const next = Number(event.target.value)
+          if (Number.isFinite(next)) onChange(next)
+        }}
+        onBlur={(event) => {
+          const next = Number(event.target.value)
+          if (Number.isFinite(next)) onChange(clampToRange(next, { min, max, step }))
+        }}
+        className={cn(
+          'rounded-[6px] border border-cyan-300/16 bg-slate-950/32 py-1.5 text-center font-mono text-slate-200 outline-none focus:border-cyan-300',
+          compact ? 'px-1.5' : 'px-3',
+        )}
+        aria-label={`${labelText ?? (typeof label === 'string' ? label : '参数')} 手动输入`}
+      />
     </div>
   )
 }
@@ -780,45 +1086,131 @@ function LambdaLabel({ name, text }: { name: string; text: string }) {
 
 function OptimizationFormula({ className }: { className?: string }) {
   return (
-    <span className={cn('font-serif italic tracking-normal text-slate-100', className)}>
-      <span className="text-cyan-100">L</span>
-      <span> = </span>
-      <span>λ</span>
-      <sub>sem</sub>
-      <span>L</span>
-      <sub>sem</sub>
-      <span> + λ</span>
-      <sub>feat</sub>
-      <span>L</span>
-      <sub>feat</sub>
-      <span> + λ</span>
-      <sub>psy</sub>
-      <span>L</span>
-      <sub>psy</sub>
-      <span> + λ</span>
-      <sub>2</sub>
-      <span>∥δ∥</span>
-      <sub>2</sub>
-    </span>
+    <MathText
+      formula="L = \lambda_{\mathrm{sem}} L_{\mathrm{sem}} + \lambda_{\mathrm{feat}} L_{\mathrm{feat}} + \lambda_{\mathrm{psy}} L_{\mathrm{psy}} + \lambda_{2}\lVert \delta \rVert_{2}"
+      className={cn('text-slate-100', className)}
+    />
   )
 }
 
-function SelectInput({ label, value, options, onChange }: { label: string; value: string; options: string[]; onChange: (value: string) => void }) {
+function selectionSummary(values: string[], options: UiModelOption[]) {
+  if (!options.length) return '后端未返回'
+  if (values.length >= options.length) return `默认全选 · ${options.length}`
+  return `已选 · ${values.length}/${options.length}`
+}
+
+function ModelSelectSummary({ label, values, options, onOpen }: { label: string; values: string[]; options: UiModelOption[]; onOpen: () => void }) {
   return (
-    <label className="text-sm text-slate-300">
-      {label}
-      <select
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-        className="mt-2 h-9 w-full rounded-[6px] border border-cyan-300/14 bg-slate-950/70 px-3 text-slate-200 outline-none transition focus:border-cyan-300"
-      >
-        {options.map((option) => (
-          <option key={option} value={option} className="bg-slate-950 text-slate-100">
-            {option}
-          </option>
-        ))}
-      </select>
-    </label>
+    <div className="min-h-[64px] rounded-[7px] border border-cyan-300/14 bg-slate-950/24 px-3 py-2.5">
+      <div className="flex h-full items-center justify-between gap-3">
+        <div className="min-w-0">
+          <p className="truncate whitespace-nowrap text-sm font-black leading-5 text-slate-200">{label}</p>
+          <p className="mt-1 truncate whitespace-nowrap text-xs leading-4 text-slate-500">{selectionSummary(values, options)}</p>
+        </div>
+        <button
+          type="button"
+          onClick={onOpen}
+          className="grid h-9 w-9 shrink-0 place-items-center rounded-[6px] border border-cyan-300/18 bg-cyan-400/10 text-cyan-100 hover:bg-cyan-400/16 disabled:cursor-not-allowed disabled:opacity-45"
+          disabled={!options.length}
+          aria-label={`配置${label}`}
+          title={`配置${label}`}
+        >
+          <SlidersHorizontal className="h-4 w-4" />
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function ModelConfigModal({
+  semanticValues,
+  semanticOptions,
+  featureValues,
+  featureOptions,
+  onToggleSemantic,
+  onToggleFeature,
+  onSelectAllSemantic,
+  onSelectAllFeature,
+  onClose,
+}: {
+  semanticValues: string[]
+  semanticOptions: UiModelOption[]
+  featureValues: string[]
+  featureOptions: UiModelOption[]
+  onToggleSemantic: (value: string) => void
+  onToggleFeature: (value: string) => void
+  onSelectAllSemantic: () => void
+  onSelectAllFeature: () => void
+  onClose: () => void
+}) {
+  return (
+    <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/68 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="代理模型和编码器配置">
+      <div className="ui-card w-full max-w-[680px] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.46)]">
+        <div className="mb-4 flex items-center justify-between">
+          <div>
+            <h3 className="text-[20px] font-black text-white">模型配置</h3>
+            <p className="mt-1 text-xs text-slate-500">多选代理模型与编码器</p>
+          </div>
+          <button type="button" onClick={onClose} className="grid h-9 w-9 place-items-center rounded-full border border-cyan-300/14 bg-white/[0.035] text-slate-300 hover:text-white" aria-label="关闭模型配置">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="grid gap-4 md:grid-cols-2">
+          <MultiChoiceGroup title="语义编码器" values={semanticValues} options={semanticOptions} onToggle={onToggleSemantic} onSelectAll={onSelectAllSemantic} />
+          <MultiChoiceGroup title="特征编码器" values={featureValues} options={featureOptions} onToggle={onToggleFeature} onSelectAll={onSelectAllFeature} />
+        </div>
+        <div className="mt-5 flex justify-end">
+          <button type="button" onClick={onClose} className="cyan-button h-10 min-w-[116px] rounded-[7px] text-sm font-black">
+            完成
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function MultiChoiceGroup({ title, values, options, onToggle, onSelectAll }: { title: string; values: string[]; options: UiModelOption[]; onToggle: (value: string) => void; onSelectAll: () => void }) {
+  return (
+    <div className="rounded-[8px] border border-cyan-300/14 bg-slate-950/24 p-4">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <p className="text-sm font-black text-slate-100">{title}</p>
+          <p className="mt-1 text-xs text-slate-500">{selectionSummary(values, options)}</p>
+        </div>
+        <button
+          type="button"
+          onClick={onSelectAll}
+          className="h-8 rounded-[6px] border border-cyan-300/16 bg-white/[0.035] px-3 text-xs font-bold text-slate-300 hover:text-white"
+        >
+          全选
+        </button>
+      </div>
+      <div className="max-h-[260px] space-y-2 overflow-y-auto pr-1">
+        {options.map((option) => {
+          const selected = values.includes(option.value)
+          const unavailable = option.status === 'unavailable'
+          return (
+            <button
+              key={option.value}
+              type="button"
+              disabled={unavailable}
+              title={unavailable ? option.reason ?? '后端不可用' : option.backendValue ?? option.value}
+              onClick={() => onToggle(option.value)}
+              className={cn(
+                'flex h-10 w-full items-center justify-between gap-3 rounded-[6px] border px-3 text-left text-sm font-bold transition',
+                selected ? 'border-cyan-300 bg-cyan-400/12 text-cyan-100' : 'border-cyan-300/14 bg-slate-950/45 text-slate-400',
+                unavailable && 'cursor-not-allowed opacity-45',
+              )}
+            >
+              <span className="min-w-0 truncate">{option.label}</span>
+              <span className={cn('grid h-4 w-4 shrink-0 place-items-center rounded border', selected ? 'border-cyan-300 bg-cyan-300 text-slate-950' : 'border-slate-600')}>
+                {selected ? <CheckSquare className="h-3 w-3" /> : null}
+              </span>
+            </button>
+          )
+        })}
+      </div>
+    </div>
   )
 }
 

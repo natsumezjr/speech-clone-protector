@@ -1,26 +1,81 @@
 import ReactECharts from 'echarts-for-react'
-import type { TrendPoint } from '@/types/task'
+import type { LossTrendPoint } from '@/types/task'
 
-export function TrendChart({ data }: { data: TrendPoint[] }) {
+const lossSeries = [
+  { key: 'Lfeat', tooltipName: 'L<sub>feat</sub>', color: '#22d3ee' },
+  { key: 'Lsem', tooltipName: 'L<sub>sem</sub>', color: '#22c55e' },
+  { key: 'Lpsy', tooltipName: 'L<sub>psy</sub>', color: '#f59e0b' },
+  { key: 'L2', tooltipName: 'L<sub>2</sub>', color: '#a78bfa' },
+] as const
+
+function formatLossValue(value: unknown) {
+  const numberValue = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(numberValue)) return '未返回'
+  const abs = Math.abs(numberValue)
+  if (abs > 0 && (abs < 0.001 || abs >= 10000)) return numberValue.toExponential(3)
+  return numberValue.toFixed(6).replace(/\.?0+$/, '')
+}
+
+export function TrendChart({ data }: { data: LossTrendPoint[] }) {
   const option = {
     backgroundColor: 'transparent',
+    animation: false,
     tooltip: {
       trigger: 'axis',
-      backgroundColor: 'rgba(7, 16, 31, 0.94)',
+      backgroundColor: 'rgba(7, 16, 31, 0.96)',
       borderColor: 'rgba(56, 189, 248, 0.22)',
       textStyle: { color: '#e2e8f0' },
+      formatter: (params: Array<{ axisValue: number | string; seriesName: string; marker: string; value: unknown }>) => {
+        const step = params[0]?.axisValue ?? '-'
+        const rows = params
+          .map((item) => `${item.marker}${item.seriesName}: ${formatLossValue(item.value)}`)
+          .join('<br/>')
+        const point = data.find((item) => String(item.step) === String(step))
+        const total = point?.total === null || point?.total === undefined ? '' : `<br/>total loss: ${formatLossValue(point.total)}`
+        return `step: ${step}<br/>${rows}${total}`
+      },
     },
-    legend: { textStyle: { color: '#cbd5e1' }, top: 0 },
-    grid: { left: 36, right: 16, top: 42, bottom: 28 },
-    xAxis: { type: 'category', data: data.map((item) => item.step), axisLabel: { color: '#94a3b8' } },
-    yAxis: { type: 'value', axisLabel: { color: '#94a3b8' }, splitLine: { lineStyle: { color: 'rgba(148,163,184,0.12)' } } },
-    series: [
-      { name: 'WER', type: 'line', smooth: true, data: data.map((item) => item.wer), color: '#22d3ee' },
-      { name: 'Feature 相似度', type: 'line', smooth: true, data: data.map((item) => item.sim), color: '#22c55e' },
-      { name: 'MOS-LQO', type: 'line', smooth: true, data: data.map((item) => item.mos / 5), color: '#f59e0b' },
-      { name: 'PESQ', type: 'line', smooth: true, data: data.map((item) => item.pesq / 5), color: '#8b5cf6' },
-    ],
+    axisPointer: { link: [{ xAxisIndex: [0, 1, 2, 3] }] },
+    legend: { show: false },
+    grid: lossSeries.map((_, index) => ({
+      left: 48,
+      right: 16,
+      top: `${5 + index * 24}%`,
+      height: '16%',
+      containLabel: false,
+    })),
+    xAxis: lossSeries.map((_, index) => ({
+      type: 'category',
+      gridIndex: index,
+      data: data.map((item) => item.step),
+      axisTick: { show: index === lossSeries.length - 1 },
+      axisLabel: { show: index === lossSeries.length - 1, color: '#94a3b8' },
+      axisLine: { lineStyle: { color: 'rgba(148,163,184,0.18)' } },
+    })),
+    yAxis: lossSeries.map((_, index) => ({
+      type: 'value',
+      gridIndex: index,
+      axisLabel: {
+        color: '#94a3b8',
+        formatter: (value: number) => formatLossValue(value),
+      },
+      splitNumber: 2,
+      splitLine: { lineStyle: { color: 'rgba(148,163,184,0.10)' } },
+    })),
+    series: lossSeries.map((series, index) => ({
+      name: series.tooltipName,
+      type: 'line',
+      xAxisIndex: index,
+      yAxisIndex: index,
+      smooth: true,
+      showSymbol: true,
+      symbolSize: 5,
+      connectNulls: false,
+      data: data.map((item) => item[series.key]),
+      color: series.color,
+      lineStyle: { width: 2 },
+    })),
   }
 
-  return <ReactECharts option={option} className="h-72 w-full" />
+  return <ReactECharts option={option} className="h-full w-full" />
 }

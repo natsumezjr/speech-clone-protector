@@ -1,28 +1,35 @@
 import { create } from 'zustand'
-import { dataMode, type DataMode } from '@/config/runtime'
 
 export type ToastKind = 'success' | 'error' | 'info'
 
 export interface ToastMessage {
-  id: number
+  id: string
   kind: ToastKind
   title: string
   description?: string
 }
 
 interface AppState {
-  dataMode: DataMode
   toasts: ToastMessage[]
-  pushToast: (toast: Omit<ToastMessage, 'id'>) => void
-  removeToast: (id: number) => void
+  pushToast: (toast: Omit<ToastMessage, 'id'> & { id?: string; dedupeMs?: number }) => void
+  removeToast: (id: string) => void
 }
 
+const recentToasts = new Map<string, number>()
+
 export const useAppStore = create<AppState>((set) => ({
-  dataMode,
   toasts: [],
   pushToast: (toast) =>
-    set((state) => ({
-      toasts: [...state.toasts, { ...toast, id: Date.now() + Math.random() }],
-    })),
+    set((state) => {
+      const id = toast.id ?? `${toast.kind}:${toast.title}:${toast.description ?? ''}`
+      const now = Date.now()
+      const dedupeMs = toast.dedupeMs ?? 2500
+      const previous = recentToasts.get(id) ?? 0
+      if (now - previous < dedupeMs) return state
+      recentToasts.set(id, now)
+      const nextToast = { kind: toast.kind, title: toast.title, description: toast.description, id }
+      const withoutSameId = state.toasts.filter((item) => item.id !== id)
+      return { toasts: [...withoutSameId, nextToast] }
+    }),
   removeToast: (id) => set((state) => ({ toasts: state.toasts.filter((toast) => toast.id !== id) })),
 }))

@@ -2,8 +2,9 @@ param(
   [int]$BackendPort = 8000,
   [int]$FrontendPort = 5173,
   [string]$HostAddress = "127.0.0.1",
-  [switch]$AllowFallback,
-  [switch]$DisableRealGuard
+  [switch]$DisableRealGuard,
+  [switch]$DisableAsr,
+  [string]$AsrModel = "openai-whisper:tiny"
 )
 
 $ErrorActionPreference = "Stop"
@@ -65,10 +66,12 @@ Write-Host "Starting backend: http://localhost:$BackendPort"
 $backendArgs = if ((Split-Path -Leaf $python) -eq "py.exe") { @("-3", "api_server.py") } else { @("api_server.py") }
 $previousBackendPort = $env:SEME2E_API_PORT
 $previousRealGuard = $env:SEME2E_API_REAL_GUARD
-$previousAllowFallback = $env:SEME2E_API_ALLOW_FALLBACK
+$previousEnableAsr = $env:SEME2E_ENABLE_ASR
+$previousAsrModel = $env:SEME2E_ASR_MODEL
 $env:SEME2E_API_PORT = [string]$BackendPort
 $env:SEME2E_API_REAL_GUARD = if ($DisableRealGuard) { "0" } else { "1" }
-$env:SEME2E_API_ALLOW_FALLBACK = if ($AllowFallback) { "1" } else { "0" }
+$env:SEME2E_ENABLE_ASR = if ($DisableAsr) { "0" } else { "1" }
+$env:SEME2E_ASR_MODEL = $AsrModel
 $backend = Start-Process -FilePath $python -ArgumentList $backendArgs -WorkingDirectory $BackendDir -RedirectStandardOutput $backendOut -RedirectStandardError $backendErr -PassThru -WindowStyle Hidden
 if ($null -eq $previousBackendPort) {
   Remove-Item Env:\SEME2E_API_PORT -ErrorAction SilentlyContinue
@@ -80,10 +83,15 @@ if ($null -eq $previousRealGuard) {
 } else {
   $env:SEME2E_API_REAL_GUARD = $previousRealGuard
 }
-if ($null -eq $previousAllowFallback) {
-  Remove-Item Env:\SEME2E_API_ALLOW_FALLBACK -ErrorAction SilentlyContinue
+if ($null -eq $previousEnableAsr) {
+  Remove-Item Env:\SEME2E_ENABLE_ASR -ErrorAction SilentlyContinue
 } else {
-  $env:SEME2E_API_ALLOW_FALLBACK = $previousAllowFallback
+  $env:SEME2E_ENABLE_ASR = $previousEnableAsr
+}
+if ($null -eq $previousAsrModel) {
+  Remove-Item Env:\SEME2E_ASR_MODEL -ErrorAction SilentlyContinue
+} else {
+  $env:SEME2E_ASR_MODEL = $previousAsrModel
 }
 
 Write-Host "Starting frontend: http://localhost:$FrontendPort"

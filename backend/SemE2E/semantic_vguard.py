@@ -9,6 +9,7 @@ warnings.filterwarnings("ignore")
 
 import librosa
 import numpy as np
+import onnx
 import soundfile as sf
 import torch
 import torch.optim as optim
@@ -202,7 +203,7 @@ class SemanticE2EVGuard:
 
         if self.use_cosyvoice and self.paths.cosyvoice_campplus.exists():
             try:
-                self.encoder_cosyvoice = convert(str(self.paths.cosyvoice_campplus)).to(self.device)
+                self.encoder_cosyvoice = convert(onnx.load(str(self.paths.cosyvoice_campplus))).to(self.device)
                 self.encoder_cosyvoice.eval()
                 self.active_timbre_encoders.append("cosyvoice")
             except Exception as exc:
@@ -356,13 +357,19 @@ class SemanticE2EVGuard:
             wave = wave.detach().cpu().numpy()
         sf.write(str(output_path), wave, samplerate=sr)
 
-    def protect(self, input_wav, output_wav=None, verbose=False):
+    @staticmethod
+    def load_audio(input_wav):
+        wave, sr = sf.read(str(input_wav), dtype="float32", always_2d=True)
+        wave = torch.from_numpy(wave.T)
+        return wave, sr
+
+    def protect(self, input_wav, output_wav=None, verbose=False, progress_callback=None, cancel_event=None):
         input_wav = Path(input_wav).resolve()
         if output_wav is None:
             output_wav = input_wav.with_name(f"{input_wav.stem}_semantic.wav")
         output_wav = Path(output_wav).resolve()
 
-        wave, sr = torchaudio.load(str(input_wav))
+        wave, sr = self.load_audio(input_wav)
         original_length = wave.shape[1]
         if original_length < sr:
             wave = torch.cat((wave, torch.zeros((1, sr - original_length))), dim=1)
@@ -394,8 +401,25 @@ class SemanticE2EVGuard:
 
         loss_items = {}
         optimization_trace = []
-        trace_every = max(1, self.max_items // 20)
+
+        def trace_step_numbers(total_steps):
+            if total_steps <= 10:
+                return set(range(1, total_steps + 1))
+            if total_steps % 10 == 0:
+                interval = total_steps // 10
+                return set(range(interval, total_steps + 1, interval))
+            if total_steps < 20:
+                return set(range(1, min(7, total_steps) + 1)) | set(range(max(1, total_steps - 2), total_steps + 1))
+            points = {1, total_steps}
+            for index in range(1, 9):
+                points.add(round(index * (total_steps - 1) / 9) + 1)
+            return points
+
+        trace_steps = trace_step_numbers(self.max_items)
         for step in tqdm(range(self.max_items)):
+            step_number = step + 1
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("TASK_CANCELLED")
             adv_wave_16k = transform_16k(adv_wave)
 
             adv_timbre = self.get_timbre_embeddings(adv_wave_16k, 16000)
@@ -431,18 +455,30 @@ class SemanticE2EVGuard:
                 "loss_total": f"{loss.item():.6f}",
             }
 
-            if step == 0 or step == self.max_items - 1 or step % trace_every == 0:
-                optimization_trace.append(
-                    {
-                        "step": step,
-                        "Lfea": float(loss_timbre.item()),
-                        "Lsem": float(loss_semantic.item()),
-                        "Lpsy": float(loss_psy.item()),
-                        "L2": float(loss_l2.item()),
-                        "total": float(loss.item()),
-                        "snr": float(self.calculate_snr(wave, adv_wave.detach()).item()),
-                    }
-                )
+            trace_point = None
+            if step_number in trace_steps:
+                trace_point = {
+                    "step": step_number,
+                    "Lfeat": float(loss_timbre.item()),
+                    "Lsem": float(loss_semantic.item()),
+                    "Lpsy": float(loss_psy.item()),
+                    "L2": float(loss_l2.item()),
+                    "total": float(loss.item()),
+                    "snr": float(self.calculate_snr(wave, adv_wave.detach()).item()),
+                }
+                optimization_trace.append(trace_point)
+            if progress_callback is not None:
+                try:
+                    progress_callback(
+                        step=step_number,
+                        total=self.max_items,
+                        loss_items=loss_items,
+                        trace=trace_point,
+                    )
+                except Exception as exc:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise RuntimeError("TASK_CANCELLED") from exc
+                    pass
 
             if verbose and step % 50 == 0:
                 print(step, loss_items, self.lr)

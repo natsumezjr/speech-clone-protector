@@ -8,7 +8,8 @@ MetricValue = int | float | None
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
+    return f"{now.year}.{now.month}.{now.day} {now.hour:02d}:{now.minute:02d}:{now.second:02d}"
 
 
 def metric_source(value: MetricValue, source: str, status: str | None = None) -> dict[str, Any]:
@@ -37,7 +38,7 @@ def empty_details() -> dict[str, Any]:
             "sampleRate": None,
             "durationSec": None,
             "lossFinal": {
-                "Lfea": None,
+                "Lfeat": None,
                 "Lsem": None,
                 "Lpsy": None,
                 "L2": None,

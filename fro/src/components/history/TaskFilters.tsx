@@ -32,6 +32,7 @@ export function TaskFilters({ search, status, mode, onSearchChange, onStatusChan
         <option value="standard">标准保护</option>
         <option value="strong">强保护</option>
         <option value="high_fidelity">高保真</option>
+        <option value="custom">自定义</option>
         <option value="joint">联合防护</option>
       </select>
     </div>

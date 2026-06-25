@@ -6,7 +6,7 @@ import { cn } from '@/lib/utils'
 const navItems = [
   { label: '首页', href: '/' },
   { label: '防护工作台', href: '/workspace' },
-  { label: '结果分析', href: '/results/mock-task-001' },
+  { label: '结果分析', href: '/results' },
   { label: '历史任务', href: '/history' },
 ]
 
@@ -44,8 +44,7 @@ export function TopNav() {
         <div className="flex items-center justify-end gap-5 max-lg:gap-2">
           <div className="hidden h-[36px] items-center gap-2 rounded-full border border-cyan-300/12 bg-cyan-400/[0.05] px-4 py-2 text-sm font-semibold text-slate-300 md:flex">
             <ShieldCheck className="h-4 w-4 text-emerald-300" />
-            系统防护中
-            <span className="h-2.5 w-2.5 rounded-full bg-lime-400 shadow-[0_0_10px_rgba(132,204,22,0.9)]" />
+            防护工作流
           </div>
           <button className="grid h-10 w-10 place-items-center rounded-full text-slate-300 transition hover:bg-white/5" aria-label="通知">
             <Bell className="h-5 w-5" />

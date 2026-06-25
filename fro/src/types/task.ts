@@ -1,7 +1,8 @@
-import type { DataMode } from '@/config/runtime'
 import type { AudioFileMeta } from './audio'
 
-export type TaskStatus = 'queued' | 'running' | 'completed' | 'success' | 'failed' | 'error'
+export type DataMode = 'backend'
+
+export type TaskStatus = 'queued' | 'running' | 'completed' | 'success' | 'failed' | 'error' | 'cancelled'
 export type ProtectionMode = 'standard' | 'strong' | 'high_fidelity' | 'custom' | 'joint'
 export type ProtectionTarget = 'semantic' | 'timbre'
 export type TaskStage =
@@ -11,31 +12,71 @@ export type TaskStage =
   | 'psychoacoustic_constraint'
   | 'result_evaluation'
   | 'report_generation'
+  | 'protect_generation'
+  | 'semantic_tokenizer_eval'
+  | 'asr_eval'
+  | 'speaker_eval'
+  | 'downstream_tts_eval'
+  | 'perception_eval'
 
 export interface ProtectionTaskRequest {
   fileId?: string
   mode: Exclude<ProtectionMode, 'joint'>
+  profile?: 'formal' | string
   targets: ProtectionTarget[]
   semantic: {
     enabled: boolean
-    asrModel: string
+    asrModel?: string
+    asrModels?: string[]
     encoders: string[]
-    lambdaSemantic: number
+    tokenizerPath?: string
+    hubertPath?: string
+    whisperPath?: string
+    weightSemantic?: number
+    lambdaSemantic?: number
   }
   timbre: {
     enabled: boolean
     mode: 'untargeted' | 'targeted'
     encoders: string[]
-    lambdaTimbre: number
+    weightFeature?: number
+    lambdaTimbre?: number
   }
   psychoacoustic: {
     enabled: boolean
-    lambdaPsy: number
+    weightPsy?: number
+    lambdaPsy?: number
   }
   optimization: {
     epsilon: number
     steps: number
+    weightL2?: number
+    lambdaL2?: number
   }
+}
+
+export interface AsrMetrics {
+  model?: string
+  originalText: string | null
+  protectedText: string | null
+  wer?: number | null
+  cer?: number | null
+  tokenChangeRate?: number | null
+  tokenErrorRate?: number | null
+  semanticDrift?: number | null
+  insertRate?: number | null
+  deleteRate?: number | null
+  substituteRate?: number | null
+  status?: string
+  error?: string | null
+  reason?: string | null
+}
+
+export interface AsrEvalResponse {
+  taskId: string
+  status: string
+  asr?: AsrMetrics
+  asrSubId?: string
 }
 
 export interface TaskStatusResponse {
@@ -46,48 +87,188 @@ export interface TaskStatusResponse {
   message: string
   createdAt: string
   updatedAt: string
-  error: string | null
-}
-
-export interface AsrMetrics {
-  originalText: string
-  protectedText: string
-  wer?: number
-  cer?: number
-  tokenChangeRate?: number
-  tokenErrorRate?: number
-  semanticDrift?: number
-  insertRate?: number
-  deleteRate?: number
+  currentStep?: number | null
+  totalSteps?: number | null
+  elapsedSec?: number | null
+  error: string | ApiErrorPayload | null
+  asrResult?: AsrEvalResponse | null
+  cloneResult?: CloneVoiceResult | null
 }
 
 export interface SpeakerMetrics {
-  simBefore: number
-  simAfter: number
-  simDropRate: number
-  embeddingDistanceBefore: number
-  embeddingDistanceAfter: number
+  simBefore: number | null
+  simAfter: number | null
+  simDropRate: number | null
+  embeddingDistanceBefore: number | null
+  embeddingDistanceAfter: number | null
+  source?: string
+  status?: string
 }
 
 export interface QualityMetrics {
-  snr: number
-  pesq: number
-  mosLqo: number
+  snr: number | null
+  pesq: number | null
+  mosLqo: number | null
+  l2Norm?: number | null
+  psychoacousticViolationRate?: number | null
+  status?: string
 }
 
 export interface TrendPoint {
   step: number
-  wer: number
-  sim: number
-  mos: number
-  pesq: number
-  elapsed: number
+  wer?: number | null
+  sim?: number | null
+  mos?: number | null
+  pesq?: number | null
+  elapsed?: number | null
+}
+
+export interface LossTrendPoint {
+  step: number
+  Lfeat: number | null
+  Lsem: number | null
+  Lpsy: number | null
+  L2: number | null
+  total?: number | null
+}
+
+export interface LossFinal {
+  Lfeat: number | null
+  Lsem: number | null
+  Lpsy: number | null
+  L2: number | null
+  total?: number | null
 }
 
 export interface PsychoacousticPoint {
   frequency: number
   maskingThreshold: number
-  perturbation: number
+  perturbation?: number
+  perturbationPsd?: number
+}
+
+export interface MetricSource {
+  source?: string
+  status?: string
+}
+
+export interface ApiErrorPayload {
+  code?: string
+  message: string
+  requestId?: string
+  taskId?: string
+  stage?: string
+  details?: unknown
+}
+
+export interface CapabilityChain {
+  status: 'available' | 'unavailable' | 'partial' | string
+  reason?: string | null
+  available?: string[]
+  unavailable?: string[]
+}
+
+export interface NumericConfigRange {
+  min: number
+  max: number
+  step: number
+}
+
+export interface RuntimeModelOption {
+  label?: string
+  value: string
+  backendValue?: string
+  branch?: string
+  backend?: string
+  defaultPath?: string
+  status?: string
+  reason?: string | null
+  languages?: string[]
+}
+
+export interface RuntimeChoiceOption {
+  label: string
+  value: string
+  description?: string
+  targetPolicy?: 'selectable' | 'joint_only' | string
+}
+
+export interface RuntimeModePreset {
+  semantic?: Partial<ProtectionTaskRequest['semantic']>
+  timbre?: Partial<ProtectionTaskRequest['timbre']>
+  psychoacoustic?: Partial<ProtectionTaskRequest['psychoacoustic']>
+  optimization?: Partial<ProtectionTaskRequest['optimization']>
+}
+
+export interface ProtectionRuntimeConfig {
+  defaults: ProtectionTaskRequest
+  profiles?: Record<string, ProtectionTaskRequest>
+  activeDefaultProfile?: string
+  ranges: Record<string, NumericConfigRange>
+  models: {
+    semantic?: Array<string | RuntimeModelOption>
+    asr?: Array<string | RuntimeModelOption>
+    feature?: Array<string | RuntimeModelOption>
+    timbre?: Array<string | RuntimeModelOption>
+    tts?: Array<string | RuntimeModelOption>
+    [key: string]: Array<string | RuntimeModelOption> | undefined
+  }
+  formSchema?: RuntimeFormSchema
+  constraints?: {
+    maxAudioSizeBytes?: number
+    [key: string]: unknown
+  }
+  clone?: {
+    defaults?: {
+      model?: string
+      backendValue?: string
+      language?: string
+      uiPreferredLanguage?: string
+      speed?: number
+    }
+    languages?: string[]
+    speeds?: number[]
+  }
+  modes?: RuntimeChoiceOption[]
+  targets?: RuntimeChoiceOption[]
+  modePresets?: Record<string, RuntimeModePreset>
+}
+
+export interface RuntimeFormField {
+  label: string
+  path: string
+  default: number
+  min: number
+  max: number
+  step: number
+  unit?: string
+  description?: string
+}
+
+export interface RuntimeFormSchema {
+  defaults?: {
+    formal?: ProtectionTaskRequest
+  }
+  activeDefaultProfile?: string
+  profiles?: RuntimeChoiceOption[]
+  fields?: Record<string, RuntimeFormField>
+  modelOptions?: {
+    semanticEncoders?: Array<string | RuntimeModelOption>
+    timbreEncoders?: Array<string | RuntimeModelOption>
+    asrModels?: Array<string | RuntimeModelOption>
+    ttsModels?: Array<string | RuntimeModelOption>
+  }
+}
+
+export interface CapabilitiesResponse {
+  ok: boolean
+  device?: string
+  chains?: Record<string, CapabilityChain>
+  config?: ProtectionRuntimeConfig
+  defaults?: ProtectionRuntimeConfig['defaults']
+  ranges?: ProtectionRuntimeConfig['ranges']
+  models?: ProtectionRuntimeConfig['models']
+  constraints?: ProtectionRuntimeConfig['constraints']
 }
 
 export interface TaskResult {
@@ -96,11 +277,11 @@ export interface TaskResult {
   mode: ProtectionMode
   dataMode: DataMode
   verdict: string
-  score: number
+  score: number | null
   createdAt?: string
   submittedAt?: string
-  completedAt: string
-  elapsedSec: number
+  completedAt?: string
+  elapsedSec?: number | null
   inputSource?: string
   language?: string
   processingModel?: string
@@ -118,12 +299,35 @@ export interface TaskResult {
   asr: AsrMetrics
   speaker: SpeakerMetrics
   quality: QualityMetrics
+  metricSources?: Record<string, MetricSource>
+  generation?: {
+    lossFinal?: LossFinal
+    optimizationTrace?: LossTrendPoint[]
+    steps?: number | null
+    realProtect?: boolean | null
+    source?: string
+    status?: string
+    mode?: string
+  }
+  raw?: unknown
   charts: {
     psychoacoustic: PsychoacousticPoint[]
     trend: TrendPoint[]
-    radarBefore: number[]
-    radarAfter: number[]
+    optimizationTrend: LossTrendPoint[]
+    radarBefore?: number[]
+    radarAfter?: number[]
+    chainRadar?: Array<{ name: string; value: number | null; status?: string }>
   }
+}
+
+export interface TaskDetailsResponse {
+  taskId: string
+  status: TaskStatus
+  details: Record<string, unknown>
+  summary?: Record<string, unknown>
+  chains?: Array<Record<string, unknown>>
+  charts?: Record<string, unknown>
+  raw?: unknown
 }
 
 export interface CloneVoiceRequest {
@@ -132,6 +336,11 @@ export interface CloneVoiceRequest {
   language?: string
   speed?: number
   speakerPrompt?: string
+}
+
+export interface AsrEvalRequest {
+  model: string
+  referenceText?: string
 }
 
 export interface CloneVoiceResult {
@@ -150,11 +359,44 @@ export interface HistoryTask {
   filename: string
   protectedFilename: string
   mode: ProtectionMode
+  targetMode?: 'semantic' | 'timbre' | 'joint'
+  parameters?: {
+    weightSemantic?: number | null
+    weightFeature?: number | null
+    weightPsy?: number | null
+    weightL2?: number | null
+  }
   dataMode: DataMode
   status: TaskStatus
-  wer: number
-  simDropRate: number
-  pesq: number
+  progress?: number | null
+  stage?: TaskStage | string | null
+  message?: string | null
+  protectionStatus?: TaskStatus | string | null
+  protectionProgress?: number | null
+  protectionStage?: TaskStage | string | null
+  protectionMessage?: string | null
+  protectionElapsedSec?: number | null
+  protectionError?: string | ApiErrorPayload | null
+  asrStatus?: TaskStatus | string | null
+  asrProgress?: number | null
+  asrStage?: TaskStage | string | null
+  asrMessage?: string | null
+  asrElapsedSec?: number | null
+  asrError?: string | ApiErrorPayload | null
+  cloneStatus?: TaskStatus | string | null
+  cloneProgress?: number | null
+  cloneStage?: TaskStage | string | null
+  cloneMessage?: string | null
+  cloneElapsedSec?: number | null
+  cloneError?: string | ApiErrorPayload | null
+  hasAsrResult?: boolean
+  hasCloneResult?: boolean
+  elapsedSec?: number | null
+  updatedAt?: string | null
+  error?: string | ApiErrorPayload | null
+  wer: number | null
+  simDropRate: number | null
+  pesq: number | null
   createdAt: string
 }
 

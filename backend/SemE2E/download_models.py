@@ -1,10 +1,20 @@
 import shutil
+import os
 from pathlib import Path
 
 import yaml
 from huggingface_hub import hf_hub_download, snapshot_download
 
+from result_adapter import SUPPORTED_TTS_MODELS
+
 ROOT = Path(__file__).resolve().parent
+os.environ.setdefault("TTS_HOME", str(ROOT / "checkpoints" / "tts"))
+
+
+COQUI_TOS_MODELS = {
+    "tts_models/multilingual/multi-dataset/xtts_v2",
+    "tts_models/multilingual/multi-dataset/xtts_v1.1",
+}
 
 
 def download_files(repo_id, files, download_path):
@@ -20,6 +30,39 @@ def download_files(repo_id, files, download_path):
             print(f"Downloaded {file}")
         except Exception as exc:
             print(f"Failed to download {file}: {exc}")
+
+
+def download_coqui_tts_models():
+    try:
+        from TTS.utils.manage import ModelManager
+    except Exception as exc:
+        print(f"Skipping Coqui TTS models because TTS is not installed: {exc}")
+        return
+
+    manager = ModelManager()
+    tos_agreed = os.getenv("COQUI_TOS_AGREED") == "1"
+    for item in SUPPORTED_TTS_MODELS:
+        model_name = str(item["backendValue"])
+        if model_name in COQUI_TOS_MODELS and not tos_agreed:
+            print(f"Skipping {model_name}; set COQUI_TOS_AGREED=1 after accepting Coqui terms to download it.")
+            continue
+        try:
+            print(f"Downloading Coqui TTS model {model_name}...")
+            manager.download_model(model_name)
+            normalize_coqui_tts_cache(str(item["cacheName"]))
+        except Exception as exc:
+            print(f"Failed to download {model_name}: {exc}")
+
+
+def normalize_coqui_tts_cache(cache_name):
+    tts_home = Path(os.environ["TTS_HOME"])
+    target = tts_home / cache_name
+    nested = tts_home / "tts" / cache_name
+    if not nested.exists() or target.exists():
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(nested), str(target))
+    print(f"Moved Coqui TTS cache to {target}")
 
 
 def main():
@@ -80,6 +123,9 @@ def main():
             yaml.dump(config, file, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
     print("VITS is not hosted here. Put pretrained_ljs.pth at checkpoints/VITS/pretrained_ljs.pth.")
+
+    print("Downloading supported Coqui TTS clone backends...")
+    download_coqui_tts_models()
 
 
 if __name__ == "__main__":

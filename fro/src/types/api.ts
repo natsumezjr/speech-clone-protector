@@ -1,9 +1,13 @@
 import type { AudioFileMeta } from './audio'
 import type {
+  CapabilitiesResponse,
+  AsrEvalRequest,
+  AsrEvalResponse,
   CloneVoiceRequest,
   CloneVoiceResult,
   HistoryTask,
   ProtectionTaskRequest,
+  TaskDetailsResponse,
   TaskResult,
   TaskStatusResponse,
 } from './task'
@@ -14,10 +18,13 @@ export interface ProtectionTaskCreated {
 }
 
 export interface ApiClient {
+  getCapabilities(): Promise<CapabilitiesResponse>
   uploadFile(file: File): Promise<AudioFileMeta>
   createProtectionTask(payload: ProtectionTaskRequest): Promise<ProtectionTaskCreated>
   getTaskStatus(taskId: string): Promise<TaskStatusResponse>
   getTaskResult(taskId: string): Promise<TaskResult>
+  getTaskDetails(taskId: string): Promise<TaskDetailsResponse>
+  runAsrEval(taskId: string, payload: AsrEvalRequest): Promise<AsrEvalResponse>
   cloneVoice(taskId: string, payload: CloneVoiceRequest): Promise<CloneVoiceResult>
   listTasks(): Promise<HistoryTask[]>
   deleteTask(taskId: string): Promise<void>

@@ -3,11 +3,26 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import numpy as np
 import torch
+import soundfile as sf
+import torchaudio.functional as ta_functional
 
 from runtime import resolve_torch_device
 
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
+ROOT = Path(__file__).resolve().parent
+LOCAL_ASR_MODELS = {
+    "openai/whisper-small": ROOT / "checkpoints" / "asr" / "openai-whisper-small",
+}
+
+
+def resolve_asr_model_path(model_name: str) -> str:
+    local_path = LOCAL_ASR_MODELS.get(model_name)
+    if local_path and (local_path / "config.json").exists():
+        return str(local_path)
+    return model_name
 
 
 class ASRTranscriber:
@@ -43,12 +58,23 @@ class ASRTranscriber:
         self.is_whisper = "whisper" in model_name.lower()
         device_id = (self.device.index or 0) if self.device.type == "cuda" else -1
         dtype = torch.float16 if device_id >= 0 and self.is_whisper else torch.float32
+        resolved_model = resolve_asr_model_path(model_name)
         self.pipe = pipeline(
             "automatic-speech-recognition",
-            model=model_name,
+            model=resolved_model,
             device=device_id,
             torch_dtype=dtype,
         )
+
+    @staticmethod
+    def _load_audio_array(audio_path: str | Path, target_sr: int = 16000) -> np.ndarray:
+        audio_np, sample_rate = sf.read(str(audio_path), dtype="float32", always_2d=True)
+        audio = torch.from_numpy(audio_np.T)
+        if audio.size(0) != 1:
+            audio = torch.mean(audio, dim=0, keepdim=True)
+        if sample_rate != target_sr:
+            audio = ta_functional.resample(audio, sample_rate, target_sr)
+        return audio.squeeze(0).contiguous().cpu().numpy()
 
     def transcribe(self, audio_path: str | Path) -> str:
         if self.backend == "funasr":
@@ -58,8 +84,9 @@ class ASRTranscriber:
             return str(result).strip()
 
         if self.backend == "openai-whisper":
+            audio = self._load_audio_array(audio_path)
             result = self.model.transcribe(
-                str(audio_path),
+                audio,
                 language="en",
                 task="transcribe",
                 fp16=self.device.type == "cuda",
@@ -69,5 +96,6 @@ class ASRTranscriber:
         kwargs = {}
         if self.is_whisper:
             kwargs["generate_kwargs"] = {"language": "en", "task": "transcribe"}
-        result = self.pipe(str(audio_path), **kwargs)
+        audio = self._load_audio_array(audio_path)
+        result = self.pipe({"array": audio, "sampling_rate": 16000}, **kwargs)
         return result["text"].strip()

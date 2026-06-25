@@ -12,6 +12,7 @@ export const router = createBrowserRouter([
     children: [
       { index: true, element: <HomePage /> },
       { path: 'workspace', element: <WorkspacePage /> },
+      { path: 'results', element: <ResultsPage /> },
       { path: 'results/:taskId', element: <ResultsPage /> },
       { path: 'history', element: <HistoryPage /> },
     ],

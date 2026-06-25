@@ -7,6 +7,10 @@ node_modules/
 seme2e-runtime/
 logs/
 
+# Local model caches
+backend/SemE2E/checkpoints/
+backend/SemE2E/outputs/
+
 # Build output
 dist/
 dist-ssr/

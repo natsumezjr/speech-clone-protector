@@ -63,7 +63,7 @@ const capabilities = [
 export function HomePage() {
   return (
     <div className="space-y-6 pb-2">
-      <section className="grid min-h-[486px] grid-cols-[430px_1fr_414px] gap-5 max-2xl:grid-cols-[420px_1fr_390px] max-xl:grid-cols-1">
+      <section className="grid min-h-[486px] grid-cols-[430px_1fr_372px] gap-5 max-2xl:grid-cols-[420px_1fr_350px] max-xl:grid-cols-1">
         <div className="pt-[34px]">
           <h1 className="text-[43px] font-black leading-[1.18] tracking-normal text-white drop-shadow-[0_4px_18px_rgba(0,0,0,0.3)] max-md:text-4xl">
             发布前保护你的声音，
@@ -78,7 +78,7 @@ export function HomePage() {
               开始防护
             </Link>
             <Link
-              to="/results/mock-task-001"
+              to="/workspace"
               className="inline-flex h-11 min-w-[168px] items-center justify-center gap-2 rounded-[7px] border border-slate-300/40 bg-slate-950/24 text-[16px] font-bold text-white transition hover:bg-white/8"
             >
               <CirclePlay className="h-5 w-5" />
@@ -110,7 +110,7 @@ export function HomePage() {
         ))}
       </section>
 
-      <section className="grid grid-cols-[1fr_358px] gap-3 max-xl:grid-cols-1">
+      <section className="mt-6 grid grid-cols-[1fr_358px] gap-3 max-xl:grid-cols-1">
         <div className="ui-card p-4">
           <div className="mb-3 flex h-7 items-center gap-2">
             <Zap className="h-5 w-5 shrink-0 translate-y-[1px] text-cyan-300" />
@@ -201,7 +201,7 @@ function HeroScene() {
                 ['ASR', '语音识别', '↓ 62.3%'],
                 ['Tokenizer', '分词器', '↑ 73.8%'],
                 ['LLM', '语言模型', '↓ 58.7%'],
-                ['克隆系统', '特征建模/TTS', '↓ 81.4%'],
+                ['TTS', '克隆系统', '↓ 81.4%'],
               ].map(([name, sub, value]) => (
                 <div key={name} className="h-[96px] rounded-[6px] border border-cyan-300/18 bg-[#07192d] px-1.5 py-2 text-center">
                   <div className="whitespace-nowrap text-[12px] font-black leading-4 text-white">{name}</div>

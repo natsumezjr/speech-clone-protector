@@ -1,5 +1,6 @@
 import sys
-import json
+import os
+import shutil
 from pathlib import Path
 import torch
 import yaml
@@ -10,6 +11,36 @@ from torch import nn
 
 
 ROOT = Path(__file__).resolve().parent
+VENDORED_ESPEAK_DIR = ROOT / "vendor" / "espeak-ng"
+
+
+def _configure_espeak_library():
+    try:
+        from phonemizer.backend.espeak.wrapper import EspeakWrapper
+
+        if VENDORED_ESPEAK_DIR.is_dir():
+            os.environ["PATH"] = f"{VENDORED_ESPEAK_DIR}{os.pathsep}{os.environ.get('PATH', '')}"
+
+        try:
+            EspeakWrapper.library()
+            return
+        except RuntimeError:
+            pass
+
+        espeak_exe = shutil.which("espeak-ng") or shutil.which("espeak")
+        candidates = [
+            VENDORED_ESPEAK_DIR / "libespeak-ng.dll",
+            os.getenv("SEME2E_ESPEAK_LIBRARY"),
+            os.getenv("PHONEMIZER_ESPEAK_LIBRARY"),
+            Path(espeak_exe).with_name("libespeak-ng.dll") if espeak_exe else None,
+            Path(espeak_exe).with_name("espeak.dll") if espeak_exe else None,
+        ]
+        for candidate in candidates:
+            if candidate and Path(candidate).is_file():
+                EspeakWrapper.set_library(candidate)
+                return
+    except Exception:
+        return
 
 
 def _prepare_vits_imports():
@@ -73,13 +104,16 @@ def recursive_munch(d):
 
 
 def build_models_styletts2(config_path, checkpoint_path=None, device=None):
-    sys.path.append("tts_models/styletts2")
+    styletts2_dir = str(ROOT / "tts_models" / "styletts2")
+    if styletts2_dir not in sys.path:
+        sys.path.append(styletts2_dir)
     from tts_models.styletts2.models import load_F0_models, load_ASR_models, build_model
     from tts_models.styletts2.Utils.PLBERT.util import load_plbert
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    _configure_espeak_library()
     global_phonemizer = phonemizer.backend.EspeakBackend(language='en-us', preserve_punctuation=True,  with_stress=True)
 
     config = yaml.safe_load(open(config_path))
@@ -102,7 +136,7 @@ def build_models_styletts2(config_path, checkpoint_path=None, device=None):
     _ = [model[key].eval() for key in model]
     _ = [model[key].to(device) for key in model]
 
-    params_whole = torch.load(checkpoint_path, map_location='cpu')
+    params_whole = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     params = params_whole['net']
 
     for key in model:
