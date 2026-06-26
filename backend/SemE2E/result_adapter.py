@@ -15,6 +15,19 @@ from typing import Any, Callable
 
 import numpy as np
 
+from metric_definitions import (
+    align_audio_pair,
+    compute_asr_metrics,
+    compute_clone_eval,
+    compute_direct_speaker_metrics,
+    compute_loss_summary,
+    compute_overall_score,
+    compute_perturbation_metrics,
+    compute_psychoacoustic_metrics,
+    compute_quality_metrics,
+    compute_semantic_token_metrics,
+    metric_source,
+)
 from result_schema import default_chains, empty_charts, empty_details, empty_primary_metrics, utc_now_iso
 
 ProgressCallback = Callable[..., None]
@@ -797,80 +810,105 @@ def run_protection(
     )
 
 
-def compute_perception(clean_path: Path, protected_path: Path) -> dict[str, Any]:
+def compute_perception(clean_path: Path, protected_path: Path, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = payload or {}
+    optimization = payload.get("optimization") or {}
+    epsilon = to_float(optimization.get("epsilon"))
+    epsilon_norm = str(optimization.get("epsilonNorm") or optimization.get("epsilon_norm") or "linf")
     perception = {
         "snr": None,
         "pesq": None,
+        "stoi": None,
+        "mos": None,
         "mosLqo": None,
+        "qualityScore": None,
+        "qualityLevel": None,
         "l2Norm": None,
+        "l2Rms": None,
+        "linfNorm": None,
+        "epsilon": epsilon,
+        "epsilonNorm": epsilon_norm,
+        "epsilonUsageRate": None,
+        "clippingRate": None,
+        "lPsy": None,
+        "overMaskRate": None,
         "psychoacousticViolationRate": None,
+        "maskingThreshold": None,
+        "perturbationSpectrum": None,
         "maskingCurve": [],
+        "perturbation": None,
+        "protectionQuality": None,
+        "psychoacoustic": None,
         "status": "unavailable",
-        "source": "audio_utils.py",
+        "source": "metric_definitions.py",
+        "_metricSources": {},
     }
     try:
-        clean_data = read_wav_float(clean_path)
-        protected_data = read_wav_float(protected_path)
-        if clean_data is None or protected_data is None:
-            raise ValueError("default perception metrics currently support 16-bit PCM WAV")
-        clean, _ = clean_data
-        protected, _ = protected_data
-        n = min(len(clean), len(protected))
-        l2_norm = float(np.linalg.norm(protected[:n] - clean[:n])) if n else None
+        x, xp, delta, sr = align_audio_pair(clean_path, protected_path)
+        perturbation = compute_perturbation_metrics(x, xp, delta, sr, epsilon=epsilon, epsilon_norm=epsilon_norm)
+        quality = compute_quality_metrics(x, xp, delta, sr, perturbation)
+        psycho = compute_psychoacoustic_metrics(x, xp, delta, sr)
+        quality_sources = quality.pop("_metricSources", {})
+        psycho_sources = psycho.pop("_metricSources", {})
+        perception.update(perturbation)
         perception.update(
             {
-                "snr": compute_snr_numpy(clean, protected),
-                "l2Norm": l2_norm,
-                "status": "computed",
+                "snr": quality.get("snr"),
+                "pesq": quality.get("pesq"),
+                "stoi": quality.get("stoi"),
+                "mos": quality.get("mos"),
+                "mosLqo": quality.get("mosLqo"),
+                "qualityScore": quality.get("qualityScore"),
+                "qualityLevel": quality.get("qualityLevel"),
+                "lPsy": psycho.get("lPsy"),
+                "overMaskRate": psycho.get("overMaskRate"),
+                "psychoacousticViolationRate": psycho.get("overMaskRate"),
+                "maskingThreshold": psycho.get("maskingThreshold"),
+                "perturbationSpectrum": psycho.get("perturbationSpectrum"),
+                "maskingCurve": psycho.get("chart") or [],
+                "perturbation": perturbation,
+                "protectionQuality": quality,
+                "psychoacoustic": {
+                    "lPsy": psycho.get("lPsy"),
+                    "overMaskRate": psycho.get("overMaskRate"),
+                    "maskingThreshold": psycho.get("maskingThreshold"),
+                    "perturbationSpectrum": psycho.get("perturbationSpectrum"),
+                },
+                "status": "available",
             }
         )
+        sources = {
+            "perturbation.*": metric_source(
+                "available",
+                "align_audio_pair + compute_perturbation_metrics",
+                formula="delta=xp-x; l2Norm=sqrt(sum(delta^2)); snr=10*log10((P_signal+1e-12)/(P_noise+1e-12))",
+            )
+        }
+        for key in perturbation:
+            sources[f"perturbation.{key}"] = sources["perturbation.*"]
+        sources.update(quality_sources)
+        sources.update(psycho_sources)
+        for key in ["lPsy", "overMaskRate", "maskingThreshold", "perturbationSpectrum"]:
+            sources[f"psychoacoustic.{key}"] = sources["psychoacoustic.*"]
+        perception["_metricSources"] = sources
     except Exception as exc:
-        perception["error"] = str(exc)
+        reason = str(exc)
+        perception["error"] = reason
+        perception["_metricSources"] = {
+            "perturbation.*": metric_source("error", "align_audio_pair", reason=reason, formula="read/resample/mono/truncate audio pair"),
+            "protectionQuality.pesq": metric_source("unavailable", "pesq", reason="Audio pair alignment failed before PESQ", formula="pesq(sr,x,xp,mode)"),
+            "protectionQuality.stoi": metric_source("unavailable", "pystoi", reason="Audio pair alignment failed before STOI", formula="stoi(x,xp,sr)"),
+            "protectionQuality.mos": metric_source("unavailable", "human_listening_test", reason="MOS requires human listening test or a declared MOS model", formula="None"),
+            "protectionQuality.mosLqo": metric_source("unavailable", "objective_mos_lqo_model", reason="No explicit MOS-LQO objective model is configured", formula="None"),
+            "psychoacoustic.*": metric_source("error", "engineering_stft_masking_threshold", reason=reason, formula="V=max(0,PSD_delta-Theta)"),
+        }
     return perception
 
 
 def compute_mfcc_semantic(clean_path: Path, protected_path: Path) -> dict[str, Any]:
-    details = {
-        "tokenErrorRate": None,
-        "tokenChangeCount": None,
-        "tokenTotal": None,
-        "semanticDrift": None,
-        "encoderDistances": empty_details()["semantic"]["encoderDistances"],
-        "status": "unavailable",
-    }
-    if os.getenv("SEME2E_ENABLE_MFCC", "0") != "1":
-        details["reason"] = "Set SEME2E_ENABLE_MFCC=1 to compute MFCC semantic distance."
-        return details
-    try:
-        import librosa
-
-        clean, sr = librosa.load(str(clean_path), sr=16000)
-        protected, _ = librosa.load(str(protected_path), sr=16000)
-        n = min(len(clean), len(protected))
-        clean = clean[:n]
-        protected = protected[:n]
-        if n == 0:
-            return details
-        clean_mfcc = librosa.feature.mfcc(y=clean, sr=sr, n_mfcc=20).mean(axis=1)
-        protected_mfcc = librosa.feature.mfcc(y=protected, sr=sr, n_mfcc=20).mean(axis=1)
-        denom = float(np.linalg.norm(clean_mfcc) * np.linalg.norm(protected_mfcc) + 1.0e-12)
-        cosine = float(np.dot(clean_mfcc, protected_mfcc) / denom)
-        distance = float(np.linalg.norm(clean_mfcc - protected_mfcc))
-        drift = max(0.0, min(1.0, 1.0 - cosine))
-        encoders = details["encoderDistances"]
-        for item in encoders:
-            if item["encoder"] == "MFCC":
-                item.update(
-                    {
-                        "cosineBeforeAfter": cosine,
-                        "distance": distance,
-                        "status": "computed",
-                        "source": "librosa.mfcc",
-                    }
-                )
-        details.update({"semanticDrift": drift, "status": "partial"})
-    except Exception as exc:
-        details["error"] = str(exc)
+    details = compute_semantic_token_metrics(clean_path, protected_path, {})
+    if not details.get("encoderDistances"):
+        details["encoderDistances"] = empty_details()["semantic"]["encoderDistances"]
     return details
 
 
@@ -901,36 +939,34 @@ def maybe_asr_eval(clean_path: Path, protected_path: Path, payload: dict[str, An
     if os.getenv("SEME2E_ENABLE_ASR", "0") != "1" and payload.get("forceAsrEval") is not True:
         asr["status"] = "unavailable"
         asr["reason"] = "Set SEME2E_ENABLE_ASR=1 to run evaluate_asr.py dependencies."
+        asr["_metricSources"] = {"asrEval.*": metric_source("not_run", "ASRTranscriber", reason=asr["reason"], formula="POST /api/tasks/{taskId}/asr-eval")}
         return asr
 
     try:
         from asr_backends import ASRTranscriber
-        from text_metrics import cer, wer
 
         evaluations = []
         for model in actual_models:
             transcriber = ASRTranscriber(model, os.getenv("SEME2E_API_DEVICE", "cpu"))
             clean_text = transcriber.transcribe(clean_path)
             protected_text = transcriber.transcribe(protected_path)
-            reference = reference_text or clean_text
-            item = {
-                "model": model,
-                "referenceText": reference,
-                "cleanTranscription": clean_text,
-                "protectedTranscription": protected_text,
-                "wer": wer(reference, protected_text),
-                "cer": cer(reference, protected_text),
-                "status": "computed",
-            }
+            item = compute_asr_metrics(
+                clean_text,
+                protected_text,
+                reference_text=reference_text,
+                language=payload.get("language"),
+                model=model,
+            )
             evaluations.append(item)
         if evaluations:
             asr.update(evaluations[0])
             asr["model"] = evaluations[0]["model"]
             asr["evaluations"] = evaluations
-            asr["status"] = "computed"
+            asr["status"] = "available"
     except Exception as exc:
         asr["status"] = "unavailable"
         asr["error"] = str(exc)
+        asr["_metricSources"] = {"asrEval.*": metric_source("error", "ASRTranscriber", reason=str(exc), formula="transcribe(original/protected)+Levenshtein")}
     return asr
 
 
@@ -948,43 +984,31 @@ def create_asr_eval(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     details = result.setdefault("details", {})
     details["asr"] = asr
     primary = result.setdefault("summary", {}).setdefault("primaryMetrics", {})
-    for key in ["wer", "cer", "tokenErrorRate", "semanticDrift"]:
+    for key in ["wer", "cer", "tokenErrorRate", "tokenChangeRate", "semanticDrift"]:
         if key in asr:
             primary[key] = asr.get(key)
+    metric_sources = result.setdefault("summary", {}).setdefault("metricSources", {})
+    metric_sources.update(asr.get("_metricSources") or {})
+    semantic_sources = ((details.get("semantic") or {}).get("_metricSources") or {})
+    for key in ["asrEval.tokenChangeRate", "asrEval.tokenErrorRate", "asrEval.semanticDrift"]:
+        metric_sources.setdefault(key, semantic_sources.get(key) or metric_source("unavailable", "semantic_tokenizer", reason="Not produced by ASR evaluator", formula="None"))
     result["asrModel"] = asr.get("model")
     result["updatedAt"] = utc_now_iso()
+    summary_score = compute_overall_score(result)
+    result.setdefault("summary", {})["score"] = summary_score["score"]
+    result.setdefault("summary", {})["verdict"] = summary_score["verdict"]
+    metric_sources.update(summary_score.get("_metricSources") or {})
+    result["metricSources"] = metric_sources
     save_result(TASK_DIR / task_id, result)
     return {
         "taskId": task_id,
-        "status": asr.get("status") or "computed",
+        "status": asr.get("status") or "available",
         "asr": asr,
     }
 
 
 def maybe_speaker_eval(clean_path: Path, protected_path: Path) -> dict[str, Any]:
-    speaker = empty_details()["speaker"]
-    metric = os.getenv("SEME2E_SPEAKER_METRIC", "ecapa")
-    speaker["metric"] = metric
-    if os.getenv("SEME2E_ENABLE_SPEAKER", "0") != "1":
-        speaker["reason"] = "Set SEME2E_ENABLE_SPEAKER=1 to run speaker_similarity.py dependencies."
-        return speaker
-    try:
-        from speaker_similarity import build_speaker_similarity
-
-        model = os.getenv("SEME2E_SPEAKER_MODEL", "speechbrain/spkrec-ecapa-voxceleb")
-        scorer = build_speaker_similarity(metric, model, os.getenv("SEME2E_API_DEVICE", "cpu"))
-        sim = scorer.score(clean_path, protected_path)
-        speaker.update(
-            {
-                "simOriginalProtected": sim,
-                "embeddingDistance": 1.0 - sim,
-                "status": "computed",
-            }
-        )
-    except Exception as exc:
-        speaker["status"] = "unavailable"
-        speaker["error"] = str(exc)
-    return speaker
+    return compute_direct_speaker_metrics(clean_path, protected_path)
 
 
 def git_commit() -> str | None:
@@ -1030,44 +1054,13 @@ def build_task_payload(
     timbre = payload.get("timbre") or {}
     semantic_cfg = payload.get("semantic") or {}
     psychoacoustic = payload.get("psychoacoustic") or {}
-    weight_warnings: list[str] = []
-    weight_feature = _read_weight(timbre, "weightFeature", "lambdaTimbre", FORMAL_WEIGHT_FEATURE, weight_warnings)
-    weight_semantic = _read_weight(semantic_cfg, "weightSemantic", "lambdaSemantic", FORMAL_WEIGHT_SEMANTIC, weight_warnings)
-    weight_psy = _read_weight(psychoacoustic, "weightPsy", "lambdaPsy", FORMAL_WEIGHT_PSY, weight_warnings)
-    weight_l2 = _read_weight(optimization, "weightL2", "lambdaL2", FORMAL_WEIGHT_L2, weight_warnings)
     meta = read_wav_meta(input_path)
-    loss_items = protection_result.get("loss_items") or {}
-    lfea = to_float(loss_items.get("Lfeat") or loss_items.get("Lfea") or loss_items.get("lossFeature") or loss_items.get("loss_timbre") or loss_items.get("L_feature"))
-    lsem = to_float(loss_items.get("Lsem") or loss_items.get("lossSemantic") or loss_items.get("loss_semantic") or loss_items.get("L_semantic"))
-    lpsy = to_float(loss_items.get("Lpsy") or loss_items.get("lossPsy") or loss_items.get("loss_psy") or loss_items.get("L_psy"))
-    l2 = to_float(loss_items.get("L2") or loss_items.get("lossL2") or loss_items.get("loss_l2") or loss_items.get("l2Norm"))
-    total = None
-    if all(value is not None for value in [lfea, lsem, lpsy, l2]):
-        total = (
-            lfea * weight_feature
-            + lsem * weight_semantic
-            + lpsy * weight_psy
-            + l2 * weight_l2
-        )
-
-    raw_trace = protection_result.get("optimization_trace") or protection_result.get("optimizationTrace") or []
-    trace = []
-    if isinstance(raw_trace, list):
-        for index, item in enumerate(raw_trace):
-            if not isinstance(item, dict):
-                continue
-            point = {
-                "step": to_float(item.get("step") or item.get("epoch") or item.get("iteration") or item.get("iter")),
-                "Lfeat": to_float(item.get("Lfeat") or item.get("Lfea") or item.get("lossFeature") or item.get("loss_timbre") or item.get("L_feature")),
-                "Lsem": to_float(item.get("Lsem") or item.get("lossSemantic") or item.get("loss_semantic") or item.get("L_semantic")),
-                "Lpsy": to_float(item.get("Lpsy") or item.get("lossPsy") or item.get("loss_psy") or item.get("L_psy")),
-                "L2": to_float(item.get("L2") or item.get("lossL2") or item.get("loss_l2") or item.get("l2Norm")),
-                "total": to_float(item.get("total") or item.get("lossTotal") or item.get("loss_total")),
-            }
-            if point["step"] is None:
-                point["step"] = index
-            if any(point[key] is not None for key in ["Lfeat", "Lsem", "Lpsy", "L2", "total"]):
-                trace.append(point)
+    loss_summary = compute_loss_summary(protection_result, payload)
+    loss_final = loss_summary["lossFinal"]
+    loss_weights = loss_summary["lossWeights"]
+    trace = loss_summary["optimizationTrace"]
+    metric_sources: dict[str, Any] = {}
+    metric_sources.update(loss_summary.get("_metricSources") or {})
     details["generation"].update(
         {
             "mode": timbre.get("mode") or payload.get("mode") or "untargeted",
@@ -1075,20 +1068,19 @@ def build_task_payload(
             "steps": int(optimization.get("steps") or 0) or None,
             "sampleRate": meta["sampleRate"],
             "durationSec": meta["durationSec"],
-            "lossFinal": {
-                "Lfeat": lfea,
-                "Lsem": lsem,
-                "Lpsy": lpsy,
-                "L2": l2,
-                "total": total,
-            },
+            "lossFinal": loss_final,
             "lossWeights": {
-                "weight_feature": weight_feature,
-                "weight_semantic": weight_semantic,
-                "weight_psy": weight_psy,
-                "weight_l2": weight_l2,
+                "weight_feature": loss_weights.get("lambdaFeat"),
+                "weight_semantic": loss_weights.get("lambdaSem"),
+                "weight_psy": loss_weights.get("lambdaPsy"),
+                "weight_l2": loss_weights.get("lambda2"),
+                "lambdaFeat": loss_weights.get("lambdaFeat"),
+                "lambdaSem": loss_weights.get("lambdaSem"),
+                "lambdaPsy": loss_weights.get("lambdaPsy"),
+                "lambda2": loss_weights.get("lambda2"),
             },
             "optimizationTrace": trace,
+            "averageStepSec": loss_summary["averageStepSec"],
             "source": protection_result.get("source") or "SemanticE2EVGuard.protect",
             "status": "computed" if protected_path.exists() else "unavailable",
             "realProtect": True,
@@ -1102,11 +1094,12 @@ def build_task_payload(
         details["generation"]["guardSkipped"] = protection_result["guardSkipped"]
     if protection_result.get("guardDiagnostics"):
         details["generation"]["diagnostics"] = protection_result["guardDiagnostics"]
-    if weight_warnings:
-        details["generation"]["deprecationWarnings"] = weight_warnings
-    update_chain(chains, "protect_generation", details["generation"]["status"], details["generation"]["lossFinal"])
+    if protection_result.get("guardDiagnostics", {}).get("deprecationWarnings"):
+        details["generation"]["deprecationWarnings"] = protection_result["guardDiagnostics"]["deprecationWarnings"]
+    update_chain(chains, "protect_generation", details["generation"]["status"], details["generation"]["lossFinal"] or {})
 
-    details["perception"] = compute_perception(input_path, protected_path)
+    details["perception"] = compute_perception(input_path, protected_path, payload)
+    metric_sources.update(details["perception"].get("_metricSources") or {})
     if details["perception"]["snr"] is None:
         details["perception"]["snr"] = to_float(protection_result.get("snr"))
     update_chain(
@@ -1117,6 +1110,7 @@ def build_task_payload(
     )
 
     details["semantic"] = compute_mfcc_semantic(input_path, protected_path)
+    metric_sources.update(details["semantic"].get("_metricSources") or {})
     update_chain(
         chains,
         "semantic_tokenizer_eval",
@@ -1129,10 +1123,16 @@ def build_task_payload(
 
     details["asr"] = empty_details()["asr"]
     details["asr"]["reason"] = f"ASR 评估与保护流程解耦。请使用 /api/tasks/{task_id}/asr-eval 并选定 ASR 模型执行。"
+    metric_sources["asrEval.*"] = metric_source("not_run", "ASRTranscriber", reason="ASR is decoupled from protection; run POST /api/tasks/{taskId}/asr-eval", formula="None until ASR eval runs")
     update_chain(chains, "asr_eval", details["asr"]["status"], {"wer": details["asr"]["wer"], "cer": details["asr"]["cer"]})
 
     details["speaker"] = maybe_speaker_eval(input_path, protected_path)
+    metric_sources.update(details["speaker"].get("_metricSources") or {})
     update_chain(chains, "speaker_eval", details["speaker"]["status"], {"speakerSimilarity": details["speaker"]["simOriginalProtected"]})
+    metric_sources["cloneEval.*"] = metric_source("not_run", "clone-voice", reason="Voice clone evaluation is decoupled from protection; run POST /api/tasks/{taskId}/clone-voice", formula="None until clone eval runs")
+    metric_sources["cloneEval.cloneConfidenceBefore"] = metric_source("unavailable", "confidence_calibrator", reason="No confidence calibrator is configured", formula="sigmoid(A*similarity+B)")
+    metric_sources["cloneEval.cloneConfidenceAfter"] = metric_source("unavailable", "confidence_calibrator", reason="No confidence calibrator is configured", formula="sigmoid(A*similarity+B)")
+    metric_sources["cloneEval.cloneTrend"] = metric_source("not_run", "multi_checkpoint_clone_eval", reason="No repeated checkpoint TTS clone evaluations were run", formula="None")
 
     primary = empty_primary_metrics()
     primary.update(
@@ -1141,9 +1141,7 @@ def build_task_payload(
             "cer": details["asr"]["cer"],
             "tokenErrorRate": details["semantic"]["tokenErrorRate"],
             "semanticDrift": details["semantic"]["semanticDrift"],
-            "speakerSimilarity": details["downstreamTts"]["simProtectedClone"]
-            if details["downstreamTts"]["simProtectedClone"] is not None
-            else details["speaker"]["simOriginalProtected"],
+            "speakerSimilarity": details["speaker"]["simAfter"],
             "snr": details["perception"]["snr"],
             "pesq": details["perception"]["pesq"],
         }
@@ -1177,20 +1175,7 @@ def build_task_payload(
             "verdict": "防护结果已生成",
             "score": None,
             "primaryMetrics": primary,
-            "metricSources": {
-                "wer": {"source": "evaluate_asr.py", "status": details["asr"]["status"]},
-                "cer": {"source": "evaluate_asr.py", "status": details["asr"]["status"]},
-                "tokenErrorRate": {"source": "semantic tokenizer", "status": details["semantic"]["status"]},
-                "semanticDrift": {"source": "semantic_encoder_distance", "status": details["semantic"]["status"]},
-                "speakerSimilarity": {
-                    "source": "downstream_tts.simProtectedClone"
-                    if details["downstreamTts"]["simProtectedClone"] is not None
-                    else "speaker.simOriginalProtected",
-                    "status": details["speaker"]["status"],
-                },
-                "snr": {"source": details["perception"].get("source") or "audio_utils.audio_metrics", "status": details["perception"]["status"]},
-                "pesq": {"source": "PESQ evaluator", "status": "unavailable"},
-            },
+            "metricSources": metric_sources,
         },
         "artifacts": {
             "originalAudioUrl": original_url,
@@ -1210,24 +1195,29 @@ def build_task_payload(
             "semantic": {
                 "enabled": bool(semantic_cfg.get("enabled")),
                 "encoders": semantic_cfg.get("encoders") or [],
-                "weightSemantic": weight_semantic,
+                "weightSemantic": loss_weights.get("lambdaSem"),
+                "lambdaSemantic": loss_weights.get("lambdaSem"),
             },
             "timbre": {
                 "enabled": bool(timbre.get("enabled")),
                 "mode": timbre.get("mode"),
                 "encoders": timbre.get("encoders") or [],
-                "weightFeature": weight_feature,
+                "weightFeature": loss_weights.get("lambdaFeat"),
+                "lambdaTimbre": loss_weights.get("lambdaFeat"),
             },
             "psychoacoustic": {
                 "enabled": bool(psychoacoustic.get("enabled")),
-                "weightPsy": weight_psy,
+                "weightPsy": loss_weights.get("lambdaPsy"),
+                "lambdaPsy": loss_weights.get("lambdaPsy"),
             },
             "optimization": {
                 "epsilon": to_float(optimization.get("epsilon")),
                 "steps": int(optimization.get("steps") or 0) or None,
-                "weightL2": weight_l2,
+                "weightL2": loss_weights.get("lambda2"),
+                "lambdaL2": loss_weights.get("lambda2"),
             },
         },
+        "metricSources": metric_sources,
         "realProtect": True,
         "warning": None,
         "backend": {
@@ -1236,6 +1226,12 @@ def build_task_payload(
             "python": sys.version.split()[0],
         },
     }
+    summary_score = compute_overall_score(result)
+    result["summary"]["score"] = summary_score["score"]
+    result["summary"]["verdict"] = summary_score["verdict"]
+    metric_sources.update(summary_score.get("_metricSources") or {})
+    result["summary"]["metricSources"] = metric_sources
+    result["metricSources"] = metric_sources
     return result
 
 
@@ -1548,6 +1544,26 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
         "originalCloneAudio": audio_meta(original_clone_path, f"{base_url}/{original_clone_path.name}"),
         "protectedCloneAudio": audio_meta(protected_clone_path, f"{base_url}/{protected_clone_path.name}"),
     }
+    clone_eval = compute_clone_eval(original_path, original_clone_path, protected_clone_path, response)
+    clone_eval_sources = clone_eval.pop("_metricSources", {})
+    response["cloneEval"] = clone_eval
+    response.update(
+        {
+            "originalSimilarity": clone_eval.get("originalSimilarity"),
+            "protectedSimilarity": clone_eval.get("protectedSimilarity"),
+            "similarityDropRate": clone_eval.get("similarityDropRate"),
+            "embeddingDistanceBefore": clone_eval.get("embeddingDistanceBefore"),
+            "embeddingDistanceAfter": clone_eval.get("embeddingDistanceAfter"),
+            "embeddingDistanceIncreaseRate": clone_eval.get("embeddingDistanceIncreaseRate"),
+            "cloneConfidenceBefore": clone_eval.get("cloneConfidenceBefore"),
+            "cloneConfidenceAfter": clone_eval.get("cloneConfidenceAfter"),
+            "cloneConfidenceDropRate": clone_eval.get("cloneConfidenceDropRate"),
+            "cloneRadar": clone_eval.get("cloneRadar"),
+            "cloneTrend": clone_eval.get("cloneTrend"),
+            "cloneDefenseScore": clone_eval.get("cloneDefenseScore"),
+            "createdAt": clone_eval.get("createdAt"),
+        }
+    )
 
     clones = result.setdefault("cloneResults", [])
     clones.append(response)
@@ -1560,7 +1576,17 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
             "source": response["source"],
             "lastCloneId": clone_id,
             "cloneText": text,
+            "simCleanClone": clone_eval.get("originalSimilarity"),
+            "simProtectedClone": clone_eval.get("protectedSimilarity"),
+            "simDropRate": clone_eval.get("similarityDropRate"),
         }
     )
+    metric_sources = result.setdefault("summary", {}).setdefault("metricSources", {})
+    metric_sources.update(clone_eval_sources)
+    summary_score = compute_overall_score(result)
+    result.setdefault("summary", {})["score"] = summary_score["score"]
+    result.setdefault("summary", {})["verdict"] = summary_score["verdict"]
+    metric_sources.update(summary_score.get("_metricSources") or {})
+    result["metricSources"] = metric_sources
     save_result(TASK_DIR / task_id, result)
     return response

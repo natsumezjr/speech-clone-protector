@@ -845,7 +845,7 @@ function StrategyConfigCard({
             开始生成保护音频
           </button>
         </div>
-        <p className="mt-3 text-center text-xs text-slate-500">预计耗时：30~120 秒（视音频长度与参数复杂度）</p>
+        <p className="mt-3 text-center text-xs text-slate-500">预计耗时：单步 9.2 s，总时长预计 {(steps * 9.2).toFixed(1)} s</p>
       </div>
     </section>
   )

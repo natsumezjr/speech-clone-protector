@@ -164,6 +164,26 @@ def task_status_path(task_id: str) -> Path:
     return TASK_DIR / task_id / "status.json"
 
 
+def _merge_subtask_status(current: dict[str, Any], updates: dict[str, Any], *, stage: str, key: str, result_key: str, sub_id_key: str) -> None:
+    if updates.get("stage") != stage and result_key not in updates and sub_id_key not in updates:
+        return
+    now = utc_now_iso()
+    previous = current.get(key)
+    subtask = dict(previous) if isinstance(previous, dict) else {}
+    if not subtask.get("createdAt") or updates.get(sub_id_key):
+        subtask["createdAt"] = now
+    for field in ["status", "progress", "stage", "message", "elapsedSec", "error"]:
+        if field in updates:
+            subtask[field] = updates.get(field)
+    subtask["stage"] = stage
+    if result_key in updates:
+        subtask[result_key] = updates.get(result_key)
+    if sub_id_key in updates:
+        subtask[sub_id_key] = updates.get(sub_id_key)
+    subtask["updatedAt"] = now
+    current[key] = subtask
+
+
 def write_task_status(task_id: str, **updates: Any) -> dict[str, Any]:
     if is_task_deleted(task_id):
         raise TaskCancelledError(f"task deleted: {task_id}")
@@ -178,6 +198,8 @@ def write_task_status(task_id: str, **updates: Any) -> dict[str, Any]:
             current = {}
     now = utc_now_iso()
     current.update(updates)
+    _merge_subtask_status(current, updates, stage="asr_eval", key="asrTask", result_key="asrResult", sub_id_key="asrSubId")
+    _merge_subtask_status(current, updates, stage="downstream_tts_eval", key="cloneTask", result_key="cloneResult", sub_id_key="cloneSubId")
     current.setdefault("taskId", task_id)
     current.setdefault("createdAt", now)
     current["updatedAt"] = now
@@ -501,6 +523,13 @@ def _number(value: Any) -> float | None:
     return number if number == number and number not in {float("inf"), float("-inf")} else None
 
 
+def _coalesce(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
 def _frontend_audio(meta: dict[str, Any] | None, fallback_name: str) -> dict[str, Any]:
     meta = meta or {}
     return {
@@ -531,6 +560,7 @@ def _frontend_clone(clone: dict[str, Any]) -> dict[str, Any]:
         "request": clone.get("request") or {},
         "originalCloneAudio": _frontend_audio(clone.get("originalCloneAudio"), "original_clone.wav"),
         "protectedCloneAudio": _frontend_audio(clone.get("protectedCloneAudio"), "protected_clone.wav"),
+        "cloneEval": clone.get("cloneEval"),
         "originalSimilarity": clone.get("originalSimilarity"),
         "protectedSimilarity": clone.get("protectedSimilarity"),
         "similarityDropRate": clone.get("similarityDropRate"),
@@ -553,23 +583,25 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
     details = result.get("details") or {}
     audio = result.get("audio") or {}
     score = _number(summary.get("score"))
-    snr = _number(primary.get("snr"))
-    pesq = _number(primary.get("pesq"))
-    sim_after = _number(primary.get("speakerSimilarity") or (details.get("speaker") or {}).get("simOriginalProtected"))
+    snr = _number(_coalesce(primary.get("snr"), (details.get("perception") or {}).get("snr")))
+    pesq = _number(_coalesce(primary.get("pesq"), (details.get("perception") or {}).get("pesq")))
+    sim_after = _number(_coalesce(primary.get("speakerSimilarity"), (details.get("speaker") or {}).get("simOriginalProtected")))
     sim_before = None
     asr = details.get("asr") or {}
     semantic = details.get("semantic") or {}
     generation = details.get("generation") or {}
     perception = details.get("perception") or {}
     charts = result.get("charts") or {}
+    metric_sources = summary.get("metricSources") or result.get("metricSources") or {}
     request = result.get("request") or {}
     optimization = request.get("optimization") or {}
-    loss_final = generation.get("lossFinal") or {}
+    loss_final = generation.get("lossFinal")
     loss_weights = generation.get("lossWeights") or {}
     asr_status = asr.get("status")
     asr_eval = None
-    if asr_status in {"computed", "partial", "completed", "success"}:
+    if asr_status in {"available", "computed", "partial", "completed", "success"}:
         asr_eval = {
+            "model": asr.get("model"),
             "asrModel": asr.get("model"),
             "language": asr.get("language"),
             "originalText": asr.get("referenceText") or asr.get("cleanTranscription"),
@@ -593,9 +625,9 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
     latest_clone = clone_results[-1] if clone_results else None
     clone_eval = None
     if latest_clone:
-        clone_eval = {
+        clone_eval = latest_clone.get("cloneEval") or {
             "cloneModel": (latest_clone.get("request") or {}).get("model"),
-            "speakerEvalModel": None,
+            "speakerEvalModel": latest_clone.get("speakerEvalModel"),
             "targetText": (latest_clone.get("request") or {}).get("text"),
             "originalCloneAudio": latest_clone.get("originalCloneAudio"),
             "protectedCloneAudio": latest_clone.get("protectedCloneAudio"),
@@ -640,17 +672,19 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
         ],
         "originalAudio": original_audio,
         "protectedAudio": protected_audio,
-        "perturbation": {
-            "l2Norm": perception.get("l2Norm") or loss_final.get("L2") or loss_final.get("l2"),
+        "perturbation": perception.get("perturbation")
+        or {
+            "l2Norm": _coalesce(perception.get("l2Norm"), loss_final.get("L2") if isinstance(loss_final, dict) else None, loss_final.get("l2") if isinstance(loss_final, dict) else None),
             "l2Rms": perception.get("l2Rms"),
             "linfNorm": perception.get("linfNorm"),
-            "epsilon": optimization.get("epsilon"),
-            "epsilonNorm": optimization.get("epsilonNorm") or optimization.get("epsilon_norm"),
+            "epsilon": _coalesce(perception.get("epsilon"), optimization.get("epsilon")),
+            "epsilonNorm": _coalesce(perception.get("epsilonNorm"), optimization.get("epsilonNorm"), optimization.get("epsilon_norm")),
             "epsilonUsageRate": perception.get("epsilonUsageRate"),
             "snr": snr,
             "clippingRate": perception.get("clippingRate"),
         },
-        "protectionQuality": {
+        "protectionQuality": perception.get("protectionQuality")
+        or {
             "snr": snr,
             "pesq": pesq,
             "stoi": perception.get("stoi"),
@@ -658,18 +692,19 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
             "mosLqo": perception.get("mosLqo"),
             "qualityLevel": perception.get("qualityLevel"),
         },
-        "psychoacoustic": {
-            "lPsy": loss_final.get("Lpsy") or loss_final.get("lPsy"),
-            "overMaskRate": perception.get("overMaskRate") or perception.get("psychoacousticViolationRate"),
+        "psychoacoustic": perception.get("psychoacoustic")
+        or {
+            "lPsy": _coalesce(perception.get("lPsy"), loss_final.get("Lpsy") if isinstance(loss_final, dict) else None, loss_final.get("lPsy") if isinstance(loss_final, dict) else None),
+            "overMaskRate": _coalesce(perception.get("overMaskRate"), perception.get("psychoacousticViolationRate")),
             "maskingThreshold": perception.get("maskingThreshold"),
             "perturbationSpectrum": perception.get("perturbationSpectrum"),
         },
         "lossFinal": loss_final,
         "lossWeights": {
-            "lambdaFeat": loss_weights.get("lambdaFeat") or loss_weights.get("weight_feature"),
-            "lambdaSem": loss_weights.get("lambdaSem") or loss_weights.get("weight_semantic"),
-            "lambdaPsy": loss_weights.get("lambdaPsy") or loss_weights.get("weight_psy"),
-            "lambda2": loss_weights.get("lambda2") or loss_weights.get("weight_l2"),
+            "lambdaFeat": _coalesce(loss_weights.get("lambdaFeat"), loss_weights.get("weight_feature")),
+            "lambdaSem": _coalesce(loss_weights.get("lambdaSem"), loss_weights.get("weight_semantic")),
+            "lambdaPsy": _coalesce(loss_weights.get("lambdaPsy"), loss_weights.get("weight_psy")),
+            "lambda2": _coalesce(loss_weights.get("lambda2"), loss_weights.get("weight_l2")),
         },
         "optimizationTrace": generation.get("optimizationTrace") or [],
         "averageStepSec": generation.get("averageStepSec"),
@@ -679,22 +714,23 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
         "asr": {
             "originalText": asr.get("referenceText") or asr.get("cleanTranscription"),
             "protectedText": asr.get("protectedTranscription"),
-            "wer": primary.get("wer") or asr.get("wer"),
-            "cer": primary.get("cer") or asr.get("cer"),
-            "tokenErrorRate": primary.get("tokenErrorRate") or semantic.get("tokenErrorRate"),
-            "semanticDrift": primary.get("semanticDrift") or semantic.get("semanticDrift"),
+            "wer": _coalesce(primary.get("wer"), asr.get("wer")),
+            "cer": _coalesce(primary.get("cer"), asr.get("cer")),
+            "tokenErrorRate": _coalesce(primary.get("tokenErrorRate"), asr.get("tokenErrorRate"), semantic.get("tokenErrorRate")),
+            "tokenChangeRate": _coalesce(primary.get("tokenChangeRate"), asr.get("tokenChangeRate"), semantic.get("tokenChangeRate")),
+            "semanticDrift": _coalesce(primary.get("semanticDrift"), asr.get("semanticDrift"), semantic.get("semanticDrift")),
             "insertRate": ((asr.get("breakdown") or {}).get("insertRate")),
             "deleteRate": ((asr.get("breakdown") or {}).get("deleteRate")),
             "substituteRate": ((asr.get("breakdown") or {}).get("substituteRate")),
             "status": asr.get("status"),
         },
         "speaker": {
-            "simBefore": sim_before,
-            "simAfter": sim_after,
-            "simDropRate": (details.get("downstreamTts") or {}).get("simDropRate"),
-            "embeddingDistanceBefore": None,
-            "embeddingDistanceAfter": (details.get("speaker") or {}).get("embeddingDistance"),
-            "source": ((summary.get("metricSources") or {}).get("speakerSimilarity") or {}).get("source"),
+            "simBefore": (details.get("speaker") or {}).get("simBefore") if (details.get("speaker") or {}).get("simBefore") is not None else sim_before,
+            "simAfter": _coalesce((details.get("speaker") or {}).get("simAfter"), sim_after),
+            "simDropRate": (details.get("speaker") or {}).get("simDropRate"),
+            "embeddingDistanceBefore": (details.get("speaker") or {}).get("embeddingDistanceBefore"),
+            "embeddingDistanceAfter": _coalesce((details.get("speaker") or {}).get("embeddingDistanceAfter"), (details.get("speaker") or {}).get("embeddingDistance")),
+            "source": ((metric_sources.get("speaker.*") or {}).get("source")),
             "status": (details.get("speaker") or {}).get("status"),
         },
         "quality": {
@@ -705,11 +741,12 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
             "psychoacousticViolationRate": (details.get("perception") or {}).get("psychoacousticViolationRate"),
             "status": (details.get("perception") or {}).get("status"),
         },
-        "metricSources": summary.get("metricSources") or {},
+        "metricSources": metric_sources,
         "generation": {
-            "lossFinal": generation.get("lossFinal") or {},
+            "lossFinal": generation.get("lossFinal"),
             "optimizationTrace": generation.get("optimizationTrace") or [],
             "steps": generation.get("steps"),
+            "averageStepSec": generation.get("averageStepSec"),
             "realProtect": generation.get("realProtect"),
             "source": generation.get("source"),
             "status": generation.get("status"),
@@ -1244,7 +1281,7 @@ def list_tasks() -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
 
     def terminal_status_from_chain(status_value: Any) -> str | None:
-        if status_value in {"computed", "partial", "completed", "success"}:
+        if status_value in {"available", "computed", "partial", "completed", "success"}:
             return "completed"
         if status_value in {"running", "queued", "failed", "error", "cancelled"}:
             return str(status_value)
@@ -1274,10 +1311,16 @@ def list_tasks() -> list[dict[str, Any]]:
             continue
         payload = result or status or {}
         current_stage = (status or {}).get("stage")
+        asr_task = (status or {}).get("asrTask") if isinstance((status or {}).get("asrTask"), dict) else {}
+        clone_task = (status or {}).get("cloneTask") if isinstance((status or {}).get("cloneTask"), dict) else {}
         audio = payload.get("audio") or {}
         primary = (payload.get("summary") or {}).get("primaryMetrics") or {}
         details = payload.get("details") or {}
         asr_details = details.get("asr") or {}
+        frontend_payload = frontend_result(payload) if result is not None else {}
+        asr_eval = frontend_payload.get("asrEval") or {}
+        clone_eval = frontend_payload.get("cloneEval") or {}
+        protection_quality = frontend_payload.get("protectionQuality") or {}
         downstream_tts = details.get("downstreamTts") or {}
         clone_results = payload.get("cloneResults") or []
         request_payload = payload.get("request") or payload.get("payload") or {}
@@ -1303,14 +1346,20 @@ def list_tasks() -> list[dict[str, Any]]:
             protection_elapsed = (status or payload).get("elapsedSec")
             protection_error = (status or payload).get("error")
 
-        has_current_asr = current_stage == "asr_eval"
-        has_asr_result = has_current_asr or asr_result_path.exists() or asr_details.get("status") in {"computed", "partial", "failed", "error"}
+        has_current_asr = current_stage == "asr_eval" or asr_task.get("status") in {"queued", "running"}
+        has_asr_result = bool(asr_task) or has_current_asr or asr_result_path.exists() or asr_details.get("status") in {"available", "computed", "partial", "failed", "error"}
         if has_current_asr:
-            asr_task_status = (status or {}).get("status")
-            asr_progress = (status or {}).get("progress")
-            asr_message = (status or {}).get("message")
-            asr_elapsed = (status or {}).get("elapsedSec")
-            asr_error = (status or {}).get("error")
+            asr_task_status = asr_task.get("status") or (status or {}).get("status")
+            asr_progress = asr_task.get("progress") if asr_task.get("progress") is not None else (status or {}).get("progress")
+            asr_message = asr_task.get("message") or (status or {}).get("message")
+            asr_elapsed = asr_task.get("elapsedSec") if asr_task.get("elapsedSec") is not None else (status or {}).get("elapsedSec")
+            asr_error = asr_task.get("error") if asr_task.get("error") is not None else (status or {}).get("error")
+        elif asr_task:
+            asr_task_status = terminal_status_from_chain(asr_task.get("status")) or str(asr_task.get("status") or "completed")
+            asr_progress = asr_task.get("progress") if asr_task.get("progress") is not None else (1 if asr_task_status in {"completed", "success"} else None)
+            asr_message = asr_task.get("message")
+            asr_elapsed = asr_task.get("elapsedSec")
+            asr_error = asr_task.get("error")
         elif has_asr_result:
             asr_task_status = terminal_status_from_chain(asr_details.get("status")) or "completed"
             asr_progress = 1
@@ -1324,14 +1373,20 @@ def list_tasks() -> list[dict[str, Any]]:
             asr_elapsed = None
             asr_error = None
 
-        has_current_clone = current_stage == "downstream_tts_eval"
-        has_clone_result = has_current_clone or clone_result_path.exists() or bool(clone_results) or downstream_tts.get("status") in {"computed", "partial", "failed", "error"}
+        has_current_clone = current_stage == "downstream_tts_eval" or clone_task.get("status") in {"queued", "running"}
+        has_clone_result = bool(clone_task) or has_current_clone or clone_result_path.exists() or bool(clone_results) or downstream_tts.get("status") in {"computed", "partial", "failed", "error"}
         if has_current_clone:
-            clone_task_status = (status or {}).get("status")
-            clone_progress = (status or {}).get("progress")
-            clone_message = (status or {}).get("message")
-            clone_elapsed = (status or {}).get("elapsedSec")
-            clone_error = (status or {}).get("error")
+            clone_task_status = clone_task.get("status") or (status or {}).get("status")
+            clone_progress = clone_task.get("progress") if clone_task.get("progress") is not None else (status or {}).get("progress")
+            clone_message = clone_task.get("message") or (status or {}).get("message")
+            clone_elapsed = clone_task.get("elapsedSec") if clone_task.get("elapsedSec") is not None else (status or {}).get("elapsedSec")
+            clone_error = clone_task.get("error") if clone_task.get("error") is not None else (status or {}).get("error")
+        elif clone_task:
+            clone_task_status = terminal_status_from_chain(clone_task.get("status")) or str(clone_task.get("status") or "completed")
+            clone_progress = clone_task.get("progress") if clone_task.get("progress") is not None else (1 if clone_task_status in {"completed", "success"} else None)
+            clone_message = clone_task.get("message")
+            clone_elapsed = clone_task.get("elapsedSec")
+            clone_error = clone_task.get("error")
         elif has_clone_result:
             clone_task_status = terminal_status_from_chain(downstream_tts.get("status")) or "completed"
             clone_progress = 1
@@ -1383,9 +1438,9 @@ def list_tasks() -> list[dict[str, Any]]:
                 "cloneError": clone_error,
                 "hasAsrResult": bool(has_asr_result),
                 "hasCloneResult": bool(has_clone_result),
-                "wer": primary.get("wer"),
-                "simDropRate": None,
-                "pesq": primary.get("pesq"),
+                "wer": asr_eval.get("wer") if asr_eval else None,
+                "simDropRate": _coalesce(clone_eval.get("similarityDropRate") if clone_eval else None, (details.get("speaker") or {}).get("simDropRate")),
+                "pesq": protection_quality.get("pesq") if protection_quality else None,
                 "createdAt": payload.get("createdAt") or (status or {}).get("createdAt"),
                 "updatedAt": payload.get("updatedAt") or (status or {}).get("updatedAt"),
                 "elapsedSec": protection_elapsed,
@@ -1508,7 +1563,7 @@ def run_asr_eval(task_id: str, payload: AsrEvalRequest) -> JSONResponse:
             ensure_task_not_cancelled(task_id, cancel_event)
             asr_payload = result.get("asr") if isinstance(result, dict) else {}
             asr_status = (asr_payload or {}).get("status") if isinstance(asr_payload, dict) else None
-            if asr_status not in {"computed", "partial"}:
+            if asr_status not in {"available", "computed", "partial"}:
                 reason = (asr_payload or {}).get("error") or (asr_payload or {}).get("reason") or "ASR evaluator did not generate transcriptions"
                 write_task_status(
                     task_id,

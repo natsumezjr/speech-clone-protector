@@ -50,7 +50,7 @@ const metrics = [
   { title: '听感保真（PESQ）', value: '4.38 / 5', sub: '高保真听感', tone: 'green', data: [35, 45, 38, 62, 54, 77, 69, 82] },
   { title: '对抗评估（攻击成功率）', value: '↓ 85.6%', sub: '多攻击平均下降', tone: 'red', data: [22, 38, 55, 31, 76, 42, 37, 25] },
   { title: '任务通过率', value: '98.7%', sub: '通过率（内部基准）', tone: 'cyan', data: [16, 22, 28, 45, 39, 56, 73, 88] },
-  { title: '处理时长（12s 音频）', value: '8.2s', sub: '平均耗时', tone: 'blue', data: [18, 47, 26, 62, 38, 70, 54, 76] },
+  { title: '单步平均时长', value: '9.3s', sub: '平均耗时', tone: 'blue', data: [18, 47, 26, 62, 38, 70, 54, 76] },
 ]
 
 const capabilities = [
