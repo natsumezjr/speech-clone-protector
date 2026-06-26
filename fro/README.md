@@ -36,7 +36,7 @@ pnpm build
 
 - `/`: project entry page.
 - `/workspace`: upload or record audio, configure protection, submit real backend task.
-- `/results/:taskId`: audio comparison, ASR test, clone test, metrics, details, exports.
+- `/results/:taskId`: protection, ASR, and clone tabs with separated evidence chains.
 - `/history`: backend task history separated by protection, ASR, and clone views.
 
 ## Backend Contract
@@ -55,6 +55,11 @@ The frontend expects these endpoints:
 - `GET /api/tasks`
 - `DELETE /api/tasks/{taskId}`
 - `GET /api/tasks/{taskId}/download/protected-audio`
+- `GET /api/tasks/{taskId}/download?type=protected_audio`
+- `GET /api/tasks/{taskId}/download?type=report_pdf`
+- `GET /api/tasks/{taskId}/download?type=evidence_zip`
+- `GET /api/tasks/{taskId}/download?type=asr_report`
+- `GET /api/tasks/{taskId}/download?type=clone_result_zip`
 - `GET /api/tasks/{taskId}/export/report`
 - `GET /api/tasks/{taskId}/export/csv`
 - `GET /api/tasks/{taskId}/download/evidence`
@@ -62,6 +67,38 @@ The frontend expects these endpoints:
 Unsupported or unavailable metrics must be returned as `null` or explicit
 unavailable status by the backend. The frontend should not fabricate scores,
 PESQ, SIM, MOS, trend lines, radar values, or progress.
+
+### Result Field Contract
+
+`GET /api/tasks/{taskId}/result` may omit any optional metric. Missing values
+are rendered as `未生成` or an explicit empty state, never as `0`, `0.0%`, or
+`0 dB`.
+
+- Protection tab: `originalAudio`, `protectedAudio`, `perturbation`,
+  `protectionQuality`, `psychoacoustic`, `lossFinal`, `lossWeights`,
+  `optimizationTrace`, and `averageStepSec`.
+- ASR tab: `asrEval` only. It remains empty until the user runs
+  `POST /api/tasks/{taskId}/asr-eval`.
+- Clone tab: `cloneEval` only. It remains empty until the user runs
+  `POST /api/tasks/{taskId}/clone-voice`.
+
+The client normalizes compatible backend field names:
+
+- elapsed time: `elapsedSec`, `elapsed_sec`, `processingTimeSec`,
+  `processing_time_sec`, `processingTime`, `runtimeSec`, `durationSec`,
+  `timeCostSec`, or timestamp differences.
+- audio metadata: `url/audioUrl/downloadUrl`, `filename/name/fileName`,
+  `durationSec/duration/duration_seconds`, `sampleRate/sample_rate`,
+  `channels/channelCount`, `format/codec/ext`, `sizeBytes/size/fileSize`.
+- ASR metrics: `wer/WER`, `cer/CER`, insertion/deletion/substitution aliases,
+  token error/change aliases, semantic drift aliases, and transcript aliases.
+- Clone metrics: similarity, embedding-distance, and confidence before/after
+  aliases.
+
+ASR and clone evaluation are optional downstream tests. Protection completion
+must not automatically run ASR, voice cloning, per-step ASR, or per-step clone
+evaluation. Charts render only backend-provided arrays; otherwise the page shows
+an empty-state explanation.
 
 ## Portability Notes
 

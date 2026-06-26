@@ -57,6 +57,8 @@ export interface ProtectionTaskRequest {
 
 export interface AsrMetrics {
   model?: string
+  asrModel?: string | null
+  language?: string | null
   originalText: string | null
   protectedText: string | null
   wer?: number | null
@@ -67,6 +69,11 @@ export interface AsrMetrics {
   insertRate?: number | null
   deleteRate?: number | null
   substituteRate?: number | null
+  metricLevel?: 'word' | 'char' | string | null
+  asrProtectionScore?: number | null
+  diffOps?: DiffOp[] | null
+  trend?: Array<Record<string, number>> | null
+  createdAt?: string | null
   status?: string
   error?: string | null
   reason?: string | null
@@ -130,6 +137,7 @@ export interface LossTrendPoint {
   Lpsy: number | null
   L2: number | null
   total?: number | null
+  stepElapsedSec?: number | null
 }
 
 export interface LossFinal {
@@ -145,6 +153,67 @@ export interface PsychoacousticPoint {
   maskingThreshold: number
   perturbation?: number
   perturbationPsd?: number
+}
+
+export type DiffOp =
+  | { type: 'equal' | 'insert' | 'delete'; text: string }
+  | { type: 'replace'; from: string; to: string }
+
+export interface PerturbationMetrics {
+  l2Norm?: number | null
+  l2Rms?: number | null
+  linfNorm?: number | null
+  epsilon?: number | null
+  epsilonNorm?: 'l2' | 'linf' | string | null
+  epsilonUsageRate?: number | null
+  snr?: number | null
+  clippingRate?: number | null
+}
+
+export interface ProtectionQuality {
+  snr?: number | null
+  pesq?: number | null
+  stoi?: number | null
+  mos?: number | null
+  mosLqo?: number | null
+  qualityLevel?: string | null
+}
+
+export interface PsychoacousticMetrics {
+  lPsy?: number | null
+  overMaskRate?: number | null
+  maskingThreshold?: Array<{ frequencyHz: number; thresholdDb: number }> | null
+  perturbationSpectrum?: Array<{ frequencyHz: number; powerDb: number }> | null
+}
+
+export interface LossWeights {
+  lambdaFeat?: number | null
+  lambdaSem?: number | null
+  lambdaPsy?: number | null
+  lambda2?: number | null
+}
+
+export type AsrEval = AsrMetrics
+
+export interface CloneEval {
+  cloneModel?: string | null
+  speakerEvalModel?: string | null
+  targetText?: string | null
+  originalCloneAudio?: AudioFileMeta | null
+  protectedCloneAudio?: AudioFileMeta | null
+  originalSimilarity?: number | null
+  protectedSimilarity?: number | null
+  similarityDropRate?: number | null
+  embeddingDistanceBefore?: number | null
+  embeddingDistanceAfter?: number | null
+  embeddingDistanceIncreaseRate?: number | null
+  cloneConfidenceBefore?: number | null
+  cloneConfidenceAfter?: number | null
+  cloneConfidenceDropRate?: number | null
+  cloneRadar?: Array<Record<string, string | number>> | null
+  cloneTrend?: Array<Record<string, number>> | null
+  cloneDefenseScore?: number | null
+  createdAt?: string | null
 }
 
 export interface MetricSource {
@@ -295,6 +364,15 @@ export interface TaskResult {
   }>
   originalAudio: AudioFileMeta
   protectedAudio: AudioFileMeta
+  perturbation?: PerturbationMetrics | null
+  protectionQuality?: ProtectionQuality | null
+  psychoacoustic?: PsychoacousticMetrics | null
+  lossFinal?: LossFinal | null
+  lossWeights?: LossWeights | null
+  optimizationTrace?: LossTrendPoint[] | null
+  averageStepSec?: number | null
+  asrEval?: AsrEval | null
+  cloneEval?: CloneEval | null
   cloneResults?: CloneVoiceResult[]
   asr: AsrMetrics
   speaker: SpeakerMetrics
@@ -352,6 +430,7 @@ export interface CloneVoiceResult {
   request: CloneVoiceRequest
   originalCloneAudio: AudioFileMeta
   protectedCloneAudio: AudioFileMeta
+  cloneEval?: CloneEval | null
 }
 
 export interface HistoryTask {

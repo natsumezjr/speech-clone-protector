@@ -45,16 +45,50 @@ function firstNumber(record: Record<string, unknown>, keys: string[]) {
   return null
 }
 
+function firstValue(record: Record<string, unknown>, keys: string[]) {
+  for (const key of keys) {
+    if (record[key] !== undefined && record[key] !== null && record[key] !== '') return record[key]
+  }
+  return undefined
+}
+
+function firstString(record: Record<string, unknown>, keys: string[]) {
+  const value = firstValue(record, keys)
+  return typeof value === 'string' && value.length > 0 ? value : null
+}
+
+function parseDateMs(value: unknown) {
+  if (typeof value !== 'string' || value.length === 0) return null
+  const iso = Date.parse(value)
+  if (Number.isFinite(iso)) return iso
+  const match = /^(\d{4})\.(\d{1,2})\.(\d{1,2})\s+(\d{1,2}):(\d{1,2}):(\d{1,2})$/.exec(value)
+  if (!match) return null
+  const [, year, month, day, hour, minute, second] = match
+  const local = new Date(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second)).getTime()
+  return Number.isFinite(local) ? local : null
+}
+
+export function normalizeElapsedSec(data: unknown) {
+  const record = asRecord(data)
+  const direct = firstNumber(record, ['elapsedSec', 'elapsed_sec', 'processingTimeSec', 'processing_time_sec', 'processingTime', 'runtimeSec', 'durationSec', 'timeCostSec'])
+  if (direct !== null) return direct
+  const start = parseDateMs(firstValue(record, ['startedAt', 'started_at', 'submittedAt', 'submitted_at', 'createdAt', 'created_at']))
+  const end = parseDateMs(firstValue(record, ['completedAt', 'completed_at', 'finishedAt', 'finished_at', 'updatedAt', 'updated_at']))
+  if (start === null || end === null || end < start) return null
+  return (end - start) / 1000
+}
+
 function normalizeLossTrendPoint(value: unknown, fallbackStep: number): TaskResult['charts']['optimizationTrend'][number] | null {
   const point = asRecord(value)
   const step = firstNumber(point, ['step', 'epoch', 'iteration', 'iter']) ?? fallbackStep
   const normalized = {
     step,
-    Lfeat: firstNumber(point, ['Lfeat', 'Lfea', 'lossFeature', 'loss_timbre', 'L_feature']),
-    Lsem: firstNumber(point, ['Lsem', 'lossSemantic', 'loss_semantic', 'L_semantic']),
-    Lpsy: firstNumber(point, ['Lpsy', 'lossPsy', 'loss_psy', 'L_psy']),
-    L2: firstNumber(point, ['L2', 'lossL2', 'loss_l2', 'l2Norm']),
-    total: firstNumber(point, ['total', 'lossTotal', 'loss_total']),
+    Lfeat: firstNumber(point, ['Lfeat', 'lFeat', 'Lfea', 'lossFeature', 'loss_timbre', 'L_feature']),
+    Lsem: firstNumber(point, ['Lsem', 'lSem', 'lossSemantic', 'loss_semantic', 'L_semantic']),
+    Lpsy: firstNumber(point, ['Lpsy', 'lPsy', 'lossPsy', 'loss_psy', 'L_psy']),
+    L2: firstNumber(point, ['L2', 'l2', 'lossL2', 'loss_l2', 'l2Norm']),
+    total: firstNumber(point, ['total', 'totalLoss', 'lossTotal', 'loss_total']),
+    stepElapsedSec: firstNumber(point, ['stepElapsedSec', 'step_elapsed_sec', 'elapsedSec', 'elapsed']),
   }
   const hasLoss = [normalized.Lfeat, normalized.Lsem, normalized.Lpsy, normalized.L2, normalized.total].some((item) => item !== null)
   return hasLoss ? normalized : null
@@ -68,10 +102,6 @@ function normalizeLossTrend(value: unknown): TaskResult['charts']['optimizationT
   return sampleLossTrend(points)
 }
 
-function nearestLossPoint(points: TaskResult['charts']['optimizationTrend'], step: number) {
-  return points.reduce((best, point) => (Math.abs(point.step - step) < Math.abs(best.step - step) ? point : best), points[0])
-}
-
 function uniqueLossPoints(points: TaskResult['charts']['optimizationTrend']) {
   const seen = new Set<number>()
   return points.filter((point) => {
@@ -81,20 +111,11 @@ function uniqueLossPoints(points: TaskResult['charts']['optimizationTrend']) {
   })
 }
 
-function sampleLossTrend(points: TaskResult['charts']['optimizationTrend']): TaskResult['charts']['optimizationTrend'] {
-  if (points.length <= 10) return points
+function sampleLossTrend(points: TaskResult['charts']['optimizationTrend'], maxPoints = 80): TaskResult['charts']['optimizationTrend'] {
+  if (points.length <= maxPoints) return points
   const ordered = [...points].sort((a, b) => a.step - b.step)
-  const maxStep = Math.max(...ordered.map((point) => point.step), ordered.length)
-  if (maxStep <= 10) return ordered
-  if (maxStep % 10 === 0) {
-    const interval = maxStep / 10
-    return uniqueLossPoints(Array.from({ length: 10 }, (_, index) => nearestLossPoint(ordered, interval * (index + 1))))
-  }
-  if (maxStep < 20) {
-    return uniqueLossPoints([...ordered.slice(0, 7), ...ordered.slice(-3)])
-  }
-  const sampled = Array.from({ length: 10 }, (_, index) => {
-    const position = Math.round((index / 9) * (ordered.length - 1))
+  const sampled = Array.from({ length: maxPoints }, (_, index) => {
+    const position = Math.round((index / Math.max(1, maxPoints - 1)) * (ordered.length - 1))
     return ordered[position]
   })
   return uniqueLossPoints(sampled)
@@ -103,11 +124,11 @@ function sampleLossTrend(points: TaskResult['charts']['optimizationTrend']): Tas
 function normalizeLossFinal(value: unknown): NonNullable<TaskResult['generation']>['lossFinal'] {
   const record = asRecord(value)
   return {
-    Lfeat: firstNumber(record, ['Lfeat', 'Lfea', 'lossFeature', 'loss_timbre', 'L_feature']),
-    Lsem: firstNumber(record, ['Lsem', 'lossSemantic', 'loss_semantic', 'L_semantic']),
-    Lpsy: firstNumber(record, ['Lpsy', 'lossPsy', 'loss_psy', 'L_psy']),
-    L2: firstNumber(record, ['L2', 'lossL2', 'loss_l2', 'l2Norm']),
-    total: firstNumber(record, ['total', 'lossTotal', 'loss_total']),
+    Lfeat: firstNumber(record, ['Lfeat', 'lFeat', 'Lfea', 'lossFeature', 'loss_timbre', 'L_feature']),
+    Lsem: firstNumber(record, ['Lsem', 'lSem', 'lossSemantic', 'loss_semantic', 'L_semantic']),
+    Lpsy: firstNumber(record, ['Lpsy', 'lPsy', 'lossPsy', 'loss_psy', 'L_psy']),
+    L2: firstNumber(record, ['L2', 'l2', 'lossL2', 'loss_l2', 'l2Norm']),
+    total: firstNumber(record, ['total', 'totalLoss', 'lossTotal', 'loss_total']),
   }
 }
 
@@ -135,21 +156,21 @@ function absoluteUrl(value?: string) {
 
 function normalizeAudio(meta: unknown, fallbackName: string): AudioFileMeta {
   const data = asRecord(meta)
-  const filename = stringOr(data.filename, fallbackName)
-  const rawSrc = typeof data.src === 'string' ? data.src : undefined
-  const rawAudioUrl = typeof data.audioUrl === 'string' ? data.audioUrl : rawSrc
-  const rawDownloadUrl = typeof data.downloadUrl === 'string' ? data.downloadUrl : undefined
+  const filename = firstString(data, ['filename', 'name', 'fileName']) ?? fallbackName
+  const rawSrc = firstString(data, ['src', 'url', 'audioUrl', 'downloadUrl']) ?? undefined
+  const rawAudioUrl = firstString(data, ['audioUrl', 'url', 'src', 'downloadUrl']) ?? rawSrc
+  const rawDownloadUrl = firstString(data, ['downloadUrl', 'url', 'audioUrl', 'src']) ?? undefined
   const rawObjectUrl = typeof data.objectUrl === 'string' ? data.objectUrl : undefined
   return {
     fileId: typeof data.fileId === 'string' ? data.fileId : undefined,
     filename,
-    durationSec: numberOrNull(data.durationSec ?? data.duration) ?? undefined,
-    duration: numberOrNull(data.duration ?? data.durationSec) ?? undefined,
-    sampleRate: numberOrNull(data.sampleRate) ?? undefined,
-    channels: numberOrNull(data.channels) ?? undefined,
+    durationSec: firstNumber(data, ['durationSec', 'duration', 'duration_seconds']) ?? undefined,
+    duration: firstNumber(data, ['duration', 'durationSec', 'duration_seconds']) ?? undefined,
+    sampleRate: firstNumber(data, ['sampleRate', 'sample_rate']) ?? undefined,
+    channels: firstNumber(data, ['channels', 'channelCount']) ?? undefined,
     bitDepth: numberOrNull(data.bitDepth) ?? undefined,
-    sizeBytes: numberOrNull(data.sizeBytes) ?? 0,
-    format: stringOr(data.format, filename.split('.').pop()?.toUpperCase() ?? 'AUDIO'),
+    sizeBytes: firstNumber(data, ['sizeBytes', 'size', 'fileSize']) ?? 0,
+    format: firstString(data, ['format', 'codec', 'ext']) ?? filename.split('.').pop()?.toUpperCase() ?? 'AUDIO',
     src: absoluteUrl(rawSrc),
     audioUrl: absoluteUrl(rawAudioUrl),
     downloadUrl: absoluteUrl(rawDownloadUrl),
@@ -159,9 +180,122 @@ function normalizeAudio(meta: unknown, fallbackName: string): AudioFileMeta {
   }
 }
 
+function normalizePerturbation(value: unknown): TaskResult['perturbation'] {
+  const record = asRecord(value)
+  return {
+    l2Norm: firstNumber(record, ['l2Norm', 'l2_norm', 'L2', 'l2']),
+    l2Rms: firstNumber(record, ['l2Rms', 'l2_rms']),
+    linfNorm: firstNumber(record, ['linfNorm', 'linf_norm', 'lInfNorm']),
+    epsilon: firstNumber(record, ['epsilon', 'eps']),
+    epsilonNorm: firstString(record, ['epsilonNorm', 'epsilon_norm']) ?? null,
+    epsilonUsageRate: firstNumber(record, ['epsilonUsageRate', 'epsilon_usage_rate']),
+    snr: firstNumber(record, ['snr', 'SNR']),
+    clippingRate: firstNumber(record, ['clippingRate', 'clipping_rate']),
+  }
+}
+
+function normalizeProtectionQuality(value: unknown): TaskResult['protectionQuality'] {
+  const record = asRecord(value)
+  return {
+    snr: firstNumber(record, ['snr', 'SNR']),
+    pesq: firstNumber(record, ['pesq', 'PESQ']),
+    stoi: firstNumber(record, ['stoi', 'STOI']),
+    mos: firstNumber(record, ['mos', 'MOS']),
+    mosLqo: firstNumber(record, ['mosLqo', 'mos_lqo', 'MOSLQO']),
+    qualityLevel: firstString(record, ['qualityLevel', 'quality_level']) ?? null,
+  }
+}
+
+function normalizePsychoacoustic(value: unknown): TaskResult['psychoacoustic'] {
+  const record = asRecord(value)
+  return {
+    lPsy: firstNumber(record, ['lPsy', 'Lpsy', 'lossPsy']),
+    overMaskRate: firstNumber(record, ['overMaskRate', 'over_mask_rate', 'psychoacousticViolationRate']),
+    maskingThreshold: Array.isArray(record.maskingThreshold) ? (record.maskingThreshold as NonNullable<TaskResult['psychoacoustic']>['maskingThreshold']) : null,
+    perturbationSpectrum: Array.isArray(record.perturbationSpectrum) ? (record.perturbationSpectrum as NonNullable<TaskResult['psychoacoustic']>['perturbationSpectrum']) : null,
+  }
+}
+
+function normalizeLossWeights(value: unknown): TaskResult['lossWeights'] {
+  const record = asRecord(value)
+  return {
+    lambdaFeat: firstNumber(record, ['lambdaFeat', 'weightFeature', 'weight_feature']),
+    lambdaSem: firstNumber(record, ['lambdaSem', 'weightSemantic', 'weight_semantic']),
+    lambdaPsy: firstNumber(record, ['lambdaPsy', 'weightPsy', 'weight_psy']),
+    lambda2: firstNumber(record, ['lambda2', 'weightL2', 'weight_l2']),
+  }
+}
+
+function hasAnyNumber(record: Record<string, unknown>, keys: string[]) {
+  return keys.some((key) => numberOrNull(record[key]) !== null)
+}
+
+function normalizeAsrEval(value: unknown): TaskResult['asrEval'] {
+  const data = asRecord(value)
+  const status = firstString(data, ['status'])
+  const originalText = firstString(data, ['originalText', 'original_transcript', 'referenceText', 'cleanTranscription', 'beforeText'])
+  const protectedText = firstString(data, ['protectedText', 'protected_transcript', 'protectedTranscription', 'afterText'])
+  const hasMetric = hasAnyNumber(data, ['wer', 'WER', 'cer', 'CER', 'insertRate', 'ir', 'insertionRate', 'deleteRate', 'dr', 'deletionRate', 'substituteRate', 'sr', 'substitutionRate', 'tokenErrorRate', 'token_error_rate', 'tokenChangeRate', 'token_change_rate', 'semanticDrift', 'semantic_drift'])
+  if (status && !['computed', 'partial', 'completed', 'success', 'finished'].includes(status) && !originalText && !protectedText && !hasMetric) return null
+  if (!status && !originalText && !protectedText && !hasMetric) return null
+  return {
+    model: firstString(data, ['model', 'asrModel', 'asr_model']) ?? undefined,
+    asrModel: firstString(data, ['asrModel', 'asr_model', 'model']),
+    language: firstString(data, ['language', 'lang']),
+    originalText,
+    protectedText,
+    wer: firstNumber(data, ['wer', 'WER']),
+    cer: firstNumber(data, ['cer', 'CER']),
+    substituteRate: firstNumber(data, ['substituteRate', 'sr', 'substitutionRate']),
+    insertRate: firstNumber(data, ['insertRate', 'ir', 'insertionRate']),
+    deleteRate: firstNumber(data, ['deleteRate', 'dr', 'deletionRate']),
+    metricLevel: firstString(data, ['metricLevel', 'metric_level']),
+    tokenErrorRate: firstNumber(data, ['tokenErrorRate', 'token_error_rate']),
+    tokenChangeRate: firstNumber(data, ['tokenChangeRate', 'token_change_rate']),
+    semanticDrift: firstNumber(data, ['semanticDrift', 'semantic_drift']),
+    asrProtectionScore: firstNumber(data, ['asrProtectionScore', 'asr_protection_score']),
+    diffOps: Array.isArray(data.diffOps) ? (data.diffOps as NonNullable<TaskResult['asrEval']>['diffOps']) : null,
+    trend: Array.isArray(data.trend) ? (data.trend as NonNullable<TaskResult['asrEval']>['trend']) : null,
+    createdAt: firstString(data, ['createdAt', 'created_at']),
+    status: status ?? undefined,
+    error: firstString(data, ['error']),
+    reason: firstString(data, ['reason']),
+  }
+}
+
+function normalizeCloneEval(value: unknown): TaskResult['cloneEval'] {
+  const data = asRecord(value)
+  const request = asRecord(data.request)
+  const originalCloneAudio = data.originalCloneAudio ? normalizeAudio(data.originalCloneAudio, 'original_clone.wav') : null
+  const protectedCloneAudio = data.protectedCloneAudio ? normalizeAudio(data.protectedCloneAudio, 'protected_clone.wav') : null
+  const hasMetric = hasAnyNumber(data, ['originalSimilarity', 'simBefore', 'similarityBefore', 'protectedSimilarity', 'simAfter', 'similarityAfter', 'embeddingDistanceBefore', 'distanceBefore', 'embeddingDistanceAfter', 'distanceAfter', 'cloneConfidenceBefore', 'confidenceBefore', 'cloneConfidenceAfter', 'confidenceAfter'])
+  if (!originalCloneAudio && !protectedCloneAudio && !hasMetric && !data.cloneEval) return null
+  return {
+    cloneModel: firstString(data, ['cloneModel', 'clone_model']) ?? firstString(request, ['model']),
+    speakerEvalModel: firstString(data, ['speakerEvalModel', 'speaker_eval_model']),
+    targetText: firstString(data, ['targetText', 'target_text']) ?? firstString(request, ['text']),
+    originalCloneAudio,
+    protectedCloneAudio,
+    originalSimilarity: firstNumber(data, ['originalSimilarity', 'simBefore', 'similarityBefore']),
+    protectedSimilarity: firstNumber(data, ['protectedSimilarity', 'simAfter', 'similarityAfter']),
+    similarityDropRate: firstNumber(data, ['similarityDropRate', 'similarity_drop_rate', 'simDropRate']),
+    embeddingDistanceBefore: firstNumber(data, ['embeddingDistanceBefore', 'distanceBefore']),
+    embeddingDistanceAfter: firstNumber(data, ['embeddingDistanceAfter', 'distanceAfter']),
+    embeddingDistanceIncreaseRate: firstNumber(data, ['embeddingDistanceIncreaseRate', 'embedding_distance_increase_rate']),
+    cloneConfidenceBefore: firstNumber(data, ['cloneConfidenceBefore', 'confidenceBefore']),
+    cloneConfidenceAfter: firstNumber(data, ['cloneConfidenceAfter', 'confidenceAfter']),
+    cloneConfidenceDropRate: firstNumber(data, ['cloneConfidenceDropRate', 'confidenceDropRate']),
+    cloneRadar: Array.isArray(data.cloneRadar) ? (data.cloneRadar as NonNullable<TaskResult['cloneEval']>['cloneRadar']) : null,
+    cloneTrend: Array.isArray(data.cloneTrend) ? (data.cloneTrend as NonNullable<TaskResult['cloneEval']>['cloneTrend']) : null,
+    cloneDefenseScore: firstNumber(data, ['cloneDefenseScore', 'clone_defense_score']),
+    createdAt: firstString(data, ['createdAt', 'created_at']),
+  }
+}
+
 function normalizeCloneResult(payload: unknown): CloneVoiceResult {
   const data = asRecord(payload)
   const request = asRecord(data.request)
+  const cloneEval = normalizeCloneEval(data)
   return {
     cloneId: String(data.cloneId ?? ''),
     taskId: String(data.taskId ?? ''),
@@ -177,6 +311,7 @@ function normalizeCloneResult(payload: unknown): CloneVoiceResult {
     },
     originalCloneAudio: normalizeAudio(data.originalCloneAudio, 'original_clone.wav'),
     protectedCloneAudio: normalizeAudio(data.protectedCloneAudio, 'protected_clone.wav'),
+    cloneEval,
   }
 }
 
@@ -190,10 +325,22 @@ function normalizeTaskResult(payload: unknown): TaskResult {
     const generation = asRecord(data.generation ?? asRecord(details.generation))
     const optimizationTrend = normalizeLossTrend(charts.optimizationTrend ?? asRecord(details.generation).optimizationTrace ?? charts.trend)
     const cloneResults = Array.isArray(data.cloneResults) ? data.cloneResults.map(normalizeCloneResult) : undefined
+    const asrEval = normalizeAsrEval(data.asrEval ?? data.asr)
+    const latestCloneEval = normalizeCloneEval(data.cloneEval) ?? cloneResults?.at(-1)?.cloneEval ?? null
     return {
       ...(data as unknown as TaskResult),
       originalAudio: normalizeAudio(originalAudio, stringOr(originalAudio.filename, 'original.wav')),
       protectedAudio: normalizeAudio(protectedAudio, stringOr(protectedAudio.filename, 'protected.wav')),
+      elapsedSec: normalizeElapsedSec(data),
+      perturbation: normalizePerturbation(data.perturbation ?? asRecord(details.perception)),
+      protectionQuality: normalizeProtectionQuality(data.protectionQuality ?? data.quality ?? asRecord(details.perception)),
+      psychoacoustic: normalizePsychoacoustic(data.psychoacoustic ?? asRecord(details.perception)),
+      lossFinal: normalizeLossFinal(data.lossFinal ?? generation.lossFinal),
+      lossWeights: normalizeLossWeights(data.lossWeights ?? generation.lossWeights),
+      optimizationTrace: optimizationTrend,
+      averageStepSec: firstNumber(data, ['averageStepSec', 'average_step_sec']),
+      asrEval,
+      cloneEval: latestCloneEval,
       generation: {
         ...(asRecord(data.generation) as NonNullable<TaskResult['generation']>),
         lossFinal: normalizeLossFinal(generation.lossFinal),
@@ -239,6 +386,30 @@ function normalizeTaskResult(payload: unknown): TaskResult {
   const originalText = optionalString(detailAsr.referenceText ?? detailAsr.cleanTranscription)
   const protectedText = optionalString(detailAsr.protectedTranscription)
   const cloneResults = Array.isArray(data.cloneResults) ? data.cloneResults.map(normalizeCloneResult) : undefined
+  const lossFinal = normalizeLossFinal(detailGeneration.lossFinal)
+  const lossWeights = normalizeLossWeights(detailGeneration.lossWeights)
+  const elapsedSec = normalizeElapsedSec(data)
+  const asrEval = normalizeAsrEval(detailAsr)
+  const cloneEval = normalizeCloneEval(data.cloneEval) ?? cloneResults?.at(-1)?.cloneEval ?? null
+  const perturbation = normalizePerturbation({
+    ...asRecord(details.perception),
+    ...asRecord(details.perturbation),
+    l2Norm: asRecord(details.perception).l2Norm ?? lossFinal?.L2,
+    epsilon: asRecord(asRecord(data.request).optimization).epsilon,
+    epsilonNorm: asRecord(asRecord(data.request).optimization).epsilonNorm,
+    snr,
+  })
+  const protectionQuality = normalizeProtectionQuality({
+    ...asRecord(details.perception),
+    snr,
+    pesq,
+    mosLqo: asRecord(details.perception).mosLqo,
+  })
+  const psychoacoustic = normalizePsychoacoustic({
+    ...asRecord(details.perception),
+    lPsy: lossFinal?.Lpsy,
+    overMaskRate: asRecord(details.perception).psychoacousticViolationRate,
+  })
 
   return {
     taskId: String(data.taskId ?? ''),
@@ -250,7 +421,7 @@ function normalizeTaskResult(payload: unknown): TaskResult {
     createdAt: typeof data.createdAt === 'string' ? data.createdAt : undefined,
     submittedAt: typeof data.submittedAt === 'string' ? data.submittedAt : typeof data.createdAt === 'string' ? data.createdAt : undefined,
     completedAt: stringOr(data.completedAt ?? data.createdAt, '-'),
-    elapsedSec: numberOrNull(data.elapsedSec),
+    elapsedSec,
     inputSource: '后端 API',
     language: stringOr(detailAsr.language, '未标注'),
     processingModel: stringOr(detailGeneration.source ?? backend.version, ''),
@@ -263,6 +434,15 @@ function normalizeTaskResult(payload: unknown): TaskResult {
     ],
     originalAudio: normalizeAudio(originalRaw, 'original.wav'),
     protectedAudio: normalizeAudio(protectedRaw, 'protected.wav'),
+    perturbation,
+    protectionQuality,
+    psychoacoustic,
+    lossFinal,
+    lossWeights,
+    optimizationTrace: optimizationTrend,
+    averageStepSec: firstNumber(data, ['averageStepSec', 'average_step_sec']) ?? null,
+    asrEval,
+    cloneEval,
     cloneResults,
     asr: {
       originalText,
@@ -295,7 +475,7 @@ function normalizeTaskResult(payload: unknown): TaskResult {
     },
     metricSources: metricSources as TaskResult['metricSources'],
     generation: {
-      lossFinal: normalizeLossFinal(detailGeneration.lossFinal),
+      lossFinal,
       optimizationTrace: normalizeLossTrend(detailGeneration.optimizationTrace),
       steps: numberOrNull(detailGeneration.steps),
       realProtect: typeof detailGeneration.realProtect === 'boolean' ? detailGeneration.realProtect : null,
@@ -312,6 +492,33 @@ function normalizeTaskResult(payload: unknown): TaskResult {
       radarAfter: Array.isArray(charts.radarAfter) ? charts.radarAfter as number[] : undefined,
       chainRadar: Array.isArray(charts.chainRadar) ? charts.chainRadar as TaskResult['charts']['chainRadar'] : [],
     },
+  }
+}
+
+function normalizeHistoryTask(payload: unknown): HistoryTask {
+  const data = asRecord(payload)
+  const protectionElapsedSec = normalizeElapsedSec({
+    ...data,
+    elapsedSec: data.protectionElapsedSec ?? data.elapsedSec,
+  })
+  const asrElapsedSec = normalizeElapsedSec({
+    ...data,
+    elapsedSec: data.asrElapsedSec,
+    startedAt: data.asrStartedAt,
+    completedAt: data.asrCompletedAt,
+  })
+  const cloneElapsedSec = normalizeElapsedSec({
+    ...data,
+    elapsedSec: data.cloneElapsedSec,
+    startedAt: data.cloneStartedAt,
+    completedAt: data.cloneCompletedAt,
+  })
+  return {
+    ...(data as unknown as HistoryTask),
+    protectionElapsedSec,
+    asrElapsedSec,
+    cloneElapsedSec,
+    elapsedSec: protectionElapsedSec,
   }
 }
 
@@ -352,13 +559,13 @@ export const backendClient: ApiClient = {
   },
   async listTasks(): Promise<HistoryTask[]> {
     const response = await http.get('/api/tasks')
-    return response.data
+    return Array.isArray(response.data) ? response.data.map(normalizeHistoryTask) : []
   },
   async deleteTask(taskId: string): Promise<void> {
     await http.delete(`/api/tasks/${taskId}`)
   },
   async downloadProtectedAudio(taskId: string) {
-    const response = await http.get(`/api/tasks/${taskId}/download/protected-audio`, {
+    const response = await http.get(`/api/tasks/${taskId}/download?type=protected_audio`, {
       responseType: 'blob',
     })
     return {
@@ -367,7 +574,7 @@ export const backendClient: ApiClient = {
     }
   },
   async exportReport(taskId: string): Promise<Blob> {
-    const response = await http.post('/api/reports/export', { taskId }, { responseType: 'blob' })
+    const response = await http.get(`/api/tasks/${taskId}/download?type=report_pdf`, { responseType: 'blob' })
     return response.data
   },
   async exportCsv(taskId: string): Promise<Blob> {
@@ -375,7 +582,7 @@ export const backendClient: ApiClient = {
     return response.data
   },
   async downloadEvidenceZip(taskId: string): Promise<Blob> {
-    const response = await http.get(`/api/tasks/${taskId}/download/evidence`, { responseType: 'blob' })
+    const response = await http.get(`/api/tasks/${taskId}/download?type=evidence_zip`, { responseType: 'blob' })
     return response.data
   },
 }

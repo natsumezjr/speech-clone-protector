@@ -531,6 +531,19 @@ def _frontend_clone(clone: dict[str, Any]) -> dict[str, Any]:
         "request": clone.get("request") or {},
         "originalCloneAudio": _frontend_audio(clone.get("originalCloneAudio"), "original_clone.wav"),
         "protectedCloneAudio": _frontend_audio(clone.get("protectedCloneAudio"), "protected_clone.wav"),
+        "originalSimilarity": clone.get("originalSimilarity"),
+        "protectedSimilarity": clone.get("protectedSimilarity"),
+        "similarityDropRate": clone.get("similarityDropRate"),
+        "embeddingDistanceBefore": clone.get("embeddingDistanceBefore"),
+        "embeddingDistanceAfter": clone.get("embeddingDistanceAfter"),
+        "embeddingDistanceIncreaseRate": clone.get("embeddingDistanceIncreaseRate"),
+        "cloneConfidenceBefore": clone.get("cloneConfidenceBefore"),
+        "cloneConfidenceAfter": clone.get("cloneConfidenceAfter"),
+        "cloneConfidenceDropRate": clone.get("cloneConfidenceDropRate"),
+        "cloneRadar": clone.get("cloneRadar"),
+        "cloneTrend": clone.get("cloneTrend"),
+        "cloneDefenseScore": clone.get("cloneDefenseScore"),
+        "createdAt": clone.get("createdAt"),
     }
 
 
@@ -547,7 +560,59 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
     asr = details.get("asr") or {}
     semantic = details.get("semantic") or {}
     generation = details.get("generation") or {}
+    perception = details.get("perception") or {}
     charts = result.get("charts") or {}
+    request = result.get("request") or {}
+    optimization = request.get("optimization") or {}
+    loss_final = generation.get("lossFinal") or {}
+    loss_weights = generation.get("lossWeights") or {}
+    asr_status = asr.get("status")
+    asr_eval = None
+    if asr_status in {"computed", "partial", "completed", "success"}:
+        asr_eval = {
+            "asrModel": asr.get("model"),
+            "language": asr.get("language"),
+            "originalText": asr.get("referenceText") or asr.get("cleanTranscription"),
+            "protectedText": asr.get("protectedTranscription"),
+            "wer": asr.get("wer"),
+            "cer": asr.get("cer"),
+            "substituteRate": (asr.get("breakdown") or {}).get("substituteRate"),
+            "insertRate": (asr.get("breakdown") or {}).get("insertRate"),
+            "deleteRate": (asr.get("breakdown") or {}).get("deleteRate"),
+            "metricLevel": asr.get("metricLevel"),
+            "tokenErrorRate": asr.get("tokenErrorRate"),
+            "tokenChangeRate": asr.get("tokenChangeRate"),
+            "semanticDrift": asr.get("semanticDrift"),
+            "asrProtectionScore": asr.get("asrProtectionScore"),
+            "diffOps": asr.get("diffOps"),
+            "trend": asr.get("trend"),
+            "createdAt": asr.get("createdAt") or result.get("updatedAt"),
+            "status": asr_status,
+        }
+    clone_results = [_frontend_clone(item) for item in result.get("cloneResults", [])]
+    latest_clone = clone_results[-1] if clone_results else None
+    clone_eval = None
+    if latest_clone:
+        clone_eval = {
+            "cloneModel": (latest_clone.get("request") or {}).get("model"),
+            "speakerEvalModel": None,
+            "targetText": (latest_clone.get("request") or {}).get("text"),
+            "originalCloneAudio": latest_clone.get("originalCloneAudio"),
+            "protectedCloneAudio": latest_clone.get("protectedCloneAudio"),
+            "originalSimilarity": latest_clone.get("originalSimilarity"),
+            "protectedSimilarity": latest_clone.get("protectedSimilarity"),
+            "similarityDropRate": latest_clone.get("similarityDropRate"),
+            "embeddingDistanceBefore": latest_clone.get("embeddingDistanceBefore"),
+            "embeddingDistanceAfter": latest_clone.get("embeddingDistanceAfter"),
+            "embeddingDistanceIncreaseRate": latest_clone.get("embeddingDistanceIncreaseRate"),
+            "cloneConfidenceBefore": latest_clone.get("cloneConfidenceBefore"),
+            "cloneConfidenceAfter": latest_clone.get("cloneConfidenceAfter"),
+            "cloneConfidenceDropRate": latest_clone.get("cloneConfidenceDropRate"),
+            "cloneRadar": latest_clone.get("cloneRadar"),
+            "cloneTrend": latest_clone.get("cloneTrend"),
+            "cloneDefenseScore": latest_clone.get("cloneDefenseScore"),
+            "createdAt": latest_clone.get("createdAt") or result.get("updatedAt"),
+        }
 
     original_audio = _frontend_audio(audio.get("original"), "original.wav")
     protected_audio = _frontend_audio(audio.get("protected"), "protected.wav")
@@ -575,7 +640,42 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
         ],
         "originalAudio": original_audio,
         "protectedAudio": protected_audio,
-        "cloneResults": [_frontend_clone(item) for item in result.get("cloneResults", [])],
+        "perturbation": {
+            "l2Norm": perception.get("l2Norm") or loss_final.get("L2") or loss_final.get("l2"),
+            "l2Rms": perception.get("l2Rms"),
+            "linfNorm": perception.get("linfNorm"),
+            "epsilon": optimization.get("epsilon"),
+            "epsilonNorm": optimization.get("epsilonNorm") or optimization.get("epsilon_norm"),
+            "epsilonUsageRate": perception.get("epsilonUsageRate"),
+            "snr": snr,
+            "clippingRate": perception.get("clippingRate"),
+        },
+        "protectionQuality": {
+            "snr": snr,
+            "pesq": pesq,
+            "stoi": perception.get("stoi"),
+            "mos": perception.get("mos"),
+            "mosLqo": perception.get("mosLqo"),
+            "qualityLevel": perception.get("qualityLevel"),
+        },
+        "psychoacoustic": {
+            "lPsy": loss_final.get("Lpsy") or loss_final.get("lPsy"),
+            "overMaskRate": perception.get("overMaskRate") or perception.get("psychoacousticViolationRate"),
+            "maskingThreshold": perception.get("maskingThreshold"),
+            "perturbationSpectrum": perception.get("perturbationSpectrum"),
+        },
+        "lossFinal": loss_final,
+        "lossWeights": {
+            "lambdaFeat": loss_weights.get("lambdaFeat") or loss_weights.get("weight_feature"),
+            "lambdaSem": loss_weights.get("lambdaSem") or loss_weights.get("weight_semantic"),
+            "lambdaPsy": loss_weights.get("lambdaPsy") or loss_weights.get("weight_psy"),
+            "lambda2": loss_weights.get("lambda2") or loss_weights.get("weight_l2"),
+        },
+        "optimizationTrace": generation.get("optimizationTrace") or [],
+        "averageStepSec": generation.get("averageStepSec"),
+        "asrEval": asr_eval,
+        "cloneEval": clone_eval,
+        "cloneResults": clone_results,
         "asr": {
             "originalText": asr.get("referenceText") or asr.get("cleanTranscription"),
             "protectedText": asr.get("protectedTranscription"),
@@ -1535,6 +1635,39 @@ def download_protected_audio(task_id: str) -> FileResponse:
     if not path or not path.exists():
         raise HTTPException(status_code=404, detail="protected audio not found")
     return FileResponse(path, media_type="audio/wav", filename=filename)
+
+
+@app.get("/api/tasks/{task_id}/download")
+def download_task_file(task_id: str, type: str) -> Response:
+    if type == "protected_audio":
+        return download_protected_audio(task_id)
+    if type == "report_pdf":
+        return export_pdf({"taskId": task_id})
+    if type == "evidence_zip":
+        return evidence_zip(task_id)
+    if type == "asr_report":
+        path = TASK_DIR / task_id / "asr_result.json"
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="ASR report not generated")
+        return FileResponse(path, media_type="application/json", filename=f"{task_id}-asr-report.json")
+    if type == "clone_result_zip":
+        task_result_path(task_id)
+        task_dir = TASK_DIR / task_id
+        clone_result_path = task_dir / "clone_result.json"
+        clone_dir = task_dir / "clones"
+        if not clone_result_path.exists() and not clone_dir.exists():
+            raise HTTPException(status_code=404, detail="clone result not generated")
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            if clone_result_path.exists():
+                archive.write(clone_result_path, clone_result_path.name)
+            if clone_dir.exists():
+                for path in clone_dir.rglob("*"):
+                    if path.is_file():
+                        archive.write(path, path.relative_to(task_dir).as_posix())
+        headers = {"Content-Disposition": f'attachment; filename="{task_id}-clone-result.zip"'}
+        return Response(buffer.getvalue(), media_type="application/zip", headers=headers)
+    raise HTTPException(status_code=404, detail=f"download type not generated: {type}")
 
 
 @app.post("/api/tasks/{task_id}/clone-voice")
