@@ -256,6 +256,16 @@ type EditMetrics = {
   substituteRate: number
   insertRate: number
   deleteRate: number
+  referenceLength: number
+  substitutions: number
+  insertions: number
+  deletions: number
+  totalErrors: number
+  errorShares: {
+    substituteShare: number
+    insertShare: number
+    deleteShare: number
+  }
   diffOps: DiffOp[]
 }
 
@@ -318,10 +328,19 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
   const protectedAudio = { ...result.protectedAudio, objectUrl: result.protectedAudio.objectUrl ?? protectedObjectUrl }
   const activeAsrEval = result.asrEval
   const originalText = activeAsrEval?.originalText ?? ''
+  const referenceText = activeAsrEval?.referenceText ?? originalText
   const protectedText = activeAsrEval?.protectedText ?? ''
-  const asrLevel = activeAsrEval?.metricLevel === 'word' || activeAsrEval?.metricLevel === 'char' ? activeAsrEval.metricLevel : chooseEditLevel(originalText, protectedText)
-  const asrEditStats = activeAsrEval && originalText && protectedText ? computeEditMetrics(originalText, protectedText, asrLevel) : null
+  const asrLevel = activeAsrEval?.metricLevel === 'word' || activeAsrEval?.metricLevel === 'char' ? activeAsrEval.metricLevel : chooseEditLevel(referenceText, protectedText)
+  const asrEditStats = activeAsrEval && referenceText && protectedText ? computeEditMetrics(referenceText, protectedText, asrLevel) : null
   const activeCloneEval = cloneResult?.cloneEval ?? cloneResultToEval(cloneResult) ?? result.cloneEval ?? null
+  const cloneModel = activeCloneEval?.cloneModel ?? '未生成'
+  const speakerEvalModel = formatSpeakerEvalModel(
+    activeCloneEval?.speakerEvalModel
+      ?? result.metricSources?.['cloneEval.*']?.source
+      ?? result.metricSources?.['speaker.*']?.source
+      ?? activeCloneEval?.speakerModel
+      ?? 'ECAPA-TDNN',
+  )
   const compareTabs = [
     {
       key: 'protect',
@@ -336,7 +355,7 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
     {
       key: 'clone',
       label: '克隆',
-      modelTitle: `克隆 ${activeCloneEval?.cloneModel ?? '未生成'} · 评估 ${activeCloneEval?.speakerEvalModel ?? '未生成'}`,
+      modelTitle: `克隆 ${cloneModel} · 评估 ${speakerEvalModel}`,
     },
   ] as const
   const activeModelTitle = compareTabs.find((tab) => tab.key === activePanel)?.modelTitle ?? '未生成'
@@ -399,7 +418,7 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
       setAsrError(undefined)
       setAsrModalOpen(false)
       setActivePanel('asr')
-      const response = await runAsrEval(result.taskId, { model: asrModel, referenceText: originalText || result.asr.originalText || undefined })
+      const response = await runAsrEval(result.taskId, { model: asrModel, referenceText: referenceText || originalText || result.asr.referenceText || result.asr.originalText || undefined })
       const asr = response.asr ?? (await waitForAsrEvalResult(result.taskId))
       onAsrUpdated(asr)
       pushToast({ kind: 'success', title: 'ASR 测试完成', description: asr.model ?? asrModel })
@@ -628,41 +647,46 @@ function AsrTab({ result, asrEval, editStats }: { result: TaskResult; asrEval?: 
   }
 
   const originalText = asrEval.originalText ?? ''
+  const referenceText = asrEval.referenceText ?? originalText
   const protectedText = asrEval.protectedText ?? ''
   const diffOps = asrEval.diffOps ?? editStats?.diffOps ?? []
   const substituteRate = asrEval.substituteRate ?? editStats?.substituteRate
   const insertRate = asrEval.insertRate ?? editStats?.insertRate
-  const deleteRate = asrEval.deleteRate ?? editStats?.deleteRate
   const wer = asrEval.wer ?? (editStats?.level === 'word' ? editStats.werOrCer : undefined)
   const cer = asrEval.cer ?? (editStats?.level === 'char' ? editStats.werOrCer : undefined)
-  const tokenDiff = asrEval.tokenErrorRate ?? asrEval.tokenChangeRate
-  const tokenReason = metricReason(result, ['asrEval.tokenErrorRate', 'asrEval.tokenChangeRate'])
-  const semanticReason = metricReason(result, ['asrEval.semanticDrift'])
-  const semanticFoot = semanticReason ? `来源：${semanticReason}` : metricSourceLabel(result, ['asrEval.semanticDrift'])
+  const tokenDiff = asrEval.tokenChangeRate ?? asrEval.tokenErrorRate
+  const tokenUsesEditDistance = asrEval.tokenChangeRate == null && asrEval.tokenErrorRate != null
+  const tokenReason = tokenUsesEditDistance ? '使用 token edit distance；可能受 token 序列长度差异影响。' : metricReason(result, ['asrEval.tokenChangeRate', 'asrEval.tokenErrorRate'])
+  const semanticSourceInfo = metricSource(result, ['asrEval.semanticDrift'])
+  const semanticIsMfccProxy = String(semanticSourceInfo?.source ?? '').toLowerCase() === 'mfcc_proxy'
+  const semanticFoot = semanticIsMfccProxy ? 'MFCC proxy，仅代表声学特征漂移，不等同于 S3/HuBERT/Whisper 语义 encoder 漂移。' : undefined
+  const semanticCardLabel = semanticIsMfccProxy ? 'SD（MFCC 代理）' : 'SD（语义漂移）'
+  const semanticDetailLabel = semanticIsMfccProxy ? 'MFCC 代理漂移' : '语义表示漂移'
+  const errorShares = asrErrorShares(asrEval, editStats)
 
   return (
     <div className="space-y-5">
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_288px_minmax(0,1fr)]">
-        <TextBox title="原始转写（ASR）" text={originalText || '未生成'} foot="原始音频经 ASR 识别得到的参考转写文本" />
+        <TextBox title="参考文本 / 原始转写（ASR）" text={referenceText || '未生成'} foot="用于 WER/CER 与 diff 的参考文本" />
         <div className="grid grid-cols-2 content-center gap-3">
           <ScoreBox label="WER（词错率）" value={formatMetricValue(wer, 'percent')} red compact />
           <ScoreBox label="CER（字错率）" value={formatMetricValue(cer, 'percent')} red compact />
-          <ScoreBox label="Token 错误率" value={formatMetricValue(tokenDiff, 'percent')} foot={tokenDiff == null ? tokenReason : undefined} red compact />
-          <ScoreBox label="SD（语义漂移）" value={formatMetricValue(asrEval.semanticDrift, 'number')} foot={semanticFoot} red compact />
+          <ScoreBox label="Token 变化率" value={formatMetricValue(tokenDiff, 'percent')} foot={tokenDiff == null || tokenUsesEditDistance ? tokenReason : undefined} red compact />
+          <ScoreBox label={semanticCardLabel} value={formatMetricValue(asrEval.semanticDrift, 'number')} foot={semanticFoot} red compact />
           <ScoreBox label="IR（插入率）" value={formatMetricValue(insertRate, 'percent')} red compact />
-          <ScoreBox label="DR（删除率）" value={formatMetricValue(deleteRate, 'percent')} red compact />
+          <ScoreBox label="SR（替换率）" value={formatMetricValue(substituteRate, 'percent')} red compact />
         </div>
         <TextBox title="保护音频转写（ASR）" text={protectedText || '未生成'} foot="红色为新增内容，绿色删除线为原文缺失内容" content={diffOps.length ? renderDiffOps(diffOps) : undefined} />
       </div>
       <div className="grid grid-cols-[1.05fr_0.95fr] gap-5 max-lg:grid-cols-1">
         <MetricPanel title="语义链路分析">
-          <ScoreBox label="语义表示漂移" value={formatMetricValue(asrEval.semanticDrift, 'number')} foot={semanticFoot} />
-          <ScoreBox label="Token 序列差异" value={formatMetricValue(tokenDiff, 'percent')} foot={tokenDiff == null ? tokenReason : undefined} />
+          <ScoreBox label={semanticDetailLabel} value={formatMetricValue(asrEval.semanticDrift, 'number')} foot={semanticFoot} />
+          <ScoreBox label="Token 变化率" value={formatMetricValue(tokenDiff, 'percent')} foot={tokenDiff == null || tokenUsesEditDistance ? tokenReason : undefined} />
           <ScoreBox label="指标层级" value={asrEval.metricLevel ?? editStats?.level ?? '未生成'} />
         </MetricPanel>
-        <RateBreakdown substituteRate={substituteRate} insertRate={insertRate} deleteRate={deleteRate} />
+        <RateBreakdown substituteShare={errorShares?.substituteShare} insertShare={errorShares?.insertShare} />
       </div>
-      <InsightPanel title="ASR 结果解读" items={generateAsrInsights(asrEval, editStats)} />
+      <InsightPanel title="ASR 结果解读" items={generateAsrInsights(asrEval, editStats, result)} />
     </div>
   )
 }
@@ -697,8 +721,8 @@ function CloneTab({ result, cloneEval, loading, status }: { result: TaskResult; 
         <div className="mx-auto grid h-12 w-12 place-items-center rounded-full border border-violet-300/28 bg-slate-950/70 text-[18px] font-black text-white">VS</div>
         {cloneEval.protectedCloneAudio ? <AudioCard title="克隆保护语音" audio={cloneEval.protectedCloneAudio} color="#f59e0b" /> : <EmptyMetricCard title="克隆保护语音" text="后端未返回克隆保护语音" />}
       </div>
-      <div className="grid grid-cols-[minmax(420px,0.95fr)_minmax(520px,1.05fr)] gap-5 max-xl:grid-cols-1">
-        <div className="space-y-5">
+      <div className="grid items-stretch grid-cols-[minmax(420px,0.95fr)_minmax(520px,1.05fr)] gap-5 max-xl:grid-cols-1">
+        <div className="flex h-full flex-col gap-5">
           <CloneIdentityPanel cloneEval={cloneEval} />
           <CloneResultPanel cloneEval={cloneEval} />
         </div>
@@ -770,11 +794,10 @@ function MetricPanel({ title, children }: { title: string; children: ReactNode }
   )
 }
 
-function RateBreakdown({ substituteRate, insertRate, deleteRate }: { substituteRate?: number | null; insertRate?: number | null; deleteRate?: number | null }) {
+function RateBreakdown({ substituteShare, insertShare }: { substituteShare?: number | null; insertShare?: number | null }) {
   const rows = [
-    ['替换率', substituteRate, 'bg-yellow-300'],
-    ['插入率', insertRate, 'bg-red-300'],
-    ['删除率', deleteRate, 'bg-emerald-300'],
+    ['替换占比', substituteShare, 'bg-yellow-300'],
+    ['插入占比', insertShare, 'bg-red-300'],
   ] as const
   return (
     <section className="rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
@@ -806,40 +829,45 @@ function RateBreakdown({ substituteRate, insertRate, deleteRate }: { substituteR
 function CloneIdentityPanel({ cloneEval }: { cloneEval: CloneEval }) {
   const similarityDropRate = optionalNumber(cloneEval.similarityDropRate) ?? computeDropRate(cloneEval.originalSimilarity, cloneEval.protectedSimilarity)
   const embeddingIncreaseRate = optionalNumber(cloneEval.embeddingDistanceIncreaseRate) ?? computeRateChange(cloneEval.embeddingDistanceBefore, cloneEval.embeddingDistanceAfter)
+  const confidenceBefore = optionalNumber(cloneEval.cloneConfidenceBefore)
+  const confidenceAfter = optionalNumber(cloneEval.cloneConfidenceAfter)
   const confidenceDropRate = optionalNumber(cloneEval.cloneConfidenceDropRate)
-  const confidenceBefore = formatCloneConfidence(cloneEval.cloneConfidenceBefore)
-  const confidenceAfter = formatCloneConfidence(cloneEval.cloneConfidenceAfter)
-  const confidenceDelta = confidenceDropRate === null ? '未生成 / 未配置校准模型' : `↓ ${formatMetricValue(confidenceDropRate, 'percent')}`
+  const hasCloneConfidence = confidenceBefore !== null || confidenceAfter !== null || confidenceDropRate !== null
 
   return (
     <section className="rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
       <SectionTitle>声音身份特征链路分析</SectionTitle>
       <div className="mt-5 grid grid-cols-[repeat(auto-fit,minmax(210px,1fr))] gap-3">
-        <FeatureStatCard
+        <DeltaStatCard
           title="Speaker Similarity（越低越好）"
           before={formatMetricValue(cloneEval.originalSimilarity, 'number')}
           after={formatMetricValue(cloneEval.protectedSimilarity, 'number')}
-          delta={`↓ ${formatMetricValue(similarityDropRate, 'percent')}`}
+          delta={`↓ ${formatRatioPercent(similarityDropRate, { clampToUnit: true })}`}
           foot="来源：后端声纹相似度评估"
           tone="green"
         />
-        <FeatureStatCard
-          title="Embedding 距离（越大越好）"
+        <DeltaStatCard
+          title="Embedding 距离（cosine distance，越大越好）"
           before={formatMetricValue(cloneEval.embeddingDistanceBefore, 'number')}
           after={formatMetricValue(cloneEval.embeddingDistanceAfter, 'number')}
-          delta={`↑ ${formatMetricValue(embeddingIncreaseRate, 'percent')}`}
+          delta={`↑ ${formatRatioPercent(embeddingIncreaseRate, { clampToUnit: true })}`}
           foot="来源：后端 speaker embedding 距离"
           tone="red"
         />
-        <FeatureStatCard
-          title="克隆可置信度"
-          before={confidenceBefore}
-          after={confidenceAfter}
-          delta={confidenceDelta}
-          foot="未配置校准模型时不把 SIM 当作 cloneConfidence"
-          tone="green"
-        />
+        {hasCloneConfidence ? (
+          <DeltaStatCard
+            title="克隆可置信度"
+            before={formatRatioPercent(confidenceBefore, { clampToUnit: true })}
+            after={formatRatioPercent(confidenceAfter, { clampToUnit: true })}
+            delta={`↓ ${formatRatioPercent(confidenceDropRate, { clampToUnit: true })}`}
+            foot="来源：校准后的 speaker verification probability model"
+            tone="green"
+          />
+        ) : null}
       </div>
+      {!hasCloneConfidence ? (
+        <p className="mt-3 text-[11px] leading-5 text-slate-500">克隆置信度需要校准后的 speaker verification probability model，当前未配置，因此不展示。</p>
+      ) : null}
     </section>
   )
 }
@@ -853,7 +881,7 @@ function CloneResultPanel({ cloneEval }: { cloneEval: CloneEval }) {
       <div className="mt-5 grid grid-cols-[repeat(auto-fit,minmax(150px,1fr))] gap-3">
         <ScoreBox label="原始克隆相似度" value={formatMetricValue(cloneEval.originalSimilarity, 'number')} />
         <ScoreBox label="保护后克隆相似度" value={formatMetricValue(cloneEval.protectedSimilarity, 'number')} />
-        <ScoreBox label="防护下降率" value={formatMetricValue(similarityDropRate, 'percent')} />
+        <ScoreBox label="防护下降率" value={formatRatioPercent(similarityDropRate, { clampToUnit: true })} />
       </div>
     </section>
   )
@@ -861,21 +889,22 @@ function CloneResultPanel({ cloneEval }: { cloneEval: CloneEval }) {
 
 function CloneVisualizationPanel({ result, cloneEval }: { result: TaskResult; cloneEval: CloneEval }) {
   const radar = cloneEval.cloneRadar ?? result.speakerFeatureMap?.radar ?? result.charts?.speakerRadar ?? null
-  const availableRadar = (radar ?? []).filter((item) => typeof item.value === 'number' && Number.isFinite(item.value))
+  const displayRadar = normalizeCloneRadarForDisplay(radar ?? [], cloneEval)
+  const availableRadar = displayRadar.filter((item) => typeof item.value === 'number' && Number.isFinite(item.value))
 
   return (
-    <section className="flex min-h-[360px] flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
+    <section className="flex h-full flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
       <div className="flex items-center justify-between gap-4">
         <SectionTitle>说话人防护雷达图</SectionTitle>
         <span className="text-[10px] text-slate-500">由后端真实指标动态生成</span>
       </div>
-      <div className="mt-5 min-h-[320px] flex-1 overflow-hidden rounded-[9px] border border-cyan-300/12 bg-slate-950/16 p-4">
-        {!radar?.length ? (
+      <div className="mt-5 min-h-[250px] flex-1 overflow-hidden rounded-[9px] border border-cyan-300/12 bg-slate-950/16 p-3">
+        {!displayRadar.length ? (
           <ChartEmptyState text="后端未返回说话人防护雷达数据" />
         ) : availableRadar.length < 3 ? (
           <ChartEmptyState text="后端返回的可用雷达指标不足，至少需要 3 个真实指标" />
         ) : (
-          <CloneRadarPreview radar={radar} availableRadar={availableRadar} />
+          <CloneRadarPreview radar={displayRadar} availableRadar={availableRadar} />
         )}
       </div>
     </section>
@@ -886,12 +915,31 @@ function ChartEmptyState({ text }: { text: string }) {
   return <div className="grid h-full min-h-[110px] place-items-center text-center text-xs leading-5 text-slate-500">{text}</div>
 }
 
+function normalizeCloneRadarForDisplay(radar: RadarPoint[], cloneEval: CloneEval) {
+  const hasRealCloneConfidence = optionalNumber(cloneEval.cloneConfidenceDropRate) !== null
+  return radar
+    .filter((item) => hasRealCloneConfidence || !/置信|confidence/i.test(item.name))
+    .map((item) => ({
+      ...item,
+      name: normalizeCloneRadarName(item.name),
+    }))
+}
+
+function normalizeCloneRadarName(name: string) {
+  if (/直接|direct/i.test(name)) return '直接声纹偏移'
+  if (/相似|similar/i.test(name)) return '相似度下降'
+  if (/嵌入|embedding|距离/i.test(name)) return '嵌入距离增加'
+  if (/保护后|防护|protected/i.test(name)) return '保护后克隆防护'
+  if (/置信|confidence/i.test(name)) return '克隆置信度下降'
+  return name
+}
+
 function CloneRadarPreview({ radar, availableRadar }: { radar: RadarPoint[]; availableRadar: RadarPoint[] }) {
-  const width = 360
-  const height = 300
+  const width = 510
+  const height = 345
   const centerX = width / 2
   const centerY = height / 2
-  const radius = 104
+  const radius = 102
   const axisPoints = availableRadar.map((item, index) => {
     const angle = -Math.PI / 2 + (index / availableRadar.length) * Math.PI * 2
     const normalized = Math.max(0, Math.min(100, item.value ?? 0)) / 100
@@ -902,8 +950,8 @@ function CloneRadarPreview({ radar, availableRadar }: { radar: RadarPoint[]; ava
       axisY: centerY + Math.sin(angle) * radius,
       valueX: centerX + Math.cos(angle) * radius * normalized,
       valueY: centerY + Math.sin(angle) * radius * normalized,
-      labelX: centerX + Math.cos(angle) * (radius + 34),
-      labelY: centerY + Math.sin(angle) * (radius + 26),
+      labelX: centerX + Math.cos(angle) * (radius + 51),
+      labelY: centerY + Math.sin(angle) * (radius + 36),
     }
   })
   const polygon = axisPoints.map((point) => `${point.valueX.toFixed(1)},${point.valueY.toFixed(1)}`).join(' ')
@@ -911,9 +959,9 @@ function CloneRadarPreview({ radar, availableRadar }: { radar: RadarPoint[]; ava
   const missingNames = missing.map((item) => item.reason ? `${item.name}（${item.reason}）` : item.name).filter(Boolean)
 
   return (
-    <div className="flex h-full min-h-[300px] flex-col">
-      <div className="min-h-0 flex-1">
-        <svg viewBox={`0 0 ${width} ${height}`} className="h-full min-h-[260px] w-full">
+    <div className="flex h-full flex-col">
+      <div className="grid min-h-0 flex-1 place-items-center">
+        <svg viewBox={`0 0 ${width} ${height}`} className="h-[345px] w-full max-w-[840px]">
           {[0.25, 0.5, 0.75, 1].map((scale) => (
             <polygon
               key={scale}
@@ -930,11 +978,11 @@ function CloneRadarPreview({ radar, availableRadar }: { radar: RadarPoint[]; ava
           {axisPoints.map((point) => (
             <g key={point.item.name}>
               <circle cx={point.valueX} cy={point.valueY} r="3.5" fill="#fcd34d" />
-              <text x={point.labelX} y={point.labelY} textAnchor={point.labelX < centerX - 8 ? 'end' : point.labelX > centerX + 8 ? 'start' : 'middle'} fontSize="11" fontWeight="700" fill="#cbd5e1">
+              <text x={point.labelX} y={point.labelY} textAnchor={point.labelX < centerX - 12 ? 'end' : point.labelX > centerX + 12 ? 'start' : 'middle'} fontSize="13" fontWeight="700" fill="#cbd5e1">
                 {point.item.name}
               </text>
-              <text x={point.labelX} y={point.labelY + 14} textAnchor={point.labelX < centerX - 8 ? 'end' : point.labelX > centerX + 8 ? 'start' : 'middle'} fontSize="10" fill="#67e8f9">
-                {formatMetricValue(point.item.value, 'number')}
+              <text x={point.labelX} y={point.labelY + 17} textAnchor={point.labelX < centerX - 12 ? 'end' : point.labelX > centerX + 12 ? 'start' : 'middle'} fontSize="12" fill="#67e8f9">
+                {formatRadarScore(point.item.value)}
               </text>
             </g>
           ))}
@@ -1229,14 +1277,47 @@ function computeEditMetrics(originalText: string, protectedText: string, level: 
   }
 
   const base = original.length
+  const totalErrors = substitutions + insertions + deletions
+  const errorBase = Math.max(totalErrors, 1)
   return {
     level,
-    werOrCer: (substitutions + insertions + deletions) / base,
+    werOrCer: totalErrors / base,
     substituteRate: substitutions / base,
     insertRate: insertions / base,
     deleteRate: deletions / base,
+    referenceLength: base,
+    substitutions,
+    insertions,
+    deletions,
+    totalErrors,
+    errorShares: {
+      substituteShare: totalErrors ? substitutions / errorBase : 0,
+      insertShare: totalErrors ? insertions / errorBase : 0,
+      deleteShare: totalErrors ? deletions / errorBase : 0,
+    },
     diffOps: ops,
   }
+}
+
+function asrErrorShares(asrEval: AsrEval, editStats: EditMetrics | null) {
+  const direct = asrEval.errorShares
+  if (direct && [direct.substituteShare, direct.insertShare, direct.deleteShare].some((value) => optionalNumber(value) !== null)) {
+    return {
+      substituteShare: optionalNumber(direct.substituteShare) ?? 0,
+      insertShare: optionalNumber(direct.insertShare) ?? 0,
+      deleteShare: optionalNumber(direct.deleteShare) ?? 0,
+    }
+  }
+  const counts = asrEval.editCounts
+  if (counts && optionalNumber(counts.totalErrors) !== null) {
+    const total = Math.max(optionalNumber(counts.totalErrors) ?? 0, 1)
+    return {
+      substituteShare: counts.totalErrors ? counts.substitutions / total : 0,
+      insertShare: counts.totalErrors ? counts.insertions / total : 0,
+      deleteShare: counts.totalErrors ? counts.deletions / total : 0,
+    }
+  }
+  return editStats?.errorShares ?? null
 }
 
 function renderDiffOps(diffOps: DiffOp[]): ReactNode[] {
@@ -1296,7 +1377,7 @@ function ScoreBox({ label, value, red, compact, foot }: { label: string; value: 
   )
 }
 
-function FeatureStatCard({ title, before, after, delta, foot, tone }: { title: string; before: string; after: string; delta: string; foot: string; tone: 'green' | 'red' }) {
+function DeltaStatCard({ title, before, after, delta, foot, tone }: { title: string; before: string; after: string; delta: string; foot: string; tone: 'green' | 'red' }) {
   return (
     <div className="min-h-[180px] rounded-[9px] border border-cyan-300/12 bg-slate-950/16 p-4">
       <h3 className="min-h-[40px] text-[13px] font-bold leading-5 text-slate-300">{title}</h3>
@@ -1456,17 +1537,27 @@ function QualityMetric({ label, value, tag, tone, onClick, title }: { label: str
   )
 }
 
-const lossDefinitions: Array<{ key: keyof Pick<LossTrendPoint, 'Lfeat' | 'Lsem' | 'Lpsy' | 'L2'>; formula: string; altFormula?: string; label: string; description: string; colorClass: string }> = [
-  { key: 'Lfeat', formula: 'L_{\\mathrm{feat}}', label: 'Feature Loss', description: '特征 / 音色损失', colorClass: 'bg-cyan-300' },
+type LossDisplayKey = 'Lid' | 'Lsem' | 'Lpsy' | 'L2'
+type LossDefinition = { key: LossDisplayKey; legacyKey?: 'Lfeat'; formula: string; altFormula?: string; label: string; description: string; colorClass: string }
+
+const lossDefinitions: LossDefinition[] = [
+  {
+    key: 'Lid',
+    legacyKey: 'Lfeat',
+    formula: 'L_{\\mathrm{id}}',
+    label: 'Identity Loss',
+    description: '声音身份损失',
+    colorClass: 'bg-cyan-300',
+  },
   { key: 'Lsem', formula: 'L_{\\mathrm{sem}}', label: 'Semantic Loss', description: '语义损失', colorClass: 'bg-emerald-300' },
-  { key: 'Lpsy', formula: 'L_{\\mathrm{psy}}', label: 'Psychoacoustic Loss', description: '心理声学损失，量级可能较小', colorClass: 'bg-amber-300' },
+  { key: 'Lpsy', formula: 'L_{\\mathrm{psy}}', label: 'Psychoacoustic Loss', description: '心理声学损失，量级可能较大', colorClass: 'bg-amber-300' },
   { key: 'L2', formula: 'L_2', altFormula: '\\lVert\\delta\\rVert_2', label: 'L2 Constraint', description: '扰动范数约束', colorClass: 'bg-violet-300' },
 ]
 
 function TrendPanel({ result, embedded }: { result: TaskResult; embedded?: boolean }) {
   const trend = downsampleTrace(result.optimizationTrace ?? result.generation?.optimizationTrace ?? result.charts.optimizationTrend)
   const lossFinal = result.lossFinal ?? result.generation?.lossFinal ?? finalLossFromTrend(trend)
-  const missingLosses = lossDefinitions.filter((loss) => trend.length > 0 && trend.every((point) => point[loss.key] === null || point[loss.key] === undefined))
+  const missingLosses = lossDefinitions.filter((loss) => trend.length > 0 && trend.every((point) => lossPointValue(point, loss) === null))
   const steps = result.generation?.steps ?? lastStep(trend)
   const avgIterationSec = optionalNumber(result.averageStepSec) ?? averageStepSecFromTrace(trend) ?? (typeof result.elapsedSec === 'number' && steps && steps > 0 ? result.elapsedSec / steps : null)
 
@@ -1509,7 +1600,7 @@ function TrendPanel({ result, embedded }: { result: TaskResult; embedded?: boole
                   {loss.altFormula ? <MathText formula={loss.altFormula} className="text-cyan-100" /> : null}
                   <span className="text-slate-500">{loss.label}</span>
                 </p>
-                <p className="text-[13px] font-black text-white">{formatLossNumber(lossFinal?.[loss.key])}</p>
+                <p className="text-[13px] font-black text-white">{formatLossNumber(lossFinalValue(lossFinal, loss))}</p>
               </div>
               <p className="mt-1 text-[10px] text-slate-500">{loss.description}</p>
             </div>
@@ -1676,8 +1767,23 @@ function formatMetricValue(value: unknown, type: 'percent' | 'db' | 'seconds' | 
   return numberValue.toFixed(3).replace(/\.?0+$/, '')
 }
 
-function formatCloneConfidence(value: unknown) {
-  return optionalNumber(value) === null ? '未生成 / 未配置校准模型' : formatMetricValue(value, 'percent')
+function formatRatioPercent(value: unknown, options?: { clampToUnit?: boolean }) {
+  const numberValue = optionalNumber(value)
+  if (numberValue === null) return '未生成'
+  const normalized = options?.clampToUnit ? clamp(numberValue, 0, 1) : numberValue
+  return `${(normalized * 100).toFixed(1)}%`
+}
+
+function formatRadarScore(value: unknown) {
+  const numberValue = optionalNumber(value)
+  if (numberValue === null) return '未生成'
+  return `${clamp(numberValue, 0, 100).toFixed(1)} 分`
+}
+
+function formatSpeakerEvalModel(value: unknown) {
+  const label = typeof value === 'string' && value.trim() ? value.trim() : 'ECAPA-TDNN'
+  if (label === 'speechbrain/spkrec-ecapa-voxceleb' || /spkrec-ecapa-voxceleb/i.test(label)) return 'ECAPA-TDNN'
+  return label
 }
 
 function optionalNumber(value: unknown) {
@@ -1703,15 +1809,13 @@ function metricReason(result: TaskResult, keys: string[]) {
   return reason ? shortMetricReason(reason) : ''
 }
 
-function metricSourceLabel(result: TaskResult, keys: string[]) {
-  const source = metricSource(result, keys)
-  if (!source?.source) return ''
-  return `来源：${source.source}`
-}
-
 function shortMetricReason(reason: string) {
-  if (/torchcodec|libtorchcodec|FFmpeg/i.test(reason)) return '语义 tokenizer 依赖 torchcodec/FFmpeg 未正确加载'
-  if (/local cache|Hub|connection|Internet/i.test(reason)) return '说话人模型未在本地缓存，且当前无法从 Hub 加载'
+  if (/torchcodec|libtorchcodec|FFmpeg/i.test(reason)) return '语义 tokenizer/encoder 依赖 torchcodec/FFmpeg 未正确加载'
+  if (/local cache|Hub|connection|Internet|from_pretrained|huggingface/i.test(reason)) {
+    if (/semantic|encoder|hubert|whisper|tokenizer|s3/i.test(reason)) return '语义编码器模型加载失败'
+    if (/speaker|ecapa|speechbrain|spkrec/i.test(reason)) return '说话人模型未在本地缓存，且当前无法从 Hub 加载'
+    return '模型未在本地缓存，且当前无法从 Hub 加载'
+  }
   const pesqSampleRate = /PESQ supports 8000 or 16000 Hz, got (\d+)/i.exec(reason)
   if (pesqSampleRate) return `PESQ 仅支持 8k/16k，当前 ${pesqSampleRate[1]} Hz`
   if (/confidence calibrator/i.test(reason) || /calibrated clone confidence/i.test(reason)) return '未配置克隆置信度校准模型'
@@ -1730,12 +1834,22 @@ function finalLossFromTrend(points: LossTrendPoint[]): LossFinal | undefined {
   const last = points.at(-1)
   if (!last) return undefined
   return {
+    Lid: last.Lid ?? last.Lfeat,
     Lfeat: last.Lfeat,
     Lsem: last.Lsem,
     Lpsy: last.Lpsy,
     L2: last.L2,
     total: last.total,
   }
+}
+
+function lossPointValue(point: LossTrendPoint, loss: { key: LossDisplayKey; legacyKey?: 'Lfeat' }) {
+  return optionalNumber(point[loss.key]) ?? (loss.legacyKey ? optionalNumber(point[loss.legacyKey]) : null)
+}
+
+function lossFinalValue(lossFinal: LossFinal | null | undefined, loss: { key: LossDisplayKey; legacyKey?: 'Lfeat' }) {
+  if (!lossFinal) return null
+  return optionalNumber(lossFinal[loss.key]) ?? (loss.legacyKey ? optionalNumber(lossFinal[loss.legacyKey]) : null)
 }
 
 function lastStep(points: LossTrendPoint[]) {
@@ -1754,7 +1868,7 @@ function computeDropRate(before: number | null | undefined, after: number | null
   const beforeValue = optionalNumber(before)
   const afterValue = optionalNumber(after)
   if (beforeValue === null || afterValue === null) return null
-  return (beforeValue - afterValue) / Math.max(Math.abs(beforeValue), 1e-8)
+  return (beforeValue - afterValue) / Math.max(beforeValue, 1e-8)
 }
 
 function computeEpsilonUsageRate(perturbation: TaskResult['perturbation']) {
@@ -1785,22 +1899,158 @@ function averageStepSecFromTrace(trace: LossTrendPoint[]) {
   return values.reduce((sum, value) => sum + value, 0) / values.length
 }
 
-function generateProtectionInsights(_result: TaskResult) {
-  return ['已生成防护报告']
+function mean(values: number[]) {
+  if (values.length === 0) return null
+  return values.reduce((sum, value) => sum + value, 0) / values.length
 }
 
-function generateAsrInsights(asrEval: AsrEval, editStats: EditMetrics | null) {
+function traceMetricValue(point: LossTrendPoint, key: LossDisplayKey | 'total') {
+  if (key === 'Lid') return optionalNumber(point.Lid) ?? optionalNumber(point.Lfeat)
+  return optionalNumber(point[key])
+}
+
+function trendDirection(points: LossTrendPoint[] | null | undefined, key: LossDisplayKey | 'total'): 'increasing' | 'decreasing' | 'stable' | 'unknown' {
+  const values = (points ?? []).map((point) => traceMetricValue(point, key)).filter((value): value is number => value !== null)
+  if (values.length < 5) return 'unknown'
+  const segmentSize = Math.max(1, Math.floor(values.length * 0.2))
+  const startMean = mean(values.slice(0, segmentSize))
+  const endMean = mean(values.slice(-segmentSize))
+  if (startMean === null || endMean === null) return 'unknown'
+  const relative = (endMean - startMean) / Math.max(Math.abs(startMean), 1e-8)
+  if (relative > 0.1) return 'increasing'
+  if (relative < -0.1) return 'decreasing'
+  return 'stable'
+}
+
+function lossChanged(points: LossTrendPoint[], key: LossDisplayKey | 'total') {
+  const direction = trendDirection(points, key)
+  return direction === 'increasing' || direction === 'decreasing'
+}
+
+function generateProtectionInsights(result: TaskResult) {
+  const perturbation = result.perturbation
+  const quality = result.protectionQuality ?? result.quality
+  const psycho = result.psychoacoustic
+  const trace = result.optimizationTrace ?? result.generation?.optimizationTrace ?? result.charts?.optimizationTrend ?? []
+  const lossFinal = result.lossFinal ?? result.generation?.lossFinal ?? finalLossFromTrend(trace)
+  const snr = optionalNumber(perturbation?.snr) ?? optionalNumber(quality?.snr)
+  const pesq = optionalNumber(quality?.pesq)
+  const stoi = optionalNumber('stoi' in (quality ?? {}) ? (quality as { stoi?: number | null }).stoi : null)
+  const mos = optionalNumber('mos' in (quality ?? {}) ? (quality as { mos?: number | null }).mos : null)
+  const l2Norm = optionalNumber(perturbation?.l2Norm)
+  const epsilonUsageRate = optionalNumber(perturbation?.epsilonUsageRate)
+  const clippingRate = optionalNumber(perturbation?.clippingRate)
+  const overMaskRate = optionalNumber(psycho?.overMaskRate)
+  const lPsy = optionalNumber(psycho?.lPsy) ?? optionalNumber(lossFinal?.Lpsy)
+  const lid = optionalNumber(lossFinal?.Lid) ?? optionalNumber(lossFinal?.Lfeat)
+  const lsem = optionalNumber(lossFinal?.Lsem)
+  const l2 = optionalNumber(lossFinal?.L2)
+  const total = optionalNumber(lossFinal?.total)
+  const lPsyTrend = trendDirection(trace, 'Lpsy')
+  const lidTrend = trendDirection(trace, 'Lid')
+  const l2Trend = trendDirection(trace, 'L2')
+  const items: string[] = []
+  const missing: string[] = []
+
+  if (l2Norm !== null) {
+    const budget = epsilonUsageRate === null ? '' : `扰动预算使用率为 ${formatRatioPercent(epsilonUsageRate, { clampToUnit: true })}。`
+    let comment = ''
+    if (epsilonUsageRate !== null && epsilonUsageRate <= 0.3) comment = '当前扰动预算使用较低，说明仍有提升防护强度的空间。'
+    else if (epsilonUsageRate !== null && epsilonUsageRate <= 0.8) comment = '当前扰动预算使用适中，防护强度与可听性处于相对平衡状态。'
+    else if (epsilonUsageRate !== null) comment = '当前扰动预算使用较高，若听感下降明显，建议降低扰动预算或提高心理声学约束权重。'
+    items.push(`指标概览：本次保护扰动 L2 范数为 ${formatMetricValue(l2Norm, 'loss')}，表示保护音频相对原始音频的总体扰动能量。${budget}${comment}`)
+  } else {
+    missing.push('扰动 L2 范数')
+  }
+
+  if (snr !== null) {
+    let snrText = 'SNR 处于中等水平，说明扰动已经较明显，但仍可能保持基本听感。'
+    if (snr >= 20) snrText = 'SNR 较高，扰动相对较弱，保护音频通常具有较好的可听性。'
+    else if (snr < 12) snrText = 'SNR 偏低，说明扰动较强，可能影响正常听感；若目标是高保真保护，可降低 λid / λsem 或提高 λpsy。'
+    items.push(`听感质量：${snrText}`)
+  } else {
+    missing.push('SNR')
+  }
+
+  if (pesq !== null || stoi !== null || mos !== null) {
+    const qualityNotes: string[] = []
+    if (pesq !== null) qualityNotes.push(pesq >= 3 ? 'PESQ 较高，客观感知质量较好。' : pesq >= 2 ? 'PESQ 中等，存在一定感知质量下降。' : 'PESQ 偏低，保护扰动可能明显影响语音质量。')
+    if (stoi !== null) qualityNotes.push(stoi >= 0.85 ? 'STOI 较高，语音可懂度保持较好。' : stoi >= 0.65 ? 'STOI 中等，语音可懂度有一定下降。' : 'STOI 偏低，保护音频可能影响正常理解。')
+    if (mos !== null) qualityNotes.push(`人工/估计 MOS 为 ${formatMetricValue(mos, 'number')}，可作为主观听感参考。`)
+    items.push(`听感质量：${qualityNotes.join('')}`)
+  } else {
+    items.push('听感质量：PESQ/STOI 未生成，当前感知质量主要依据 SNR、人工 MOS 或音频试听判断。')
+  }
+
+  if (overMaskRate !== null || lPsy !== null) {
+    const psychoNotes: string[] = []
+    if (overMaskRate !== null) {
+      psychoNotes.push(overMaskRate <= 0.05 ? '超过听觉掩蔽阈值的频点较少，扰动大多处于较不易察觉区域。' : overMaskRate <= 0.2 ? '部分扰动超过心理声学掩蔽阈值，可能在少量频段产生可察觉噪声。' : '较多扰动超过心理声学掩蔽阈值，高保真性风险较高，建议增大 λpsy 或降低身份/语义攻击权重。')
+    }
+    if (lPsy !== null) psychoNotes.push(`当前 Lpsy 为 ${formatLossNumber(lPsy)}。Lpsy 表示扰动频谱超过 masking threshold 的惩罚项；数值升高通常意味着扰动更容易被听见。`)
+    if (lPsyTrend === 'increasing') psychoNotes.push('Lpsy 在优化过程中呈上升趋势，说明优化正在增强攻击/防护效果的同时牺牲心理声学约束。若希望获得更高保真，可尝试增大 λpsy，或降低 λid / λsem。')
+    else if (lPsyTrend === 'decreasing' || lPsyTrend === 'stable') psychoNotes.push('Lpsy 未明显上升，说明心理声学约束相对稳定。')
+    items.push(`心理声学：${psychoNotes.join('')}`)
+  } else {
+    missing.push('心理声学 overMaskRate / Lpsy')
+  }
+
+  const lossNotes: string[] = []
+  if (lid !== null) lossNotes.push(`Lid 为 ${formatLossNumber(lid)}，表示声音身份特征链路的损失。Lid 的方向需要结合后端 loss 定义解释；当前页面只展示数值趋势，不把单独的 Lid 大小作为最终防护结论。`)
+  if (lidTrend === 'increasing') lossNotes.push('Lid 上升可能表示声音身份表示被进一步拉开，通常有利于身份防护，但可能增加可听扰动。')
+  if (lidTrend === 'decreasing') lossNotes.push('Lid 下降表示优化器正在降低当前定义下的身份目标损失；若该损失是相似度型 loss，应确认后端是否采用了最小化相似度或最大化距离的等价形式。')
+  if (lsem !== null) lossNotes.push(`Lsem 为 ${formatLossNumber(lsem)}，表示语义编码器表示层面的扰动目标。Lsem 变化越明显，通常说明保护音频在语义表示空间中与原始音频差异越大，但具体方向取决于后端 loss 定义。`)
+  if (lsem !== null && (Math.abs(lsem) > 1 || lossChanged(trace, 'Lsem'))) lossNotes.push('Lsem 较高或变化明显，说明保护过程对 ASR / tokenizer 语义链路施加了较强影响；若保护音频听感下降，可降低 λsem 或提高 λpsy。')
+  items.push(`身份/语义 loss：${lossNotes.length ? lossNotes.join('') : '后端未返回 Lid/Lsem，当前无法解释身份与语义目标的优化状态。'}`)
+
+  const convergenceNotes: string[] = []
+  if (l2 !== null) convergenceNotes.push(`L2 为 ${formatLossNumber(l2)}，反映扰动总体能量。L2 持续上升通常意味着保护强度增强，但也可能带来听感下降。`)
+  if (total !== null) convergenceNotes.push(`total loss 为 ${formatLossNumber(total)}，是 Lid、Lsem、Lpsy 和 L2 的加权组合，主要用于观察优化过程是否收敛，不应直接等同于最终防护效果。`)
+  if (trace.length === 0) convergenceNotes.push('后端未返回逐步 optimizationTrace，因此无法判断各 loss 的收敛趋势，只能展示最终指标。')
+  items.push(`优化收敛：${convergenceNotes.length ? convergenceNotes.join('') : '后端返回的 loss 信息不足，暂不判断优化收敛状态。'}`)
+
+  const tuning: string[] = []
+  if ((snr !== null && snr < 12) || (pesq !== null && pesq < 2) || (stoi !== null && stoi < 0.65) || (overMaskRate !== null && overMaskRate > 0.2)) {
+    tuning.push('建议高保真调参：增大 λpsy，适当降低 λid / λsem，或减少迭代步数与扰动预算。')
+  }
+  if (epsilonUsageRate !== null && epsilonUsageRate < 0.3 && snr !== null && snr > 20) {
+    tuning.push('建议增强防护调参：当前扰动较保守，可适当增大扰动预算、增加迭代步数，或提高 λid / λsem。')
+  }
+  if (lPsyTrend === 'increasing') tuning.push('建议优先提高 λpsy，使优化器更重视心理声学掩蔽约束。')
+  if (l2Trend === 'increasing' && ((pesq !== null && pesq < 2) || (stoi !== null && stoi < 0.65) || (snr !== null && snr < 12))) {
+    tuning.push('建议提高 λ2 或降低扰动预算，限制整体扰动能量。')
+  }
+  if (clippingRate !== null && clippingRate > 0.01) tuning.push('注意：检测到一定比例削波，可降低扰动预算或增加约束以减少失真。')
+  items.push(`调参建议：${tuning.length ? tuning.join('') : '当前未触发强风险阈值，可优先结合试听和下游 ASR/克隆评测结果微调 λid、λsem 与 λpsy。'}`)
+
+  if (!psycho?.maskingThreshold?.length || !psycho?.perturbationSpectrum?.length) {
+    missing.push('完整心理声学曲线')
+  }
+  if (trace.length === 0) missing.push('optimizationTrace')
+  if (missing.length > 0) items.push(`缺失指标：后端未返回 ${Array.from(new Set(missing)).join('、')}，相关结论会更保守。`)
+
+  while (items.length < 6) items.push('缺失指标：当前保护结果字段仍不完整，建议结合音频试听、ASR 测试和克隆测试共同判断防护效果。')
+  return items.slice(0, 10)
+}
+
+function generateAsrInsights(asrEval: AsrEval, editStats: EditMetrics | null, result: TaskResult) {
   const wer = optionalNumber(asrEval.wer) ?? (editStats?.level === 'word' ? editStats.werOrCer : null)
   const cer = optionalNumber(asrEval.cer) ?? (editStats?.level === 'char' ? editStats.werOrCer : null)
   const insertRate = optionalNumber(asrEval.insertRate) ?? editStats?.insertRate ?? null
-  const deleteRate = optionalNumber(asrEval.deleteRate) ?? editStats?.deleteRate ?? null
-  const tokenErrorRate = optionalNumber(asrEval.tokenErrorRate)
+  const tokenChangeRate = optionalNumber(asrEval.tokenChangeRate)
   const semanticDrift = optionalNumber(asrEval.semanticDrift)
+  const tokenSource = metricSource(result, ['asrEval.tokenChangeRate'])
+  const semanticSource = metricSource(result, ['asrEval.semanticDrift'])?.source
+  const semanticSourceKey = String(semanticSource ?? '').toLowerCase()
   const items: string[] = []
   if ((wer ?? 0) >= 0.3 || (cer ?? 0) >= 0.3) items.push('WER/CER 较高，ASR 识别受到干扰。')
-  if ((insertRate ?? 0) >= 0.2 || (deleteRate ?? 0) >= 0.2) items.push('插入率或删除率较高，句子结构稳定性下降。')
-  if ((tokenErrorRate ?? 0) >= 0.2) items.push('后端返回的 token 错误率较高，语义 token 序列发生变化。')
-  if ((semanticDrift ?? 0) >= 0.2) items.push('后端返回的 semanticDrift 较高，语义 encoder 表示发生偏移。')
+  if ((insertRate ?? 0) >= 0.2) items.push('插入率较高，句子结构稳定性下降。')
+  if ((tokenChangeRate ?? 0) >= 0.2 && tokenSource?.status === 'available') items.push('语音 tokenizer 序列发生明显变化。')
+  if (semanticDrift !== null && semanticSourceKey === 'mfcc_proxy') {
+    items.push(`MFCC 代理漂移${semanticDrift >= 0.2 ? '较大' : '较小'}，仅反映声学特征变化。`)
+  } else if ((semanticDrift ?? 0) >= 0.2 && semanticSource === 'SemanticEncoderEnsemble') {
+    items.push('后端返回的 semanticDrift 较高，语义 encoder 表示发生偏移。')
+  }
   if (items.length === 0) items.push('ASR 指标不足或变化较小，当前仅展示后端返回值与文本级 diff，不推断 token 或语义指标。')
   return items
 }
@@ -1808,11 +2058,9 @@ function generateAsrInsights(asrEval: AsrEval, editStats: EditMetrics | null) {
 function generateCloneInsights(cloneEval: CloneEval) {
   const similarityDropRate = optionalNumber(cloneEval.similarityDropRate) ?? computeDropRate(cloneEval.originalSimilarity, cloneEval.protectedSimilarity)
   const embeddingIncreaseRate = optionalNumber(cloneEval.embeddingDistanceIncreaseRate) ?? computeRateChange(cloneEval.embeddingDistanceBefore, cloneEval.embeddingDistanceAfter)
-  const confidenceDropRate = optionalNumber(cloneEval.cloneConfidenceDropRate) ?? computeDropRate(cloneEval.cloneConfidenceBefore, cloneEval.cloneConfidenceAfter)
   const items: string[] = []
   if ((similarityDropRate ?? 0) > 0) items.push('保护后克隆相似度下降，声音身份链路防护有效。')
   if ((embeddingIncreaseRate ?? 0) > 0) items.push('embedding 距离增加，身份表示空间被拉远。')
-  if ((confidenceDropRate ?? 0) > 0) items.push('克隆可置信度下降。')
   if ([cloneEval.originalSimilarity, cloneEval.protectedSimilarity, cloneEval.embeddingDistanceBefore, cloneEval.embeddingDistanceAfter].some((value) => optionalNumber(value) === null)) {
     items.push('部分克隆指标未生成，不做强结论。')
   }

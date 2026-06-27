@@ -2,15 +2,19 @@ import ReactECharts from 'echarts-for-react'
 import type { LossTrendPoint } from '@/types/task'
 
 const lossSeries = [
-  { key: 'Lfeat', tooltipName: 'L<sub>feat</sub>', color: '#22d3ee' },
+  { key: 'Lid', legacyKey: 'Lfeat', tooltipName: 'L<sub>id</sub>', color: '#22d3ee' },
   { key: 'Lsem', tooltipName: 'L<sub>sem</sub>', color: '#22c55e' },
   { key: 'Lpsy', tooltipName: 'L<sub>psy</sub>', color: '#f59e0b' },
   { key: 'L2', tooltipName: 'L<sub>2</sub>', color: '#a78bfa' },
 ] as const
 
+function lossValue(point: LossTrendPoint, series: (typeof lossSeries)[number]) {
+  return point[series.key] ?? ('legacyKey' in series ? point[series.legacyKey] : null)
+}
+
 function formatLossValue(value: unknown) {
   const numberValue = typeof value === 'number' ? value : Number(value)
-  if (!Number.isFinite(numberValue)) return '未返回'
+  if (!Number.isFinite(numberValue)) return '未生成'
   const abs = Math.abs(numberValue)
   if (abs > 0 && (abs < 0.001 || abs >= 10000)) return numberValue.toExponential(3)
   return numberValue.toFixed(6).replace(/\.?0+$/, '')
@@ -71,7 +75,7 @@ export function TrendChart({ data }: { data: LossTrendPoint[] }) {
       showSymbol: true,
       symbolSize: 5,
       connectNulls: false,
-      data: data.map((item) => item[series.key]),
+      data: data.map((item) => lossValue(item, series)),
       color: series.color,
       lineStyle: { width: 2 },
     })),

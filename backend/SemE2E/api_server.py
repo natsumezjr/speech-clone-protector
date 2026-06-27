@@ -363,15 +363,18 @@ def validate_protection_config(payload: ProtectTaskRequest, req_id: str) -> JSON
     if unsupported_features:
         return structured_error(
             code="UNSUPPORTED_FEATURE_MODEL",
-            message="Feature 编码器不在后端支持配置中。",
+            message="Identity 编码器不在后端支持配置中。",
             status_code=400,
             request_id_value=req_id,
             stage="file_preprocess",
             details={"featureModels": unsupported_features, "supported": sorted(allowed_feature)},
         )
+    timbre_weight_check = dict(timbre)
+    if "weightIdentity" in timbre_weight_check and "weightFeature" not in timbre_weight_check:
+        timbre_weight_check["weightFeature"] = timbre_weight_check.get("weightIdentity")
     legacy_errors = [
         _legacy_weight_error(semantic, "weightSemantic", "lambdaSemantic", 1.0),
-        _legacy_weight_error(timbre, "weightFeature", "lambdaTimbre", 1.0),
+        _legacy_weight_error(timbre_weight_check, "weightFeature", "lambdaTimbre", 1.0),
         _legacy_weight_error(psychoacoustic := (payload.psychoacoustic or {}), "weightPsy", "lambdaPsy", None, 0.01),
         _legacy_weight_error(payload.optimization or {}, "weightL2", "lambdaL2", 0.05),
     ]
@@ -383,7 +386,7 @@ def validate_protection_config(payload: ProtectTaskRequest, req_id: str) -> JSON
             status_code=400,
             request_id_value=req_id,
             stage="file_preprocess",
-            details={"legacyFields": legacy_errors, "requiredFields": ["weightFeature", "weightSemantic", "weightPsy", "weightL2"]},
+            details={"legacyFields": legacy_errors, "requiredFields": ["weightIdentity", "weightSemantic", "weightPsy", "weightL2"]},
         )
     steps = ((payload.optimization or {}).get("steps"))
     steps_range = (config.get("ranges") or {}).get("steps") or {}
@@ -604,13 +607,16 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
             "model": asr.get("model"),
             "asrModel": asr.get("model"),
             "language": asr.get("language"),
-            "originalText": asr.get("referenceText") or asr.get("cleanTranscription"),
+            "referenceText": asr.get("referenceText"),
+            "originalText": asr.get("cleanTranscription"),
             "protectedText": asr.get("protectedTranscription"),
             "wer": asr.get("wer"),
             "cer": asr.get("cer"),
             "substituteRate": (asr.get("breakdown") or {}).get("substituteRate"),
             "insertRate": (asr.get("breakdown") or {}).get("insertRate"),
             "deleteRate": (asr.get("breakdown") or {}).get("deleteRate"),
+            "editCounts": asr.get("editCounts"),
+            "errorShares": asr.get("errorShares"),
             "metricLevel": asr.get("metricLevel"),
             "tokenErrorRate": asr.get("tokenErrorRate"),
             "tokenChangeRate": asr.get("tokenChangeRate"),
@@ -716,6 +722,7 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
         },
         "lossFinal": loss_final,
         "lossWeights": {
+            "lambdaId": _coalesce(loss_weights.get("lambdaId"), loss_weights.get("weight_identity"), loss_weights.get("lambdaFeat"), loss_weights.get("weight_feature")),
             "lambdaFeat": _coalesce(loss_weights.get("lambdaFeat"), loss_weights.get("weight_feature")),
             "lambdaSem": _coalesce(loss_weights.get("lambdaSem"), loss_weights.get("weight_semantic")),
             "lambdaPsy": _coalesce(loss_weights.get("lambdaPsy"), loss_weights.get("weight_psy")),
@@ -727,7 +734,8 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
         "cloneEval": clone_eval,
         "cloneResults": clone_results,
         "asr": {
-            "originalText": (asr.get("referenceText") or asr.get("cleanTranscription")) if asr_has_result else None,
+            "referenceText": asr.get("referenceText") if asr_has_result else None,
+            "originalText": asr.get("cleanTranscription") if asr_has_result else None,
             "protectedText": asr.get("protectedTranscription") if asr_has_result else None,
             "wer": _coalesce(primary.get("wer"), asr.get("wer")) if asr_has_result else None,
             "cer": _coalesce(primary.get("cer"), asr.get("cer")) if asr_has_result else None,
@@ -737,6 +745,8 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
             "insertRate": ((asr.get("breakdown") or {}).get("insertRate")) if asr_has_result else None,
             "deleteRate": ((asr.get("breakdown") or {}).get("deleteRate")) if asr_has_result else None,
             "substituteRate": ((asr.get("breakdown") or {}).get("substituteRate")) if asr_has_result else None,
+            "editCounts": asr.get("editCounts") if asr_has_result else None,
+            "errorShares": asr.get("errorShares") if asr_has_result else None,
             "status": asr.get("status"),
         },
         "speaker": {
@@ -1426,6 +1436,7 @@ def list_tasks() -> list[dict[str, Any]]:
                 "targetMode": target_mode,
                 "parameters": {
                     "weightSemantic": semantic_cfg.get("weightSemantic", semantic_cfg.get("lambdaSemantic")),
+                    "weightIdentity": timbre_cfg.get("weightIdentity", timbre_cfg.get("lambdaId", timbre_cfg.get("weightFeature", timbre_cfg.get("lambdaTimbre")))),
                     "weightFeature": timbre_cfg.get("weightFeature", timbre_cfg.get("lambdaTimbre")),
                     "weightPsy": psychoacoustic_cfg.get("weightPsy", psychoacoustic_cfg.get("lambdaPsy")),
                     "weightL2": optimization_cfg.get("weightL2", optimization_cfg.get("lambdaL2")),

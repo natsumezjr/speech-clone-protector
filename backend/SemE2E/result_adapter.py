@@ -346,6 +346,7 @@ def _profile_defaults(profile: str, *, steps: int, semantic_encoders: list[str],
             "enabled": True,
             "mode": "untargeted",
             "encoders": timbre_encoders,
+            "weightIdentity": FORMAL_WEIGHT_FEATURE,
             "weightFeature": FORMAL_WEIGHT_FEATURE,
         },
         "psychoacoustic": {
@@ -422,7 +423,8 @@ def runtime_config() -> dict[str, Any]:
     fields = {
         "epsilon": {"label": "扰动强度 ε", "path": "optimization.epsilon", "default": round(FORMAL_EPSILON, 9), "min": 0.001, "max": 0.08, "step": 0.001, "unit": "waveform amplitude", "description": "正式默认值为 8/255。"},
         "steps": {"label": "优化步数", "path": "optimization.steps", "default": FORMAL_STEPS, "min": 1, "max": 500, "step": 1, "description": "默认 50，最大 500。"},
-        "weightFeature": {"label": "Feature 权重", "path": "timbre.weightFeature", "default": FORMAL_WEIGHT_FEATURE, "min": 0, "max": 1000, "step": 1},
+        "weightIdentity": {"label": "Identity 权重", "path": "timbre.weightIdentity", "default": FORMAL_WEIGHT_FEATURE, "min": 0, "max": 1000, "step": 1},
+        "weightFeature": {"label": "Identity 权重（legacy）", "path": "timbre.weightFeature", "default": FORMAL_WEIGHT_FEATURE, "min": 0, "max": 1000, "step": 1},
         "weightSemantic": {"label": "Semantic 权重", "path": "semantic.weightSemantic", "default": FORMAL_WEIGHT_SEMANTIC, "min": 0, "max": 500, "step": 1},
         "weightPsy": {"label": "心理声学权重", "path": "psychoacoustic.weightPsy", "default": FORMAL_WEIGHT_PSY, "min": 0, "max": 0.01, "step": 0.000001},
         "weightL2": {"label": "L2 权重", "path": "optimization.weightL2", "default": FORMAL_WEIGHT_L2, "min": 0, "max": 1, "step": 0.01},
@@ -435,28 +437,28 @@ def runtime_config() -> dict[str, Any]:
         "standard": {
             "profile": "formal",
             "semantic": {"weightSemantic": FORMAL_WEIGHT_SEMANTIC},
-            "timbre": {"weightFeature": FORMAL_WEIGHT_FEATURE},
+            "timbre": {"weightIdentity": FORMAL_WEIGHT_FEATURE, "weightFeature": FORMAL_WEIGHT_FEATURE},
             "psychoacoustic": {"weightPsy": FORMAL_WEIGHT_PSY},
             "optimization": {"epsilon": round(FORMAL_EPSILON, 9), "steps": FORMAL_STEPS, "weightL2": FORMAL_WEIGHT_L2},
         },
         "strong": {
             "profile": "formal",
             "semantic": {"weightSemantic": 140.0},
-            "timbre": {"weightFeature": 675.0},
+            "timbre": {"weightIdentity": 675.0, "weightFeature": 675.0},
             "psychoacoustic": {"weightPsy": 0.0000075},
             "optimization": {"epsilon": round(FORMAL_EPSILON, 9), "steps": FORMAL_STEPS, "weightL2": 0.08},
         },
         "high_fidelity": {
             "profile": "formal",
             "semantic": {"weightSemantic": 80.0},
-            "timbre": {"weightFeature": 400.0},
+            "timbre": {"weightIdentity": 400.0, "weightFeature": 400.0},
             "psychoacoustic": {"weightPsy": 0.000015},
             "optimization": {"epsilon": 0.020392156, "steps": FORMAL_STEPS, "weightL2": 0.15},
         },
         "custom": {
             "profile": "formal",
             "semantic": {"weightSemantic": FORMAL_WEIGHT_SEMANTIC},
-            "timbre": {"weightFeature": FORMAL_WEIGHT_FEATURE},
+            "timbre": {"weightIdentity": FORMAL_WEIGHT_FEATURE, "weightFeature": FORMAL_WEIGHT_FEATURE},
             "psychoacoustic": {"weightPsy": FORMAL_WEIGHT_PSY},
             "optimization": {"epsilon": round(FORMAL_EPSILON, 9), "steps": FORMAL_STEPS, "weightL2": FORMAL_WEIGHT_L2},
         },
@@ -659,6 +661,20 @@ def _read_weight(config: dict[str, Any], new_key: str, legacy_key: str, default:
     return default
 
 
+def _read_identity_weight(config: dict[str, Any], default: float, warnings: list[str]) -> float:
+    value = to_float(config.get("weightIdentity"))
+    if value is not None:
+        return value
+    lambda_id = to_float(config.get("lambdaId"))
+    if lambda_id is not None:
+        warnings.append("lambdaId is deprecated for request payload weights; use weightIdentity.")
+        return lambda_id
+    legacy_value = _read_weight(config, "weightFeature", "lambdaTimbre", default, warnings)
+    if "weightFeature" in config or "lambdaTimbre" in config:
+        warnings.append("weightFeature is a deprecated legacy alias of weightIdentity.")
+    return legacy_value
+
+
 def run_protection(
     input_path: Path,
     output_path: Path,
@@ -681,7 +697,7 @@ def run_protection(
     epsilon = to_float(optimization.get("epsilon")) or float(optimization_defaults["epsilon"])
     steps = int(optimization.get("steps") or int(optimization_defaults["steps"]))
     weight_warnings: list[str] = []
-    weight_feature = _read_weight(timbre, "weightFeature", "lambdaTimbre", FORMAL_WEIGHT_FEATURE, weight_warnings)
+    weight_identity = _read_identity_weight(timbre, FORMAL_WEIGHT_FEATURE, weight_warnings)
     weight_semantic = _read_weight(semantic, "weightSemantic", "lambdaSemantic", FORMAL_WEIGHT_SEMANTIC, weight_warnings)
     weight_psy = _read_weight(psychoacoustic, "weightPsy", "lambdaPsy", FORMAL_WEIGHT_PSY, weight_warnings)
     weight_l2 = _read_weight(optimization, "weightL2", "lambdaL2", FORMAL_WEIGHT_L2, weight_warnings)
@@ -704,7 +720,8 @@ def run_protection(
         "epsilon": epsilon,
         "steps": steps,
         "weights": {
-            "weightFeature": weight_feature,
+            "weightIdentity": weight_identity,
+            "weightFeature": weight_identity,
             "weightSemantic": weight_semantic,
             "weightPsy": weight_psy,
             "weightL2": weight_l2,
@@ -740,7 +757,8 @@ def run_protection(
                 use_wavlm="wavlm" in active_timbre_encoders,
                 use_cosyvoice="cosyvoice" in active_timbre_encoders,
                 use_style="style" in active_timbre_encoders,
-                weight_feature=weight_feature,
+                weight_identity=weight_identity,
+                weight_feature=weight_identity,
                 weight_semantic=weight_semantic,
                 weight_psy=weight_psy,
                 weight_l2=weight_l2,
@@ -1083,10 +1101,12 @@ def build_task_payload(
             "durationSec": meta["durationSec"],
             "lossFinal": loss_final,
             "lossWeights": {
+                "weight_identity": loss_weights.get("lambdaId"),
                 "weight_feature": loss_weights.get("lambdaFeat"),
                 "weight_semantic": loss_weights.get("lambdaSem"),
                 "weight_psy": loss_weights.get("lambdaPsy"),
                 "weight_l2": loss_weights.get("lambda2"),
+                "lambdaId": loss_weights.get("lambdaId"),
                 "lambdaFeat": loss_weights.get("lambdaFeat"),
                 "lambdaSem": loss_weights.get("lambdaSem"),
                 "lambdaPsy": loss_weights.get("lambdaPsy"),
@@ -1220,6 +1240,8 @@ def build_task_payload(
                 "enabled": bool(timbre.get("enabled")),
                 "mode": timbre.get("mode"),
                 "encoders": timbre.get("encoders") or [],
+                "weightIdentity": loss_weights.get("lambdaId"),
+                "lambdaId": loss_weights.get("lambdaId"),
                 "weightFeature": loss_weights.get("lambdaFeat"),
                 "lambdaTimbre": loss_weights.get("lambdaFeat"),
             },

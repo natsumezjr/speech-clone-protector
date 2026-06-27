@@ -108,6 +108,7 @@ class SemanticE2EVGuard:
         use_wavlm=True,
         use_cosyvoice=True,
         use_style=True,
+        weight_identity=None,
         weight_feature=500.0,
         weight_semantic=100.0,
         weight_psy=1.0e-5,
@@ -121,7 +122,8 @@ class SemanticE2EVGuard:
         self.sampling_rate = 16000
         self.paths = CheckpointPaths()
 
-        self.weight_feature = float(weight_feature)
+        self.weight_identity = float(weight_identity if weight_identity is not None else weight_feature)
+        self.weight_feature = self.weight_identity
         self.weight_semantic = float(weight_semantic)
         self.weight_psy = float(weight_psy)
         self.weight_l2 = float(weight_l2)
@@ -361,7 +363,11 @@ class SemanticE2EVGuard:
     @staticmethod
     def load_audio(input_wav):
         wave, sr = sf.read(str(input_wav), dtype="float32", always_2d=True)
-        wave = torch.from_numpy(wave.T)
+        if wave.shape[1] > 1:
+            wave = wave.mean(axis=1)
+        else:
+            wave = wave[:, 0]
+        wave = torch.from_numpy(wave).unsqueeze(0)
         return wave, sr
 
     def protect(self, input_wav, output_wav=None, verbose=False, progress_callback=None, cancel_event=None):
@@ -444,12 +450,13 @@ class SemanticE2EVGuard:
 
             loss_l2 = torch.norm(adv_wave - wave, p=2)
             loss = (
-                loss_timbre * self.weight_feature
+                loss_timbre * self.weight_identity
                 + loss_semantic * self.weight_semantic
                 + loss_psy * self.weight_psy
                 + loss_l2 * self.weight_l2
             )
             loss_items = {
+                "loss_identity": f"{loss_timbre.item():.6f}",
                 "loss_timbre": f"{loss_timbre.item():.6f}",
                 "loss_semantic": f"{loss_semantic.item():.6f}",
                 "loss_psy": f"{loss_psy.item():.6f}",
@@ -461,6 +468,7 @@ class SemanticE2EVGuard:
             if step_number in trace_steps:
                 trace_point = {
                     "step": step_number,
+                    "Lid": float(loss_timbre.item()),
                     "Lfeat": float(loss_timbre.item()),
                     "Lsem": float(loss_semantic.item()),
                     "Lpsy": float(loss_psy.item()),

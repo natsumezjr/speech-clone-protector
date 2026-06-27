@@ -30,10 +30,10 @@ The default output is `*_semantic.wav` next to the input file.
 ## Objective
 
 ```text
-L = weight_feature * Lfea + weight_semantic * Lsem + weight_psy * Lpsy + weight_l2 * L2
+L = weight_identity * Lid + weight_semantic * Lsem + weight_psy * Lpsy + weight_l2 * L2
 ```
 
-- `Lfea`: E2E-VGuard timbre feature loss from VITS, GPT-SoVITS, MFCC, WavLM, CosyVoice CAM++, and StyleTTS2.
+- `Lid`: E2E-VGuard identity loss from VITS, GPT-SoVITS, MFCC, WavLM, CosyVoice CAM++, and StyleTTS2.
 - `Lsem`: T-SemAttack semantic representation loss from S3 Tokenizer, HuBERT-Large, Whisper-Large-v3, and MFCC.
 - `Lpsy`: psychoacoustic masking loss.
 - `L2`: perturbation norm.

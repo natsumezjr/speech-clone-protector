@@ -41,6 +41,7 @@ def empty_details() -> dict[str, Any]:
             "sampleRate": None,
             "durationSec": None,
             "lossFinal": {
+                "Lid": None,
                 "Lfeat": None,
                 "Lsem": None,
                 "Lpsy": None,
@@ -48,6 +49,7 @@ def empty_details() -> dict[str, Any]:
                 "total": None,
             },
             "lossWeights": {
+                "weight_identity": None,
                 "weight_feature": None,
                 "weight_semantic": None,
                 "weight_psy": None,

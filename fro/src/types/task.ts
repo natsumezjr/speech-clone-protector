@@ -39,6 +39,8 @@ export interface ProtectionTaskRequest {
     enabled: boolean
     mode: 'untargeted' | 'targeted'
     encoders: string[]
+    weightIdentity?: number
+    lambdaId?: number
     weightFeature?: number
     lambdaTimbre?: number
   }
@@ -59,6 +61,7 @@ export interface AsrMetrics {
   model?: string
   asrModel?: string | null
   language?: string | null
+  referenceText?: string | null
   originalText: string | null
   protectedText: string | null
   wer?: number | null
@@ -69,6 +72,19 @@ export interface AsrMetrics {
   insertRate?: number | null
   deleteRate?: number | null
   substituteRate?: number | null
+  editCounts?: {
+    level: 'word' | 'char' | string
+    referenceLength: number
+    substitutions: number
+    insertions: number
+    deletions: number
+    totalErrors: number
+  } | null
+  errorShares?: {
+    substituteShare?: number | null
+    insertShare?: number | null
+    deleteShare?: number | null
+  } | null
   metricLevel?: 'word' | 'char' | string | null
   asrProtectionScore?: number | null
   diffOps?: DiffOp[] | null
@@ -134,7 +150,8 @@ export interface TrendPoint {
 
 export interface LossTrendPoint {
   step: number
-  Lfeat: number | null
+  Lid?: number | null
+  Lfeat?: number | null
   Lsem: number | null
   Lpsy: number | null
   L2: number | null
@@ -144,7 +161,8 @@ export interface LossTrendPoint {
 }
 
 export interface LossFinal {
-  Lfeat: number | null
+  Lid?: number | null
+  Lfeat?: number | null
   Lsem: number | null
   Lpsy: number | null
   L2: number | null
@@ -191,6 +209,7 @@ export interface PsychoacousticMetrics {
 }
 
 export interface LossWeights {
+  lambdaId?: number | null
   lambdaFeat?: number | null
   lambdaSem?: number | null
   lambdaPsy?: number | null
@@ -204,11 +223,14 @@ export interface RadarPoint {
   value: number | null
   status?: 'available' | 'unavailable' | 'partial' | 'not_run' | 'error' | string
   reason?: string | null
+  formula?: string | null
+  rawMetricKeys?: string[] | null
 }
 
 export interface CloneEval {
   cloneModel?: string | null
   speakerEvalModel?: string | null
+  speakerModel?: string | null
   targetText?: string | null
   originalCloneAudio?: AudioFileMeta | null
   protectedCloneAudio?: AudioFileMeta | null
@@ -234,6 +256,7 @@ export interface MetricSource {
   status?: string
   reason?: string
   formula?: string
+  metric?: string
 }
 
 export interface ApiErrorPayload {
@@ -398,6 +421,7 @@ export interface TaskResult {
   metricSources?: Record<string, MetricSource>
   generation?: {
     lossFinal?: LossFinal
+    lossWeights?: LossWeights
     optimizationTrace?: LossTrendPoint[]
     steps?: number | null
     realProtect?: boolean | null
@@ -460,6 +484,7 @@ export interface HistoryTask {
   targetMode?: 'semantic' | 'timbre' | 'joint'
   parameters?: {
     weightSemantic?: number | null
+    weightIdentity?: number | null
     weightFeature?: number | null
     weightPsy?: number | null
     weightL2?: number | null

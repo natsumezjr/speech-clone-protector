@@ -65,14 +65,38 @@ function normalizeRadarPoints(value: unknown): NonNullable<TaskResult['cloneEval
       const name = firstString(record, ['name', 'label']) ?? `指标 ${index + 1}`
       const status = firstString(record, ['status']) ?? undefined
       const reason = firstString(record, ['reason'])
+      const rawMetricKeys = Array.isArray(record.rawMetricKeys) ? record.rawMetricKeys.filter((key): key is string => typeof key === 'string') : null
       return {
         name,
         value: numberOrNull(record.value),
         status,
         reason,
+        formula: firstString(record, ['formula']),
+        rawMetricKeys,
       }
     })
     .filter((item) => item.name.length > 0)
+}
+
+function normalizeEditCounts(value: unknown): NonNullable<TaskResult['asrEval']>['editCounts'] {
+  const data = asRecord(value)
+  const referenceLength = numberOrNull(data.referenceLength)
+  const substitutions = numberOrNull(data.substitutions)
+  const insertions = numberOrNull(data.insertions)
+  const deletions = numberOrNull(data.deletions)
+  const totalErrors = numberOrNull(data.totalErrors)
+  const level = firstString(data, ['level'])
+  if (referenceLength === null || substitutions === null || insertions === null || deletions === null || totalErrors === null || !level) return null
+  return { level, referenceLength, substitutions, insertions, deletions, totalErrors }
+}
+
+function normalizeErrorShares(value: unknown): NonNullable<TaskResult['asrEval']>['errorShares'] {
+  const data = asRecord(value)
+  const substituteShare = firstNumber(data, ['substituteShare', 'substitutionShare'])
+  const insertShare = firstNumber(data, ['insertShare', 'insertionShare'])
+  const deleteShare = firstNumber(data, ['deleteShare', 'deletionShare'])
+  if (substituteShare === null && insertShare === null && deleteShare === null) return null
+  return { substituteShare, insertShare, deleteShare }
 }
 
 function parseDateMs(value: unknown) {
@@ -99,9 +123,11 @@ export function normalizeElapsedSec(data: unknown) {
 function normalizeLossTrendPoint(value: unknown, fallbackStep: number): TaskResult['charts']['optimizationTrend'][number] | null {
   const point = asRecord(value)
   const step = firstNumber(point, ['step', 'epoch', 'iteration', 'iter']) ?? fallbackStep
+  const lid = firstNumber(point, ['Lid', 'lId', 'lossIdentity', 'loss_identity', 'Lfeat', 'lFeat', 'Lfea', 'lossFeature', 'loss_timbre', 'L_feature'])
   const normalized = {
     step,
-    Lfeat: firstNumber(point, ['Lfeat', 'lFeat', 'Lfea', 'lossFeature', 'loss_timbre', 'L_feature']),
+    Lid: lid,
+    Lfeat: lid,
     Lsem: firstNumber(point, ['Lsem', 'lSem', 'lossSemantic', 'loss_semantic', 'L_semantic']),
     Lpsy: firstNumber(point, ['Lpsy', 'lPsy', 'lossPsy', 'loss_psy', 'L_psy']),
     L2: firstNumber(point, ['L2', 'l2', 'lossL2', 'loss_l2', 'l2Norm']),
@@ -109,7 +135,7 @@ function normalizeLossTrendPoint(value: unknown, fallbackStep: number): TaskResu
     snr: firstNumber(point, ['snr', 'SNR']),
     stepElapsedSec: firstNumber(point, ['stepElapsedSec', 'step_elapsed_sec', 'elapsedSec', 'elapsed']),
   }
-  const hasLoss = [normalized.Lfeat, normalized.Lsem, normalized.Lpsy, normalized.L2, normalized.total].some((item) => item !== null)
+  const hasLoss = [normalized.Lid, normalized.Lsem, normalized.Lpsy, normalized.L2, normalized.total].some((item) => item !== null)
   return hasLoss ? normalized : null
 }
 
@@ -142,8 +168,10 @@ function sampleLossTrend(points: TaskResult['charts']['optimizationTrend'], maxP
 
 function normalizeLossFinal(value: unknown): NonNullable<TaskResult['generation']>['lossFinal'] {
   const record = asRecord(value)
+  const lid = firstNumber(record, ['Lid', 'lId', 'lossIdentity', 'loss_identity', 'Lfeat', 'lFeat', 'Lfea', 'lossFeature', 'loss_timbre', 'L_feature'])
   return {
-    Lfeat: firstNumber(record, ['Lfeat', 'lFeat', 'Lfea', 'lossFeature', 'loss_timbre', 'L_feature']),
+    Lid: lid,
+    Lfeat: lid,
     Lsem: firstNumber(record, ['Lsem', 'lSem', 'lossSemantic', 'loss_semantic', 'L_semantic']),
     Lpsy: firstNumber(record, ['Lpsy', 'lPsy', 'lossPsy', 'loss_psy', 'L_psy']),
     L2: firstNumber(record, ['L2', 'l2', 'lossL2', 'loss_l2', 'l2Norm']),
@@ -238,8 +266,10 @@ function normalizePsychoacoustic(value: unknown): TaskResult['psychoacoustic'] {
 
 function normalizeLossWeights(value: unknown): TaskResult['lossWeights'] {
   const record = asRecord(value)
+  const lambdaId = firstNumber(record, ['lambdaId', 'lambdaIdentity', 'weightIdentity', 'weight_identity', 'lambdaFeat', 'weightFeature', 'weight_feature'])
   return {
-    lambdaFeat: firstNumber(record, ['lambdaFeat', 'weightFeature', 'weight_feature']),
+    lambdaId,
+    lambdaFeat: lambdaId,
     lambdaSem: firstNumber(record, ['lambdaSem', 'weightSemantic', 'weight_semantic']),
     lambdaPsy: firstNumber(record, ['lambdaPsy', 'weightPsy', 'weight_psy']),
     lambda2: firstNumber(record, ['lambda2', 'weightL2', 'weight_l2']),
@@ -253,7 +283,8 @@ function hasAnyNumber(record: Record<string, unknown>, keys: string[]) {
 function normalizeAsrEval(value: unknown): TaskResult['asrEval'] {
   const data = asRecord(value)
   const status = firstString(data, ['status'])
-  const originalText = firstString(data, ['originalText', 'original_transcript', 'referenceText', 'cleanTranscription', 'beforeText'])
+  const referenceText = firstString(data, ['referenceText', 'reference_text'])
+  const originalText = firstString(data, ['originalText', 'original_transcript', 'cleanTranscription', 'beforeText'])
   const protectedText = firstString(data, ['protectedText', 'protected_transcript', 'protectedTranscription', 'afterText'])
   const hasMetric = hasAnyNumber(data, ['wer', 'WER', 'cer', 'CER', 'insertRate', 'ir', 'insertionRate', 'deleteRate', 'dr', 'deletionRate', 'substituteRate', 'sr', 'substitutionRate', 'tokenErrorRate', 'token_error_rate', 'tokenChangeRate', 'token_change_rate', 'semanticDrift', 'semantic_drift'])
   if (status && !['computed', 'partial', 'completed', 'success', 'finished'].includes(status) && !originalText && !protectedText && !hasMetric) return null
@@ -262,6 +293,7 @@ function normalizeAsrEval(value: unknown): TaskResult['asrEval'] {
     model: firstString(data, ['model', 'asrModel', 'asr_model']) ?? undefined,
     asrModel: firstString(data, ['asrModel', 'asr_model', 'model']),
     language: firstString(data, ['language', 'lang']),
+    referenceText,
     originalText,
     protectedText,
     wer: firstNumber(data, ['wer', 'WER']),
@@ -269,6 +301,8 @@ function normalizeAsrEval(value: unknown): TaskResult['asrEval'] {
     substituteRate: firstNumber(data, ['substituteRate', 'sr', 'substitutionRate']),
     insertRate: firstNumber(data, ['insertRate', 'ir', 'insertionRate']),
     deleteRate: firstNumber(data, ['deleteRate', 'dr', 'deletionRate']),
+    editCounts: normalizeEditCounts(data.editCounts),
+    errorShares: normalizeErrorShares(data.errorShares),
     metricLevel: firstString(data, ['metricLevel', 'metric_level']),
     tokenErrorRate: firstNumber(data, ['tokenErrorRate', 'token_error_rate']),
     tokenChangeRate: firstNumber(data, ['tokenChangeRate', 'token_change_rate']),
@@ -293,6 +327,7 @@ function normalizeCloneEval(value: unknown): TaskResult['cloneEval'] {
   return {
     cloneModel: firstString(data, ['cloneModel', 'clone_model']) ?? firstString(request, ['model']),
     speakerEvalModel: firstString(data, ['speakerEvalModel', 'speaker_eval_model']),
+    speakerModel: firstString(data, ['speakerModel', 'speaker_model']),
     targetText: firstString(data, ['targetText', 'target_text']) ?? firstString(request, ['text']),
     originalCloneAudio,
     protectedCloneAudio,
@@ -408,7 +443,8 @@ function normalizeTaskResult(payload: unknown): TaskResult {
   const pesq = numberOrNull(primary.pesq)
   const simAfter = numberOrNull(primary.speakerSimilarity) ?? firstNumber(detailSpeaker, ['simAfter', 'simOriginalProtected'])
   const simBefore = firstNumber(detailSpeaker, ['simBefore'])
-  const originalText = optionalString(detailAsr.referenceText ?? detailAsr.cleanTranscription)
+  const referenceText = optionalString(detailAsr.referenceText)
+  const originalText = optionalString(detailAsr.originalText ?? detailAsr.cleanTranscription)
   const protectedText = optionalString(detailAsr.protectedTranscription)
   const cloneResults = Array.isArray(data.cloneResults) ? data.cloneResults.map(normalizeCloneResult) : undefined
   const lossFinal = normalizeLossFinal(detailGeneration.lossFinal)
@@ -474,6 +510,7 @@ function normalizeTaskResult(payload: unknown): TaskResult {
       radar: normalizeRadarPoints(asRecord(data.speakerFeatureMap).radar ?? asRecord(details.speakerFeatureMap).radar),
     },
     asr: {
+      referenceText: asrHasResult ? referenceText : null,
       originalText: asrHasResult ? originalText : null,
       protectedText: asrHasResult ? protectedText : null,
       wer: asrHasResult ? optionalNumber(primary.wer) ?? optionalNumber(detailAsr.wer) : null,
@@ -483,6 +520,8 @@ function normalizeTaskResult(payload: unknown): TaskResult {
       insertRate: asrHasResult ? optionalNumber(asRecord(detailAsr.breakdown).insertRate) : null,
       deleteRate: asrHasResult ? optionalNumber(asRecord(detailAsr.breakdown).deleteRate) : null,
       substituteRate: asrHasResult ? optionalNumber(asRecord(detailAsr.breakdown).substituteRate) : null,
+      editCounts: asrHasResult ? normalizeEditCounts(detailAsr.editCounts) : null,
+      errorShares: asrHasResult ? normalizeErrorShares(detailAsr.errorShares) : null,
       status: typeof detailAsr.status === 'string' ? detailAsr.status : undefined,
     },
     speaker: {

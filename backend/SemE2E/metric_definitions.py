@@ -4,6 +4,7 @@ import importlib.util
 import math
 import os
 import re
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -12,8 +13,10 @@ import numpy as np
 
 
 EPS = 1.0e-12
+ROOT = Path(__file__).resolve().parent
 _S3_TOKENIZER_CACHE: dict[tuple[str, str], Any] = {}
 _SEMANTIC_ENCODER_CACHE: dict[tuple[str, str, str, str], Any] = {}
+_SEMANTIC_ENCODER_LAST_ERROR: str | None = None
 
 
 def now_iso() -> str:
@@ -64,10 +67,24 @@ def _module_available(name: str) -> bool:
     return importlib.util.find_spec(name) is not None
 
 
+def _resolve_local_model_path(value: Any) -> Any:
+    if not isinstance(value, (str, os.PathLike)):
+        return value
+    raw = str(value)
+    if not raw.strip():
+        return value
+    path = Path(raw).expanduser()
+    candidates = [path] if path.is_absolute() else [Path.cwd() / path, ROOT / path]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate.resolve())
+    return raw
+
+
 def load_s3_tokenizer(model_name_or_path: str | None = None, device: str | None = None) -> Any:
     """Load the S3 semantic tokenizer used for real token metrics."""
 
-    model = model_name_or_path or os.getenv("SEME2E_TOKENIZER_MODEL") or "speech_tokenizer_v1_25hz"
+    model = _resolve_local_model_path(model_name_or_path or os.getenv("SEME2E_TOKENIZER_MODEL") or "speech_tokenizer_v1_25hz")
     resolved_device = device or os.getenv("SEME2E_TOKENIZER_DEVICE") or os.getenv("SEME2E_API_DEVICE") or "cpu"
     cache_key = (str(model), str(resolved_device))
     if cache_key not in _S3_TOKENIZER_CACHE:
@@ -380,10 +397,39 @@ def _read_weight(config: dict[str, Any], group: str, primary: str, alias: str) -
     return finite_float(section.get(primary, section.get(alias)))
 
 
+def _read_identity_weight(config: dict[str, Any]) -> float | None:
+    timbre = config.get("timbre") or {}
+    optimization = config.get("optimization") or {}
+    candidates = [
+        timbre.get("lambdaId"),
+        timbre.get("lambdaIdentity"),
+        timbre.get("weightIdentity"),
+        timbre.get("weight_identity"),
+        timbre.get("lambdaFeat"),
+        timbre.get("lambdaTimbre"),
+        timbre.get("weightFeature"),
+        timbre.get("weight_feature"),
+        optimization.get("lambdaId"),
+        optimization.get("weightIdentity"),
+        optimization.get("weight_identity"),
+    ]
+    for candidate in candidates:
+        value = finite_float(candidate)
+        if value is not None:
+            return value
+    return None
+
+
 def _normalize_loss_point(item: dict[str, Any], index: int, weights: dict[str, float | None]) -> dict[str, Any] | None:
+    lid = None
+    for key in ["Lid", "lId", "lossIdentity", "loss_identity", "Lfeat", "Lfea", "lossFeature", "loss_timbre", "L_feature"]:
+        lid = finite_float(item.get(key))
+        if lid is not None:
+            break
     point = {
         "step": finite_float(item.get("step", item.get("epoch", item.get("iteration", item.get("iter", index))))),
-        "Lfeat": finite_float(item.get("Lfeat", item.get("Lfea", item.get("lossFeature", item.get("loss_timbre", item.get("L_feature")))))),
+        "Lid": lid,
+        "Lfeat": lid,
         "Lsem": finite_float(item.get("Lsem", item.get("lossSemantic", item.get("loss_semantic", item.get("L_semantic"))))),
         "Lpsy": finite_float(item.get("Lpsy", item.get("lossPsy", item.get("loss_psy", item.get("L_psy"))))),
         "L2": finite_float(item.get("L2", item.get("lossL2", item.get("loss_l2", item.get("l2Norm"))))),
@@ -391,15 +437,15 @@ def _normalize_loss_point(item: dict[str, Any], index: int, weights: dict[str, f
         "snr": finite_float(item.get("snr", item.get("SNR"))),
         "stepElapsedSec": finite_float(item.get("stepElapsedSec", item.get("elapsedSec", item.get("step_time")))),
     }
-    if point["total"] is None and all(point[key] is not None for key in ["Lfeat", "Lsem", "Lpsy", "L2"]):
-        if all(weights.get(key) is not None for key in ["lambdaFeat", "lambdaSem", "lambdaPsy", "lambda2"]):
+    if point["total"] is None and all(point[key] is not None for key in ["Lid", "Lsem", "Lpsy", "L2"]):
+        if all(weights.get(key) is not None for key in ["lambdaId", "lambdaSem", "lambdaPsy", "lambda2"]):
             point["total"] = (
-                float(weights["lambdaFeat"]) * float(point["Lfeat"])
+                float(weights["lambdaId"]) * float(point["Lid"])
                 + float(weights["lambdaSem"]) * float(point["Lsem"])
                 + float(weights["lambdaPsy"]) * float(point["Lpsy"])
                 + float(weights["lambda2"]) * float(point["L2"])
             )
-    if any(point[key] is not None for key in ["Lfeat", "Lsem", "Lpsy", "L2", "total"]):
+    if any(point[key] is not None for key in ["Lid", "Lsem", "Lpsy", "L2", "total"]):
         return point
     return None
 
@@ -412,8 +458,10 @@ def compute_loss_summary(
     delta: np.ndarray | None = None,
 ) -> dict[str, Any]:
     del x, xp, delta
+    lambda_id = _read_identity_weight(request_config)
     weights = {
-        "lambdaFeat": _read_weight(request_config, "timbre", "lambdaTimbre", "weightFeature"),
+        "lambdaId": lambda_id,
+        "lambdaFeat": lambda_id,
         "lambdaSem": _read_weight(request_config, "semantic", "lambdaSemantic", "weightSemantic"),
         "lambdaPsy": _read_weight(request_config, "psychoacoustic", "lambdaPsy", "weightPsy"),
         "lambda2": _read_weight(request_config, "optimization", "lambdaL2", "weightL2"),
@@ -441,7 +489,33 @@ def compute_loss_summary(
             source_status,
             protection_details.get("source") or "SemanticE2EVGuard.protect",
             reason=None if trace else "Protection backend did not return per-step loss records",
-            formula="normalized backend trace; total=lambdaFeat*Lfeat+lambdaSem*Lsem+lambdaPsy*Lpsy+lambda2*L2 when total is absent",
+            formula="normalized backend trace; total=lambdaId*Lid+lambdaSem*Lsem+lambdaPsy*Lpsy+lambda2*L2 when total is absent",
+        ),
+        "lossFinal.Lid": metric_source(
+            source_status,
+            protection_details.get("source") or "SemanticE2EVGuard.protect",
+            reason=None if trace else "Protection backend did not return an optimization trace",
+            formula="L_{\\mathrm{id}}",
+            metric="Identity loss from SemanticE2EVGuard optimization trace.",
+        ),
+        "optimizationTrace.Lid": metric_source(
+            source_status,
+            protection_details.get("source") or "SemanticE2EVGuard.protect",
+            reason=None if trace else "Protection backend did not return per-step loss records",
+            formula="L_{\\mathrm{id}}",
+            metric="Identity loss from SemanticE2EVGuard optimization trace.",
+        ),
+        "lossFinal.Lfeat": metric_source(
+            source_status,
+            protection_details.get("source") or "SemanticE2EVGuard.protect",
+            reason="Deprecated legacy alias of Lid.",
+            formula="Lfeat := Lid",
+        ),
+        "optimizationTrace.Lfeat": metric_source(
+            source_status,
+            protection_details.get("source") or "SemanticE2EVGuard.protect",
+            reason="Deprecated legacy alias of Lid.",
+            formula="Lfeat := Lid",
         ),
         "averageStepSec": metric_source(
             "available" if average_step_sec is not None else "unavailable",
@@ -553,10 +627,17 @@ def compute_asr_metrics(
         substitutions, deletions, insertions, diff_ops = _edit_counts_and_ops(char_ref, char_hyp)
         normalizer = max(len(char_ref), 1)
         m = cer
+        reference_length = len(char_ref)
     else:
         substitutions, deletions, insertions, diff_ops = _edit_counts_and_ops(word_ref, word_hyp)
         normalizer = max(len(word_ref), 1)
         m = wer
+        reference_length = len(word_ref)
+    total_errors = substitutions + deletions + insertions
+    substitute_rate = substitutions / normalizer
+    insert_rate = insertions / normalizer
+    delete_rate = deletions / normalizer
+    error_normalizer = max(total_errors, 1)
     return {
         "model": model,
         "asrModel": model,
@@ -568,13 +649,26 @@ def compute_asr_metrics(
         "protectedTranscription": protected,
         "wer": wer,
         "cer": cer,
-        "insertRate": insertions / normalizer,
-        "deleteRate": deletions / normalizer,
-        "substituteRate": substitutions / normalizer,
+        "insertRate": insert_rate,
+        "deleteRate": delete_rate,
+        "substituteRate": substitute_rate,
+        "editCounts": {
+            "level": metric_level,
+            "referenceLength": reference_length,
+            "substitutions": substitutions,
+            "insertions": insertions,
+            "deletions": deletions,
+            "totalErrors": total_errors,
+        },
+        "errorShares": {
+            "substituteShare": substitutions / error_normalizer if total_errors else 0.0,
+            "insertShare": insertions / error_normalizer if total_errors else 0.0,
+            "deleteShare": deletions / error_normalizer if total_errors else 0.0,
+        },
         "breakdown": {
-            "insertRate": insertions / normalizer,
-            "deleteRate": deletions / normalizer,
-            "substituteRate": substitutions / normalizer,
+            "insertRate": insert_rate,
+            "deleteRate": delete_rate,
+            "substituteRate": substitute_rate,
         },
         "metricLevel": metric_level,
         "asrProtectionScore": 100.0 * clamp(m / 0.5),
@@ -628,6 +722,90 @@ def _cosine_distance(clean_vec: Any, protected_vec: Any) -> tuple[float, float]:
     return cosine, clamp(1.0 - cosine)
 
 
+def _framewise_cosine_similarity(clean_vec: Any, protected_vec: Any) -> float:
+    import torch
+    import torch.nn.functional as F
+
+    clean = torch.as_tensor(clean_vec).detach().float().cpu()
+    protected = torch.as_tensor(protected_vec).detach().float().cpu()
+    if clean.ndim == 0 or protected.ndim == 0:
+        raise ValueError("empty semantic vector")
+    if clean.ndim == 2:
+        clean = clean.unsqueeze(0)
+    if protected.ndim == 2:
+        protected = protected.unsqueeze(0)
+    try:
+        return float(F.cosine_similarity(clean, protected, dim=-1, eps=1.0e-6).mean().item())
+    except RuntimeError:
+        min_len = min(clean.shape[-1], protected.shape[-1])
+        if min_len <= 0:
+            raise ValueError("empty semantic vector")
+        clean = clean[..., :min_len]
+        protected = protected[..., :min_len]
+        if clean.ndim >= 2 and protected.ndim >= 2:
+            min_seq = min(clean.shape[-2], protected.shape[-2])
+            if min_seq <= 0:
+                raise ValueError("empty semantic sequence")
+            clean = clean[..., :min_seq, :]
+            protected = protected[..., :min_seq, :]
+        return float(F.cosine_similarity(clean, protected, dim=-1, eps=1.0e-6).mean().item())
+
+
+def _semantic_encoder_weight_map(config: dict[str, Any]) -> dict[str, float]:
+    semantic = config.get("semantic") if isinstance(config.get("semantic"), dict) else {}
+    raw = (
+        config.get("encoderWeights")
+        or config.get("semanticEncoderWeights")
+        or semantic.get("encoderWeights")
+        or semantic.get("semanticEncoderWeights")
+    )
+    weights: dict[str, float] = {}
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            canonical = _canonical_semantic_encoder_name(key)
+            weight = finite_float(value)
+            if canonical and weight is not None and weight > 0:
+                weights[canonical] = weight
+    elif isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            canonical = _canonical_semantic_encoder_name(item.get("encoder") or item.get("name") or item.get("value"))
+            weight = finite_float(item.get("weight"))
+            if canonical and weight is not None and weight > 0:
+                weights[canonical] = weight
+    return weights
+
+
+def _load_audio_without_torchcodec(path: Path) -> tuple[np.ndarray, int]:
+    try:
+        import soundfile as sf
+
+        audio, sr = sf.read(str(path), dtype="float32", always_2d=True)
+        mono = audio.mean(axis=1)
+        return mono.astype(np.float32, copy=False), int(sr)
+    except Exception:
+        pass
+
+    with wave.open(str(path), "rb") as wav:
+        channels = wav.getnchannels()
+        sample_width = wav.getsampwidth()
+        sr = wav.getframerate()
+        frames = wav.readframes(wav.getnframes())
+
+    if sample_width == 1:
+        data = (np.frombuffer(frames, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+    elif sample_width == 2:
+        data = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+    elif sample_width == 4:
+        data = np.frombuffer(frames, dtype="<i4").astype(np.float32) / 2147483648.0
+    else:
+        raise ValueError(f"Unsupported WAV sample width: {sample_width}")
+    if channels > 1:
+        data = data.reshape(-1, channels).mean(axis=1)
+    return data.astype(np.float32, copy=False), int(sr)
+
+
 def _canonical_semantic_encoder_name(value: Any) -> str | None:
     normalized = str(value or "").strip().lower().replace("_", "-")
     if not normalized:
@@ -653,12 +831,58 @@ def _selected_semantic_encoder_names(config: dict[str, Any]) -> set[str] | None:
     return selected or None
 
 
+def _hf_model_is_cached(model_id: str) -> bool:
+    model_path = Path(str(model_id)).expanduser()
+    if model_path.exists():
+        return True
+    if "/" not in str(model_id):
+        return False
+    cache_root = (
+        os.getenv("HUGGINGFACE_HUB_CACHE")
+        or (str(Path(os.getenv("HF_HOME")).expanduser() / "hub") if os.getenv("HF_HOME") else None)
+        or str(Path.home() / ".cache" / "huggingface" / "hub")
+    )
+    cache_name = "models--" + str(model_id).replace("/", "--")
+    return (Path(cache_root) / cache_name).exists()
+
+
+def _default_hubert_model() -> str:
+    preferred = "facebook/hubert-large-ll60k"
+    cached_fallbacks = ["facebook/hubert-large-ls960-ft"]
+    if _hf_model_is_cached(preferred):
+        return preferred
+    for fallback in cached_fallbacks:
+        if _hf_model_is_cached(fallback):
+            return fallback
+    return preferred
+
+
+def _resolve_hf_or_local_model(requested: Any, cached_fallbacks: Sequence[str]) -> str:
+    resolved = _resolve_local_model_path(requested)
+    if isinstance(resolved, str) and Path(resolved).expanduser().exists():
+        return resolved
+    for fallback in cached_fallbacks:
+        resolved_fallback = _resolve_local_model_path(fallback)
+        if isinstance(resolved_fallback, str) and Path(resolved_fallback).expanduser().exists():
+            return resolved_fallback
+    if isinstance(resolved, str) and _hf_model_is_cached(resolved):
+        return resolved
+    for fallback in cached_fallbacks:
+        resolved_fallback = _resolve_local_model_path(fallback)
+        if isinstance(resolved_fallback, str) and _hf_model_is_cached(resolved_fallback):
+            return resolved_fallback
+    return str(resolved)
+
+
 def _load_semantic_encoder_ensemble(config: dict[str, Any]) -> Any | None:
+    global _SEMANTIC_ENCODER_LAST_ERROR
     if os.getenv("SEME2E_ENABLE_SEMANTIC_ENCODERS", "1") != "1":
+        _SEMANTIC_ENCODER_LAST_ERROR = "Set SEME2E_ENABLE_SEMANTIC_ENCODERS=1 to run SemanticEncoderEnsemble"
         return None
     try:
         from semantic_encoders import SemanticEncoderEnsemble
 
+        _SEMANTIC_ENCODER_LAST_ERROR = None
         device = os.getenv("SEME2E_SEMANTIC_ENCODER_DEVICE") or os.getenv("SEME2E_API_DEVICE") or os.getenv("SEME2E_TOKENIZER_DEVICE") or "cpu"
         tokenizer_path = (
             os.getenv("SEME2E_SEMANTIC_TOKENIZER_MODEL")
@@ -666,8 +890,14 @@ def _load_semantic_encoder_ensemble(config: dict[str, Any]) -> Any | None:
             or config.get("tokenizerPath")
             or "speech_tokenizer_v1_25hz"
         )
-        hubert_path = os.getenv("SEME2E_HUBERT_MODEL") or config.get("hubertModel") or config.get("hubertPath") or "facebook/hubert-large-ll60k"
-        whisper_path = os.getenv("SEME2E_WHISPER_MODEL") or config.get("whisperModel") or config.get("whisperPath") or "openai/whisper-large-v3"
+        tokenizer_path = _resolve_local_model_path(tokenizer_path)
+        requested_hubert = os.getenv("SEME2E_HUBERT_MODEL") or config.get("hubertModel") or config.get("hubertPath") or _default_hubert_model()
+        requested_whisper = os.getenv("SEME2E_WHISPER_MODEL") or config.get("whisperModel") or config.get("whisperPath") or "openai/whisper-large-v3"
+        hubert_path = _resolve_hf_or_local_model(requested_hubert, [_default_hubert_model(), "facebook/hubert-large-ls960-ft"])
+        whisper_path = _resolve_hf_or_local_model(
+            requested_whisper,
+            [str(ROOT / "checkpoints" / "asr" / "openai-whisper-small"), "openai/whisper-small", "openai/whisper-large-v3"],
+        )
         cache_key = (str(device), str(tokenizer_path), str(hubert_path), str(whisper_path))
         if cache_key not in _SEMANTIC_ENCODER_CACHE:
             _SEMANTIC_ENCODER_CACHE[cache_key] = SemanticEncoderEnsemble(
@@ -678,7 +908,8 @@ def _load_semantic_encoder_ensemble(config: dict[str, Any]) -> Any | None:
                 sample_rate=16000,
             )
         return _SEMANTIC_ENCODER_CACHE[cache_key]
-    except Exception:
+    except Exception as exc:
+        _SEMANTIC_ENCODER_LAST_ERROR = f"{type(exc).__name__}: {exc}"
         return None
 
 
@@ -690,11 +921,11 @@ def _compute_semantic_encoder_distances(clean_path: Path, protected_path: Path, 
     import torchaudio
 
     def load_wave(path: Path) -> Any:
-        wave, sr = torchaudio.load(str(path))
-        wave = wave.mean(dim=0, keepdim=True)
+        audio, sr = _load_audio_without_torchcodec(path)
+        wave_tensor = torch.from_numpy(audio).float().unsqueeze(0)
         if sr != 16000:
-            wave = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)(wave)
-        return wave.to(ensemble.device)
+            wave_tensor = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)(wave_tensor)
+        return wave_tensor.to(ensemble.device)
 
     with torch.no_grad():
         clean_vectors = ensemble.get_vectors(load_wave(clean_path))
@@ -702,17 +933,21 @@ def _compute_semantic_encoder_distances(clean_path: Path, protected_path: Path, 
     names = list(getattr(ensemble, "vector_names", [])) or ["s3", "hubert", "whisper", "mfcc"]
     display_names = {"s3": "S3", "hubert": "HuBERT", "whisper": "Whisper", "mfcc": "MFCC"}
     selected = _selected_semantic_encoder_names(config)
+    weights = _semantic_encoder_weight_map(config)
     distances = []
     for name, clean_vec, protected_vec in zip(names, clean_vectors, protected_vectors):
         canonical_name = _canonical_semantic_encoder_name(name)
         if selected is not None and canonical_name not in selected:
             continue
-        cosine, drift = _cosine_distance(clean_vec, protected_vec)
+        cosine = _framewise_cosine_similarity(clean_vec, protected_vec)
+        drift = clamp(1.0 - cosine)
+        weight = weights.get(str(canonical_name or name).lower(), 1.0)
         distances.append(
             {
                 "encoder": display_names.get(str(canonical_name or name).lower(), str(name)),
                 "cosineBeforeAfter": cosine,
                 "distance": drift,
+                "weight": weight,
                 "status": "available",
                 "source": "SemanticEncoderEnsemble",
             }
@@ -734,7 +969,12 @@ def compute_semantic_token_metrics(clean_path: Path, protected_path: Path, confi
         "_metricSources": {
             "asrEval.tokenChangeRate": metric_source("unavailable", "semantic_tokenizer", reason="No real tokenizer configured", formula="edit/token mismatch over encoded tokens"),
             "asrEval.tokenErrorRate": metric_source("unavailable", "semantic_tokenizer", reason="No real tokenizer configured", formula="edit_distance(tokens,tokens_p)/max(len(tokens),1)"),
-            "asrEval.semanticDrift": metric_source("unavailable", "semantic_encoder", reason="No real semantic encoder is configured", formula="mean(1-cosine(pool(F_k(x)),pool(F_k(xp))))"),
+            "asrEval.semanticDrift": metric_source(
+                "unavailable",
+                "semantic_encoder",
+                reason="No real semantic encoder is configured",
+                formula="sum_k(w_k*(1-mean_t CosSim(F_k(x)_t,F_k(xp)_t)))/sum_k(w_k) over selected semantic encoders",
+            ),
         },
     }
     if os.getenv("SEME2E_ENABLE_TOKENIZER", "1") == "1":
@@ -774,11 +1014,24 @@ def compute_semantic_token_metrics(clean_path: Path, protected_path: Path, confi
     try:
         encoder_distances, encoder_source = _compute_semantic_encoder_distances(clean_path, protected_path, config)
         if encoder_distances:
-            drift_values = [finite_float(item.get("distance")) for item in encoder_distances]
-            drift_values = [value for value in drift_values if value is not None]
+            weighted_drift = 0.0
+            weighted_cosine = 0.0
+            weight_sum = 0.0
+            for item in encoder_distances:
+                drift = finite_float(item.get("distance"))
+                cosine = finite_float(item.get("cosineBeforeAfter"))
+                weight = finite_float(item.get("weight")) or 1.0
+                if drift is None or cosine is None or weight <= 0:
+                    continue
+                weighted_drift += drift * weight
+                weighted_cosine += cosine * weight
+                weight_sum += weight
             details.update(
                 {
-                    "semanticDrift": float(np.mean(drift_values)) if drift_values else None,
+                    "semanticDrift": weighted_drift / weight_sum if weight_sum else None,
+                    "semanticCosineWeightedSum": weighted_cosine,
+                    "semanticWeightedCosine": weighted_cosine / weight_sum if weight_sum else None,
+                    "semanticWeightSum": weight_sum,
                     "encoderDistances": encoder_distances,
                     "status": "available" if details.get("tokenErrorRate") is not None else "partial",
                 }
@@ -787,66 +1040,27 @@ def compute_semantic_token_metrics(clean_path: Path, protected_path: Path, confi
                 "available",
                 encoder_source or "SemanticEncoderEnsemble",
                 reason=f"selectedSemanticEncoders={sorted(selected_encoders)}" if selected_encoders else None,
-                formula="mean_k(1-cosine(pool(F_k(x)),pool(F_k(xp)))) over selected semantic encoders",
+                formula="sum_k(w_k*(1-mean_t CosSim(F_k(x)_t,F_k(xp)_t)))/sum_k(w_k) over selected semantic encoders",
             )
             return details
     except Exception as exc:
         details["status"] = "error"
         details["error"] = str(exc)
-        details["_metricSources"]["asrEval.semanticDrift"] = metric_source("error", "SemanticEncoderEnsemble", reason=str(exc), formula="mean(1-cosine(pool(F_k(x)),pool(F_k(xp))))")
-
-    selected_requires_ensemble = selected_encoders is not None and bool(selected_encoders - {"mfcc"})
-    if selected_requires_ensemble:
-        details.setdefault("reason", f"SemanticEncoderEnsemble unavailable for selected semantic encoders: {sorted(selected_encoders)}")
         details["_metricSources"]["asrEval.semanticDrift"] = metric_source(
-            "unavailable",
-            "semantic_encoder",
-            reason=details["reason"],
-            formula="mean_k(1-cosine(pool(F_k(x)),pool(F_k(xp)))) over selected semantic encoders",
+            "error",
+            "SemanticEncoderEnsemble",
+            reason=str(exc),
+            formula="sum_k(w_k*(1-mean_t CosSim(F_k(x)_t,F_k(xp)_t)))/sum_k(w_k) over selected semantic encoders",
         )
         return details
 
-    if os.getenv("SEME2E_ENABLE_MFCC", "1") != "1":
-        details.setdefault("reason", "Set SEME2E_ENABLE_MFCC=1 to compute MFCC proxy semantic drift.")
-        return details
-    try:
-        import librosa
-
-        x, sr = librosa.load(str(clean_path), sr=16000)
-        xp, _ = librosa.load(str(protected_path), sr=16000)
-        n = min(len(x), len(xp))
-        if n <= 0:
-            return details
-        clean_mfcc = librosa.feature.mfcc(y=x[:n], sr=sr, n_mfcc=20).mean(axis=1)
-        protected_mfcc = librosa.feature.mfcc(y=xp[:n], sr=sr, n_mfcc=20).mean(axis=1)
-        denom = float(np.linalg.norm(clean_mfcc) * np.linalg.norm(protected_mfcc) + EPS)
-        cosine = float(np.dot(clean_mfcc, protected_mfcc) / denom)
-        drift = clamp(1.0 - cosine)
-        details.update(
-            {
-                "semanticDrift": drift,
-                "encoderDistances": [
-                    {
-                        "encoder": "MFCC",
-                        "cosineBeforeAfter": cosine,
-                        "distance": drift,
-                        "status": "partial",
-                        "source": "mfcc_proxy",
-                    }
-                ],
-                "status": "partial" if details.get("tokenErrorRate") is not None else "partial",
-            }
-        )
-        details["_metricSources"]["asrEval.semanticDrift"] = metric_source(
-            "partial",
-            "mfcc_proxy",
-            reason="MFCC proxy drift is reported only as semanticDrift; it is not used for tokenChangeRate or tokenErrorRate",
-            formula="1-cosine(mean(MFCC(x)),mean(MFCC(xp)))",
-        )
-    except Exception as exc:
-        details["status"] = "error"
-        details["error"] = str(exc)
-        details["_metricSources"]["asrEval.semanticDrift"] = metric_source("error", "mfcc_proxy", reason=str(exc), formula="1-cosine(mean(MFCC(x)),mean(MFCC(xp)))")
+    details["reason"] = _SEMANTIC_ENCODER_LAST_ERROR or f"SemanticEncoderEnsemble unavailable for selected semantic encoders: {sorted(selected_encoders) if selected_encoders else 'all configured semantic encoders'}"
+    details["_metricSources"]["asrEval.semanticDrift"] = metric_source(
+        "error" if _SEMANTIC_ENCODER_LAST_ERROR and not _SEMANTIC_ENCODER_LAST_ERROR.startswith("Set SEME2E_ENABLE_SEMANTIC_ENCODERS") else "unavailable",
+        "SemanticEncoderEnsemble",
+        reason=details["reason"],
+        formula="sum_k(w_k*(1-mean_t CosSim(F_k(x)_t,F_k(xp)_t)))/sum_k(w_k) over selected semantic encoders",
+    )
     return details
 
 
@@ -914,14 +1128,15 @@ def compute_direct_speaker_metrics(clean_path: Path, protected_path: Path, speak
     return base
 
 
-def clone_radar_point(name: str, value: float | None, reason: str | None = None) -> dict[str, Any]:
+def clone_radar_point(name: str, value: float | None, reason: str | None = None, formula: str | None = None, raw_metric_keys: list[str] | None = None) -> dict[str, Any]:
     point: dict[str, Any] = {
         "name": name,
         "value": value,
         "status": "available" if value is not None else "unavailable",
+        "reason": reason,
+        "formula": formula,
+        "rawMetricKeys": raw_metric_keys or [],
     }
-    if value is None and reason:
-        point["reason"] = reason
     return point
 
 
@@ -930,25 +1145,44 @@ def build_clone_radar(
     similarity_drop_rate: float | None,
     embedding_distance_increase_rate: float | None,
     protected_similarity: float | None,
-    clone_confidence_drop_rate: float | None,
     *,
     direct_reason: str | None = None,
     clone_reason: str | None = None,
-    confidence_reason: str | None = None,
 ) -> list[dict[str, Any]]:
     direct_offset_score = 100.0 * clamp(1.0 - direct_similarity, 0.0, 1.0) if direct_similarity is not None else None
     similarity_drop_score = 100.0 * clamp(similarity_drop_rate / 0.5, 0.0, 1.0) if similarity_drop_rate is not None else None
     distance_increase_score = 100.0 * clamp(embedding_distance_increase_rate / 1.0, 0.0, 1.0) if embedding_distance_increase_rate is not None else None
     protected_clone_defense_score = 100.0 * clamp(1.0 - protected_similarity, 0.0, 1.0) if protected_similarity is not None else None
-    confidence_drop_score = 100.0 * clamp(clone_confidence_drop_rate / 0.5, 0.0, 1.0) if clone_confidence_drop_rate is not None else None
     return [
-        clone_radar_point("直接声纹偏移", direct_offset_score, direct_reason or "speaker similarity is not available"),
-        clone_radar_point("克隆相似度下降", similarity_drop_score, clone_reason or "clone similarity metrics are not available"),
-        clone_radar_point("嵌入距离增加", distance_increase_score, clone_reason or "clone embedding distance metrics are not available"),
-        clone_radar_point("保护后克隆防护", protected_clone_defense_score, clone_reason or "protected clone similarity is not available"),
-        clone_radar_point("克隆置信度下降", confidence_drop_score, confidence_reason or "no calibrated clone confidence model"),
+        clone_radar_point(
+            "直接声纹偏移",
+            direct_offset_score,
+            direct_reason or "speaker similarity is not available",
+            "100*clip(1-directSimilarity,0,1)",
+            ["directSimilarity"],
+        ),
+        clone_radar_point(
+            "相似度下降",
+            similarity_drop_score,
+            clone_reason or "clone similarity metrics are not available",
+            "100*clip(similarityDropRate/0.5,0,1)",
+            ["originalSimilarity", "protectedSimilarity", "similarityDropRate"],
+        ),
+        clone_radar_point(
+            "嵌入距离增加",
+            distance_increase_score,
+            clone_reason or "clone embedding distance metrics are not available",
+            "100*clip(embeddingDistanceIncreaseRate/1.0,0,1)",
+            ["embeddingDistanceBefore", "embeddingDistanceAfter", "embeddingDistanceIncreaseRate"],
+        ),
+        clone_radar_point(
+            "保护后克隆防护",
+            protected_clone_defense_score,
+            clone_reason or "protected clone similarity is not available",
+            "100*clip(1-protectedSimilarity,0,1)",
+            ["protectedSimilarity"],
+        ),
     ]
-
 
 def compute_clone_eval(
     original_audio_path: Path,
@@ -983,7 +1217,6 @@ def compute_clone_eval(
         "cloneConfidenceAfter": None,
         "cloneConfidenceDropRate": None,
         "cloneRadar": build_clone_radar(
-            None,
             None,
             None,
             None,
@@ -1053,9 +1286,7 @@ def compute_clone_eval(
                     similarity_drop_rate,
                     embedding_increase,
                     protected_similarity,
-                    conf_drop,
                     direct_reason=direct_reason,
-                    confidence_reason="no calibrated clone confidence model",
                 ),
                 "cloneDefenseScore": 100.0 * clone_score_base if clone_score_base is not None else None,
                 "status": "available",
@@ -1114,7 +1345,7 @@ def compute_overall_score(result: dict[str, Any]) -> dict[str, Any]:
     )
     score = 100.0 * score_base if score_base is not None else None
     if score is None:
-        verdict = "未完成评估"
+        verdict = "未生成评分"
     elif score >= 85:
         verdict = "强防护"
     elif score >= 70:

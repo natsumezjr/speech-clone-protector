@@ -29,7 +29,7 @@ const strategies = [
     tone: 'green',
   },
   {
-    title: 'Feature 特征防护',
+    title: 'Identity 身份防护',
     desc: '削弱声学特征，降低相似度与克隆质量',
     points: ['声学特征干扰', '抑制特征建模', '克隆攻击抵御'],
     icon: Fingerprint,
@@ -54,7 +54,7 @@ const metrics = [
 ]
 
 const capabilities = [
-  { title: '双重防护机制', icon: ShieldCheck, desc: '语义及 Feature 特征双通路协同，全面降低被克隆与滥用风险。', tone: 'green' },
+  { title: '双重防护机制', icon: ShieldCheck, desc: '语义及 Identity 身份双通路协同，全面降低被克隆与滥用风险。', tone: 'green' },
   { title: '多模型泛化', icon: Puzzle, desc: '覆盖主流 ASR / Tokenizer / LLM / TTS 模型，具备强迁移能力。', tone: 'blue' },
   { title: '听感无感知', icon: Ear, desc: '基于心理声学约束，保障人耳听感质量与发布可用性。', tone: 'purple' },
   { title: '可解释可评估', icon: Gauge, desc: '全流程评估与可视化，风险可控、结果可追踪、报告可导出。', tone: 'amber' },
@@ -70,7 +70,7 @@ export function HomePage() {
             <span className="block bg-gradient-to-r from-emerald-300 via-cyan-300 to-sky-400 bg-clip-text text-transparent">降低语音克隆风险</span>
           </h1>
           <p className="mt-5 max-w-[390px] text-[16px] leading-8 text-slate-300">
-            融合语义防护与 Feature 特征防护的双重机制，在保证听感质量的同时干扰语音理解与声学特征建模，有效抵御非授权的语音克隆与滥用。
+            融合语义防护与 Identity 身份防护的双重机制，在保证听感质量的同时干扰语音理解与声音身份建模，有效抵御非授权的语音克隆与滥用。
           </p>
           <div className="mt-7 flex gap-4">
             <Link to="/workspace" className="cyan-button inline-flex h-11 min-w-[168px] items-center justify-center gap-2 rounded-[7px] text-[16px] font-black">
@@ -147,7 +147,7 @@ export function HomePage() {
           </div>
           <div className="space-y-2 text-[13px] leading-5 text-slate-300">
             {[
-              '提出语义与 Feature 特征双重防护框架，兼顾安全与可用',
+              '提出语义与 Identity 身份双重防护框架，兼顾安全与可用',
               '引入心理声学约束，扰动不可感知，听感友好',
               '在多种下游系统上实现显著性能劣化与迁移鲁棒',
               '高效优化与工程实现，支持快速接入与大规模应用',

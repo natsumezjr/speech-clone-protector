@@ -95,7 +95,7 @@ function modeLabel(task: HistoryTask) {
 function ParamModal({ task, onClose }: { task: HistoryTask; onClose: () => void }) {
   const rows = [
     ['weightSemantic', task.parameters?.weightSemantic],
-    ['weightFeature', task.parameters?.weightFeature],
+    ['weightIdentity', task.parameters?.weightIdentity ?? task.parameters?.weightFeature],
     ['weightPsy', task.parameters?.weightPsy],
     ['weightL2', task.parameters?.weightL2],
   ]

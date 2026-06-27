@@ -39,7 +39,8 @@ def parse_args():
     parser.add_argument("--no_wavlm", action="store_true", help="Disable WavLM timbre encoder.")
     parser.add_argument("--no_cosyvoice", action="store_true", help="Disable CosyVoice CAM++ timbre encoder.")
     parser.add_argument("--no_style", action="store_true", help="Disable StyleTTS2 style encoder.")
-    parser.add_argument("--weight_feature", type=float, default=500.0)
+    parser.add_argument("--weight_identity", type=float, default=None, help="Identity loss weight. Defaults to --weight_feature for legacy compatibility.")
+    parser.add_argument("--weight_feature", type=float, default=500.0, help="Deprecated legacy alias for --weight_identity.")
     parser.add_argument("--weight_semantic", type=float, default=100.0)
     parser.add_argument("--weight_psy", type=float, default=1.0e-5)
     parser.add_argument("--weight_l2", type=float, default=0.1)
@@ -73,6 +74,7 @@ def main():
         use_wavlm=not args.no_wavlm,
         use_cosyvoice=not args.no_cosyvoice,
         use_style=not args.no_style,
+        weight_identity=args.weight_identity if args.weight_identity is not None else args.weight_feature,
         weight_feature=args.weight_feature,
         weight_semantic=args.weight_semantic,
         weight_psy=args.weight_psy,

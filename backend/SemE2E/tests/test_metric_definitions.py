@@ -90,6 +90,24 @@ class MetricDefinitionsTest(unittest.TestCase):
             self.assertEqual(result["clippingRate"], 0.25)
             self.assertIsNotNone(result["snr"])
 
+    def test_asr_edit_rates_and_error_shares_use_separate_denominators(self) -> None:
+        result = metrics.compute_asr_metrics(
+            "alpha beta gamma delta",
+            "alpha theta gamma extra delta",
+            language="en",
+            model="fake-asr",
+        )
+
+        counts = result["editCounts"]
+        shares = result["errorShares"]
+        self.assertEqual(counts["referenceLength"], 4)
+        self.assertEqual(counts["substitutions"], 1)
+        self.assertEqual(counts["insertions"], 1)
+        self.assertEqual(counts["deletions"], 0)
+        self.assertEqual(counts["totalErrors"], 2)
+        self.assertTrue(math.isclose(result["substituteRate"] + result["insertRate"] + result["deleteRate"], result["wer"], rel_tol=1e-6))
+        self.assertTrue(math.isclose(shares["substituteShare"] + shares["insertShare"] + shares["deleteShare"], 1.0, rel_tol=1e-6))
+
     def test_quality_dependency_missing_returns_null_and_reason(self) -> None:
         def fake_module_available(name: str) -> bool:
             return False if name in {"pesq", "pystoi"} else True
@@ -107,7 +125,7 @@ class MetricDefinitionsTest(unittest.TestCase):
         self.assertTrue(result["_metricSources"]["protectionQuality.pesq"]["reason"])
         self.assertTrue(result["_metricSources"]["protectionQuality.stoi"]["reason"])
 
-    def test_semantic_token_metrics_do_not_use_mfcc_for_token_rates(self) -> None:
+    def test_semantic_drift_requires_semantic_encoder_ensemble(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             clean_path = root / "clean.wav"
@@ -115,34 +133,15 @@ class MetricDefinitionsTest(unittest.TestCase):
             write_wav(clean_path, np.sin(np.linspace(0, 1, 320)).astype(np.float32))
             write_wav(protected_path, np.sin(np.linspace(0, 1, 320)).astype(np.float32) * 0.9)
 
-            fake_librosa = SimpleNamespace(
-                load=lambda path, sr=16000: (np.ones(320, dtype=np.float32), sr),
-                feature=SimpleNamespace(mfcc=lambda y, sr, n_mfcc: np.tile(np.linspace(0.0, 1.0, n_mfcc)[:, None], (1, 4))),
-            )
-            old_env = {
-                "SEME2E_ENABLE_MFCC": os.environ.get("SEME2E_ENABLE_MFCC"),
-                "SEME2E_ENABLE_TOKENIZER": os.environ.get("SEME2E_ENABLE_TOKENIZER"),
-                "SEME2E_ENABLE_SEMANTIC_ENCODERS": os.environ.get("SEME2E_ENABLE_SEMANTIC_ENCODERS"),
-            }
-            try:
-                os.environ["SEME2E_ENABLE_MFCC"] = "1"
-                os.environ["SEME2E_ENABLE_TOKENIZER"] = "0"
-                os.environ["SEME2E_ENABLE_SEMANTIC_ENCODERS"] = "0"
-                with mock.patch.dict(sys.modules, {"librosa": fake_librosa}):
-                    result = metrics.compute_semantic_token_metrics(clean_path, protected_path, {})
-            finally:
-                for key, value in old_env.items():
-                    if value is None:
-                        os.environ.pop(key, None)
-                    else:
-                        os.environ[key] = value
+            with mock.patch.dict(os.environ, {"SEME2E_ENABLE_TOKENIZER": "0", "SEME2E_ENABLE_SEMANTIC_ENCODERS": "0"}, clear=False):
+                result = metrics.compute_semantic_token_metrics(clean_path, protected_path, {})
 
-        self.assertIsNotNone(result["semanticDrift"])
+        self.assertIsNone(result["semanticDrift"])
         self.assertIsNone(result["tokenChangeRate"])
         self.assertIsNone(result["tokenErrorRate"])
-        self.assertEqual(result["_metricSources"]["asrEval.semanticDrift"]["source"], "mfcc_proxy")
+        self.assertEqual(result["_metricSources"]["asrEval.semanticDrift"]["source"], "SemanticEncoderEnsemble")
 
-    def test_semantic_drift_averages_selected_semantic_encoders(self) -> None:
+    def test_semantic_drift_uses_weighted_framewise_cosine_across_encoders(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             clean_path = root / "clean.wav"
@@ -186,14 +185,69 @@ class MetricDefinitionsTest(unittest.TestCase):
                         result = metrics.compute_semantic_token_metrics(
                             clean_path,
                             protected_path,
-                            {"encoders": ["S3", "Whisper"]},
+                            {
+                                "encoders": ["S3", "HuBERT", "Whisper", "MFCC"],
+                                "encoderWeights": {"S3": 2.0, "HuBERT": 1.0, "Whisper": 1.0, "MFCC": 1.0},
+                            },
                         )
 
-        self.assertEqual([item["encoder"] for item in result["encoderDistances"]], ["S3", "Whisper"])
-        self.assertTrue(math.isclose(result["semanticDrift"], 1.0, rel_tol=1e-6))
+        self.assertEqual([item["encoder"] for item in result["encoderDistances"]], ["S3", "HuBERT", "Whisper", "MFCC"])
+        self.assertEqual([item["weight"] for item in result["encoderDistances"]], [2.0, 1.0, 1.0, 1.0])
+        self.assertTrue(math.isclose(result["semanticDrift"], 0.6, rel_tol=1e-6))
+        self.assertTrue(math.isclose(result["semanticCosineWeightedSum"], 2.0, rel_tol=1e-6))
+        self.assertTrue(math.isclose(result["semanticWeightedCosine"], 0.4, rel_tol=1e-6))
+        self.assertTrue(math.isclose(result["semanticWeightSum"], 5.0, rel_tol=1e-6))
         self.assertEqual(result["_metricSources"]["asrEval.semanticDrift"]["source"], "SemanticEncoderEnsemble")
+        self.assertIn("sum_k(w_k", result["_metricSources"]["asrEval.semanticDrift"]["formula"])
 
-    def test_selected_non_mfcc_semantic_encoders_do_not_fallback_to_mfcc_proxy(self) -> None:
+    def test_default_hubert_model_prefers_cached_fallback(self) -> None:
+        def fake_cached(model_id: str) -> bool:
+            return model_id == "facebook/hubert-large-ls960-ft"
+
+        with mock.patch.object(metrics, "_hf_model_is_cached", side_effect=fake_cached):
+            self.assertEqual(metrics._default_hubert_model(), "facebook/hubert-large-ls960-ft")
+
+    def test_semantic_model_resolution_prefers_existing_local_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            local_model = Path(tmp) / "openai-whisper-small"
+            local_model.mkdir()
+
+            with mock.patch.object(metrics, "_hf_model_is_cached", return_value=True):
+                resolved = metrics._resolve_hf_or_local_model("openai/whisper-small", [str(local_model)])
+
+        self.assertEqual(resolved, str(local_model.resolve()))
+
+    def test_semantic_audio_loader_reads_wav_without_torchcodec(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wav_path = Path(tmp) / "audio.wav"
+            samples = np.sin(np.linspace(0, 1, 320)).astype(np.float32)
+            write_wav(wav_path, samples)
+
+            audio, sr = metrics._load_audio_without_torchcodec(wav_path)
+
+        self.assertEqual(sr, 16000)
+        self.assertEqual(audio.ndim, 1)
+        self.assertGreater(audio.size, 0)
+
+    def test_semantic_encoder_load_error_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clean_path = root / "clean.wav"
+            protected_path = root / "protected.wav"
+            write_wav(clean_path, np.zeros(160, dtype=np.float32))
+            write_wav(protected_path, np.zeros(160, dtype=np.float32))
+
+            with mock.patch.dict(os.environ, {"SEME2E_ENABLE_TOKENIZER": "0", "SEME2E_ENABLE_SEMANTIC_ENCODERS": "1"}, clear=False):
+                with mock.patch.object(metrics, "_load_semantic_encoder_ensemble", return_value=None):
+                    with mock.patch.object(metrics, "_SEMANTIC_ENCODER_LAST_ERROR", "OSError: HuBERT model is not in local cache and Hub is unavailable"):
+                        result = metrics.compute_semantic_token_metrics(clean_path, protected_path, {})
+
+        source = result["_metricSources"]["asrEval.semanticDrift"]
+        self.assertIsNone(result["semanticDrift"])
+        self.assertEqual(source["status"], "error")
+        self.assertIn("HuBERT model", source["reason"])
+
+    def test_selected_semantic_encoders_require_semantic_encoder_ensemble(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             clean_path = root / "clean.wav"
@@ -214,8 +268,8 @@ class MetricDefinitionsTest(unittest.TestCase):
                     )
 
         self.assertIsNone(result["semanticDrift"])
-        self.assertEqual(result["_metricSources"]["asrEval.semanticDrift"]["source"], "semantic_encoder")
-        self.assertIn("SemanticEncoderEnsemble unavailable", result["_metricSources"]["asrEval.semanticDrift"]["reason"])
+        self.assertEqual(result["_metricSources"]["asrEval.semanticDrift"]["source"], "SemanticEncoderEnsemble")
+        self.assertIn("SEME2E_ENABLE_SEMANTIC_ENCODERS=1", result["_metricSources"]["asrEval.semanticDrift"]["reason"])
 
     def test_direct_speaker_metrics_without_model_returns_null_reason(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -302,10 +356,37 @@ class MetricDefinitionsTest(unittest.TestCase):
             self.assertIsNone(result["cloneConfidenceAfter"])
             self.assertIsNone(result["cloneConfidenceDropRate"])
             self.assertIsNone(result["cloneTrend"])
-            self.assertEqual([item["name"] for item in result["cloneRadar"]], ["直接声纹偏移", "克隆相似度下降", "嵌入距离增加", "保护后克隆防护", "克隆置信度下降"])
+            self.assertEqual([item["name"] for item in result["cloneRadar"]], ["直接声纹偏移", "相似度下降", "嵌入距离增加", "保护后克隆防护"])
             self.assertTrue(math.isclose(result["cloneRadar"][0]["value"], 40.0, rel_tol=1e-6))
-            self.assertIsNone(result["cloneRadar"][-1]["value"])
-            self.assertEqual(result["cloneRadar"][-1]["status"], "unavailable")
+            self.assertEqual(result["cloneRadar"][1]["rawMetricKeys"], ["originalSimilarity", "protectedSimilarity", "similarityDropRate"])
+            self.assertEqual(result["cloneRadar"][1]["formula"], "100*clip(similarityDropRate/0.5,0,1)")
+
+    def test_clone_eval_keeps_negative_similarity_and_distance_above_one(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = root / "original.wav"
+            original_clone = root / "original_clone.wav"
+            protected_clone = root / "protected_clone.wav"
+            write_wav(original, np.zeros(160, dtype=np.float32))
+            write_wav(original_clone, np.zeros(160, dtype=np.float32))
+            write_wav(protected_clone, np.zeros(160, dtype=np.float32))
+
+            class FakeSpeaker:
+                def score(self, reference_audio: Path, candidate_audio: Path) -> float:
+                    return 0.458 if Path(candidate_audio) == original_clone else -0.035
+
+            result = metrics.compute_clone_eval(
+                original,
+                original_clone,
+                protected_clone,
+                {"request": {"model": "fake-tts"}},
+                speaker_model=FakeSpeaker(),
+            )
+
+        self.assertTrue(math.isclose(result["originalSimilarity"], 0.458, rel_tol=1e-6))
+        self.assertTrue(math.isclose(result["protectedSimilarity"], -0.035, rel_tol=1e-6))
+        self.assertTrue(math.isclose(result["similarityDropRate"], (0.458 - (-0.035)) / 0.458, rel_tol=1e-6))
+        self.assertTrue(math.isclose(result["embeddingDistanceAfter"], 1.035, rel_tol=1e-6))
 
     def test_clone_eval_metric_sources_use_ecapa_model_without_confidence_calibrator(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -481,7 +562,9 @@ class MetricDefinitionsTest(unittest.TestCase):
 
         self.assertEqual(frontend["generation"]["optimizationTrace"][0]["stepElapsedSec"], 0.25)
         self.assertEqual(frontend["generation"]["optimizationTrace"][0]["snr"], 20.0)
+        self.assertEqual(frontend["generation"]["optimizationTrace"][0]["Lid"], 0.1)
         self.assertEqual(frontend["lossFinal"]["total"], 1.0)
+        self.assertEqual(frontend["lossFinal"]["Lid"], 0.1)
         self.assertEqual(frontend["lossFinal"]["snr"], 20.0)
         self.assertEqual(frontend["averageStepSec"], 0.25)
 

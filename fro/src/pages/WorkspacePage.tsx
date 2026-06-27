@@ -556,11 +556,12 @@ function StrategyConfigCard({
   const applyPreset = (mode: Exclude<ProtectionMode, 'joint'>, config: ProtectionRuntimeConfig) => {
     const defaults = config.defaults
     const ranges = config.ranges
+    const identityRange = ranges.weightIdentity ?? ranges.weightFeature
     const preset = config.modePresets?.[mode]
     setEpsilon(numericFromPreset(preset?.optimization?.epsilon, defaults.optimization.epsilon, ranges.epsilon))
     setSteps(Math.max(1, Math.round(numericFromPreset(preset?.optimization?.steps, defaults.optimization.steps, ranges.steps))))
     setLambdaSem(numericFromPreset(preset?.semantic?.weightSemantic, defaults.semantic.weightSemantic ?? ranges.weightSemantic.min, ranges.weightSemantic))
-    setLambdaFeat(numericFromPreset(preset?.timbre?.weightFeature, defaults.timbre.weightFeature ?? ranges.weightFeature.min, ranges.weightFeature))
+    setLambdaFeat(numericFromPreset(preset?.timbre?.weightIdentity ?? preset?.timbre?.weightFeature, defaults.timbre.weightIdentity ?? defaults.timbre.weightFeature ?? identityRange.min, identityRange))
     setLambdaPsy(numericFromPreset(preset?.psychoacoustic?.weightPsy, defaults.psychoacoustic.weightPsy ?? ranges.weightPsy.min, ranges.weightPsy))
     setLambdaL2(numericFromPreset(preset?.optimization?.weightL2 ?? defaults.optimization.weightL2, defaults.optimization.weightL2 ?? ranges.weightL2.min, ranges.weightL2))
   }
@@ -616,7 +617,7 @@ function StrategyConfigCard({
   const epsilonRange = runtimeConfig.ranges.epsilon
   const stepsRange = runtimeConfig.ranges.steps
   const lambdaSemRange = runtimeConfig.ranges.weightSemantic
-  const lambdaFeatRange = runtimeConfig.ranges.weightFeature
+  const lambdaFeatRange = runtimeConfig.ranges.weightIdentity ?? runtimeConfig.ranges.weightFeature
   const lambdaPsyRange = runtimeConfig.ranges.weightPsy
   const lambdaL2Range = runtimeConfig.ranges.weightL2
   const semanticOptionItems = optionItems(runtimeConfig.formSchema?.modelOptions?.semanticEncoders ?? runtimeConfig.models.semantic)
@@ -690,7 +691,13 @@ function StrategyConfigCard({
         whisperPath: runtimeConfig.defaults.semantic.whisperPath,
         weightSemantic: clampToRange(lambdaSem, lambdaSemRange),
       },
-      timbre: { enabled: featureEnabled, mode: 'untargeted', encoders: safeFeatureModels, weightFeature: clampToRange(lambdaFeat, lambdaFeatRange) },
+      timbre: {
+        enabled: featureEnabled,
+        mode: 'untargeted',
+        encoders: safeFeatureModels,
+        weightIdentity: clampToRange(lambdaFeat, lambdaFeatRange),
+        weightFeature: clampToRange(lambdaFeat, lambdaFeatRange),
+      },
       psychoacoustic: { enabled: true, weightPsy: clampToRange(lambdaPsy, lambdaPsyRange) },
       optimization: { epsilon: clampToRange(epsilon, epsilonRange), steps: safeSteps, weightL2: clampToRange(lambdaL2, lambdaL2Range) },
     }
@@ -769,7 +776,7 @@ function StrategyConfigCard({
         </div>
         <div className="mt-5 grid grid-cols-1 gap-2.5 min-[1460px]:grid-cols-2">
           <ModelSelectSummary label="语义编码器" values={selectedSemanticEncoders} options={semanticOptionItems} onOpen={openModelModal} />
-          <ModelSelectSummary label="特征编码器" values={selectedFeatureModels} options={featureOptionItems} onOpen={openModelModal} />
+          <ModelSelectSummary label="身份编码器" values={selectedFeatureModels} options={featureOptionItems} onOpen={openModelModal} />
         </div>
         <button
           type="button"
@@ -782,7 +789,7 @@ function StrategyConfigCard({
         <div className="mt-5 rounded-[7px] border border-cyan-300/16 bg-sky-400/10 p-3 text-[12px] leading-5 text-slate-300">
           <p className="font-bold text-cyan-200">参数说明</p>
           <p>
-            <MathTerm>ε</MathTerm> 控制保护扰动的最大幅度，Steps 控制优化迭代次数；lamda 权重在高级选项弹窗中调节。建议先保持默认权重，再根据语义扰动、Feature 相似度与听感质量进行微调。
+            <MathTerm>ε</MathTerm> 控制保护扰动的最大幅度，Steps 控制优化迭代次数；lamda 权重在高级选项弹窗中调节。建议先保持默认权重，再根据语义扰动、身份相似度与听感质量进行微调。
           </p>
         </div>
       </ConfigBlock>
@@ -824,7 +831,7 @@ function StrategyConfigCard({
             </div>
             <div className="space-y-4">
               <SliderRow label={<LambdaLabel name="sem" text="语义权重" />} labelText="lambda sem 语义权重" value={formatParameterValue(lambdaSem, lambdaSemRange)} pct={pctFromRange(lambdaSem, lambdaSemRange)} min={lambdaSemRange.min} max={lambdaSemRange.max} step={lambdaSemRange.step} numericValue={lambdaSem} onChange={updateNumber(setLambdaSem)} />
-              <SliderRow label={<LambdaLabel name="feat" text="Feature 权重" />} labelText="lambda feat Feature 权重" value={formatParameterValue(lambdaFeat, lambdaFeatRange)} pct={pctFromRange(lambdaFeat, lambdaFeatRange)} min={lambdaFeatRange.min} max={lambdaFeatRange.max} step={lambdaFeatRange.step} numericValue={lambdaFeat} onChange={updateNumber(setLambdaFeat)} />
+              <SliderRow label={<LambdaLabel name="id" text="Identity 权重" />} labelText="lambda id Identity 权重" value={formatParameterValue(lambdaFeat, lambdaFeatRange)} pct={pctFromRange(lambdaFeat, lambdaFeatRange)} min={lambdaFeatRange.min} max={lambdaFeatRange.max} step={lambdaFeatRange.step} numericValue={lambdaFeat} onChange={updateNumber(setLambdaFeat)} />
               <SliderRow label={<LambdaLabel name="psy" text="听感约束" />} labelText="lambda psy 听感约束" value={formatScientificParameterValue(lambdaPsy)} pct={pctFromRange(lambdaPsy, lambdaPsyRange)} min={lambdaPsyRange.min} max={lambdaPsyRange.max} step={lambdaPsyRange.step} numericValue={lambdaPsy} onChange={updateNumber(setLambdaPsy)} />
               <SliderRow label={<LambdaLabel name="2" text="L2 正则" />} labelText="lambda 2 L2 正则" value={formatParameterValue(lambdaL2, lambdaL2Range)} pct={pctFromRange(lambdaL2, lambdaL2Range)} min={lambdaL2Range.min} max={lambdaL2Range.max} step={lambdaL2Range.step} numericValue={lambdaL2} onChange={updateNumber(setLambdaL2)} />
             </div>
@@ -873,7 +880,7 @@ function ArchitectureCard() {
         </div>
         <div className="mt-8 grid grid-cols-3 gap-3">
           <Branch title="语义分支" color="green" items={['语义理解模型', '多模型语义编码', '表示空间约束', '...']} />
-          <Branch title="Feature 分支" color="blue" items={['Feature Encoder', '声学特征约束', '说话人不可恢复', '...']} />
+          <Branch title="Identity 分支" color="blue" items={['Identity Encoder', '声音身份约束', '说话人不可恢复', '...']} />
           <Branch title="听感约束" color="purple" items={['心理声学模型', '掩蔽阈值建模', '听感优化', '...']} />
         </div>
         <div className="mt-6 rounded-[7px] border border-cyan-300/20 bg-sky-400/10 p-4 text-center text-sm text-slate-300">
@@ -891,8 +898,8 @@ function ArchitectureCard() {
               <LossTerm formula="L_{\mathrm{sem}}" title="语义损失">
                 拉开原始音频与保护音频在语义编码器或 speech tokenizer 表示空间中的距离，降低 ASR / LLM 对语音内容的稳定理解。
               </LossTerm>
-              <LossTerm formula="L_{\mathrm{feat}}" title="特征/音色损失">
-                扰动说话人相关特征，使攻击者更难从保护音频中恢复原说话人的音色表示。
+              <LossTerm formula="L_{\mathrm{id}}" title="声音身份损失">
+                扰动说话人身份相关表示，使攻击者更难从保护音频中恢复原说话人的声音身份。
               </LossTerm>
               <LossTerm formula="L_{\mathrm{psy}}" title="心理声学损失">
                 约束扰动尽量落在人耳不敏感或可被原语音掩蔽的区域，降低可感知噪声。
@@ -1087,7 +1094,7 @@ function LambdaLabel({ name, text }: { name: string; text: string }) {
 function OptimizationFormula({ className }: { className?: string }) {
   return (
     <MathText
-      formula="L = \lambda_{\mathrm{sem}} L_{\mathrm{sem}} + \lambda_{\mathrm{feat}} L_{\mathrm{feat}} + \lambda_{\mathrm{psy}} L_{\mathrm{psy}} + \lambda_{2}\lVert \delta \rVert_{2}"
+      formula="L = \lambda_{\mathrm{id}} L_{\mathrm{id}} + \lambda_{\mathrm{sem}} L_{\mathrm{sem}} + \lambda_{\mathrm{psy}} L_{\mathrm{psy}} + \lambda_{2}\lVert \delta \rVert_{2}"
       className={cn('text-slate-100', className)}
     />
   )
@@ -1157,7 +1164,7 @@ function ModelConfigModal({
         </div>
         <div className="grid gap-4 md:grid-cols-2">
           <MultiChoiceGroup title="语义编码器" values={semanticValues} options={semanticOptions} onToggle={onToggleSemantic} onSelectAll={onSelectAllSemantic} />
-          <MultiChoiceGroup title="特征编码器" values={featureValues} options={featureOptions} onToggle={onToggleFeature} onSelectAll={onSelectAllFeature} />
+          <MultiChoiceGroup title="身份编码器" values={featureValues} options={featureOptions} onToggle={onToggleFeature} onSelectAll={onSelectAllFeature} />
         </div>
         <div className="mt-5 flex justify-end">
           <button type="button" onClick={onClose} className="cyan-button h-10 min-w-[116px] rounded-[7px] text-sm font-black">
