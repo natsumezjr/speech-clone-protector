@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+
+CST = timezone(timedelta(hours=8))
 
 MetricValue = int | float | None
 
 
 def utc_now_iso() -> str:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(CST)
     return f"{now.year}.{now.month}.{now.day} {now.hour:02d}:{now.minute:02d}:{now.second:02d}"
 
 
@@ -21,6 +23,7 @@ def empty_primary_metrics() -> dict[str, MetricValue]:
     return {
         "wer": None,
         "cer": None,
+        "tokenChangeRate": None,
         "tokenErrorRate": None,
         "semanticDrift": None,
         "speakerSimilarity": None,
@@ -55,6 +58,7 @@ def empty_details() -> dict[str, Any]:
             "status": "unavailable",
         },
         "semantic": {
+            "tokenChangeRate": None,
             "tokenErrorRate": None,
             "tokenChangeCount": None,
             "tokenTotal": None,
@@ -109,6 +113,11 @@ def empty_details() -> dict[str, Any]:
         },
         "speaker": {
             "metric": None,
+            "simBefore": None,
+            "simAfter": None,
+            "simDropRate": None,
+            "embeddingDistanceBefore": None,
+            "embeddingDistanceAfter": None,
             "simOriginalProtected": None,
             "embeddingDistance": None,
             "status": "unavailable",
@@ -133,6 +142,27 @@ def empty_details() -> dict[str, Any]:
             "ttsWer": None,
             "status": "unavailable",
             "source": "evaluate_tts.py",
+        },
+        "cloneEval": {
+            "cloneModel": None,
+            "speakerEvalModel": None,
+            "targetText": None,
+            "originalCloneAudio": None,
+            "protectedCloneAudio": None,
+            "directSimilarity": None,
+            "originalSimilarity": None,
+            "protectedSimilarity": None,
+            "similarityDropRate": None,
+            "embeddingDistanceBefore": None,
+            "embeddingDistanceAfter": None,
+            "embeddingDistanceIncreaseRate": None,
+            "cloneConfidenceBefore": None,
+            "cloneConfidenceAfter": None,
+            "cloneConfidenceDropRate": None,
+            "cloneRadar": None,
+            "cloneTrend": None,
+            "cloneDefenseScore": None,
+            "status": "unavailable",
         },
         "robustness": {},
     }

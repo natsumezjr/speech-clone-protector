@@ -57,6 +57,24 @@ function firstString(record: Record<string, unknown>, keys: string[]) {
   return typeof value === 'string' && value.length > 0 ? value : null
 }
 
+function normalizeRadarPoints(value: unknown): NonNullable<TaskResult['cloneEval']>['cloneRadar'] {
+  if (!Array.isArray(value)) return null
+  return value
+    .map((item, index) => {
+      const record = asRecord(item)
+      const name = firstString(record, ['name', 'label']) ?? `指标 ${index + 1}`
+      const status = firstString(record, ['status']) ?? undefined
+      const reason = firstString(record, ['reason'])
+      return {
+        name,
+        value: numberOrNull(record.value),
+        status,
+        reason,
+      }
+    })
+    .filter((item) => item.name.length > 0)
+}
+
 function parseDateMs(value: unknown) {
   if (typeof value !== 'string' || value.length === 0) return null
   const iso = Date.parse(value)
@@ -88,6 +106,7 @@ function normalizeLossTrendPoint(value: unknown, fallbackStep: number): TaskResu
     Lpsy: firstNumber(point, ['Lpsy', 'lPsy', 'lossPsy', 'loss_psy', 'L_psy']),
     L2: firstNumber(point, ['L2', 'l2', 'lossL2', 'loss_l2', 'l2Norm']),
     total: firstNumber(point, ['total', 'totalLoss', 'lossTotal', 'loss_total']),
+    snr: firstNumber(point, ['snr', 'SNR']),
     stepElapsedSec: firstNumber(point, ['stepElapsedSec', 'step_elapsed_sec', 'elapsedSec', 'elapsed']),
   }
   const hasLoss = [normalized.Lfeat, normalized.Lsem, normalized.Lpsy, normalized.L2, normalized.total].some((item) => item !== null)
@@ -129,6 +148,7 @@ function normalizeLossFinal(value: unknown): NonNullable<TaskResult['generation'
     Lpsy: firstNumber(record, ['Lpsy', 'lPsy', 'lossPsy', 'loss_psy', 'L_psy']),
     L2: firstNumber(record, ['L2', 'l2', 'lossL2', 'loss_l2', 'l2Norm']),
     total: firstNumber(record, ['total', 'totalLoss', 'lossTotal', 'loss_total']),
+    snr: firstNumber(record, ['snr', 'SNR']),
   }
 }
 
@@ -285,10 +305,12 @@ function normalizeCloneEval(value: unknown): TaskResult['cloneEval'] {
     cloneConfidenceBefore: firstNumber(data, ['cloneConfidenceBefore', 'confidenceBefore']),
     cloneConfidenceAfter: firstNumber(data, ['cloneConfidenceAfter', 'confidenceAfter']),
     cloneConfidenceDropRate: firstNumber(data, ['cloneConfidenceDropRate', 'confidenceDropRate']),
-    cloneRadar: Array.isArray(data.cloneRadar) ? (data.cloneRadar as NonNullable<TaskResult['cloneEval']>['cloneRadar']) : null,
-    cloneTrend: Array.isArray(data.cloneTrend) ? (data.cloneTrend as NonNullable<TaskResult['cloneEval']>['cloneTrend']) : null,
+    cloneRadar: normalizeRadarPoints(data.cloneRadar),
+    cloneTrend: null,
     cloneDefenseScore: firstNumber(data, ['cloneDefenseScore', 'clone_defense_score']),
     createdAt: firstString(data, ['createdAt', 'created_at']),
+    status: firstString(data, ['status']),
+    reason: firstString(data, ['reason', 'error']),
   }
 }
 
@@ -338,9 +360,12 @@ function normalizeTaskResult(payload: unknown): TaskResult {
       lossFinal: normalizeLossFinal(data.lossFinal ?? generation.lossFinal),
       lossWeights: normalizeLossWeights(data.lossWeights ?? generation.lossWeights),
       optimizationTrace: optimizationTrend,
-      averageStepSec: firstNumber(data, ['averageStepSec', 'average_step_sec']),
+      averageStepSec: firstNumber(data, ['averageStepSec', 'average_step_sec']) ?? firstNumber(generation, ['averageStepSec', 'average_step_sec']),
       asrEval,
       cloneEval: latestCloneEval,
+      speakerFeatureMap: {
+        radar: normalizeRadarPoints(asRecord(data.speakerFeatureMap).radar ?? asRecord(details.speakerFeatureMap).radar),
+      },
       generation: {
         ...(asRecord(data.generation) as NonNullable<TaskResult['generation']>),
         lossFinal: normalizeLossFinal(generation.lossFinal),
@@ -359,6 +384,7 @@ function normalizeTaskResult(payload: unknown): TaskResult {
         radarBefore: Array.isArray(charts.radarBefore) ? charts.radarBefore as number[] : undefined,
         radarAfter: Array.isArray(charts.radarAfter) ? charts.radarAfter as number[] : undefined,
         chainRadar: Array.isArray(charts.chainRadar) ? charts.chainRadar as TaskResult['charts']['chainRadar'] : [],
+        speakerRadar: normalizeRadarPoints(charts.speakerRadar),
       },
       cloneResults,
     }
@@ -371,7 +397,6 @@ function normalizeTaskResult(payload: unknown): TaskResult {
   const detailAsr = asRecord(details.asr)
   const detailSpeaker = asRecord(details.speaker)
   const detailGeneration = asRecord(details.generation)
-  const detailSemantic = asRecord(details.semantic)
   const backend = asRecord(data.backend)
   const charts = asRecord(data.charts)
   const optimizationTrend = normalizeLossTrend(charts.optimizationTrend ?? detailGeneration.optimizationTrace ?? charts.trend)
@@ -381,8 +406,8 @@ function normalizeTaskResult(payload: unknown): TaskResult {
   const score = numberOrNull(summary.score)
   const snr = numberOrNull(primary.snr)
   const pesq = numberOrNull(primary.pesq)
-  const simAfter = numberOrNull(primary.speakerSimilarity ?? detailSpeaker.simOriginalProtected)
-  const simBefore = null
+  const simAfter = numberOrNull(primary.speakerSimilarity) ?? firstNumber(detailSpeaker, ['simAfter', 'simOriginalProtected'])
+  const simBefore = firstNumber(detailSpeaker, ['simBefore'])
   const originalText = optionalString(detailAsr.referenceText ?? detailAsr.cleanTranscription)
   const protectedText = optionalString(detailAsr.protectedTranscription)
   const cloneResults = Array.isArray(data.cloneResults) ? data.cloneResults.map(normalizeCloneResult) : undefined
@@ -390,6 +415,7 @@ function normalizeTaskResult(payload: unknown): TaskResult {
   const lossWeights = normalizeLossWeights(detailGeneration.lossWeights)
   const elapsedSec = normalizeElapsedSec(data)
   const asrEval = normalizeAsrEval(detailAsr)
+  const asrHasResult = asrEval !== null
   const cloneEval = normalizeCloneEval(data.cloneEval) ?? cloneResults?.at(-1)?.cloneEval ?? null
   const perturbation = normalizePerturbation({
     ...asRecord(details.perception),
@@ -440,29 +466,34 @@ function normalizeTaskResult(payload: unknown): TaskResult {
     lossFinal,
     lossWeights,
     optimizationTrace: optimizationTrend,
-    averageStepSec: firstNumber(data, ['averageStepSec', 'average_step_sec']) ?? null,
+    averageStepSec: firstNumber(data, ['averageStepSec', 'average_step_sec']) ?? firstNumber(detailGeneration, ['averageStepSec', 'average_step_sec']) ?? null,
     asrEval,
     cloneEval,
     cloneResults,
+    speakerFeatureMap: {
+      radar: normalizeRadarPoints(asRecord(data.speakerFeatureMap).radar ?? asRecord(details.speakerFeatureMap).radar),
+    },
     asr: {
-      originalText,
-      protectedText,
-      wer: optionalNumber(primary.wer) ?? optionalNumber(detailAsr.wer),
-      cer: optionalNumber(primary.cer) ?? optionalNumber(detailAsr.cer),
-      tokenErrorRate: optionalNumber(primary.tokenErrorRate) ?? optionalNumber(detailSemantic.tokenErrorRate),
-      semanticDrift: optionalNumber(primary.semanticDrift) ?? optionalNumber(detailSemantic.semanticDrift),
-      insertRate: optionalNumber(asRecord(detailAsr.breakdown).insertRate),
-      deleteRate: optionalNumber(asRecord(detailAsr.breakdown).deleteRate),
-      substituteRate: optionalNumber(asRecord(detailAsr.breakdown).substituteRate),
+      originalText: asrHasResult ? originalText : null,
+      protectedText: asrHasResult ? protectedText : null,
+      wer: asrHasResult ? optionalNumber(primary.wer) ?? optionalNumber(detailAsr.wer) : null,
+      cer: asrHasResult ? optionalNumber(primary.cer) ?? optionalNumber(detailAsr.cer) : null,
+      tokenErrorRate: asrHasResult ? optionalNumber(detailAsr.tokenErrorRate) ?? optionalNumber(primary.tokenErrorRate) : null,
+      semanticDrift: asrHasResult ? optionalNumber(detailAsr.semanticDrift) ?? optionalNumber(primary.semanticDrift) : null,
+      insertRate: asrHasResult ? optionalNumber(asRecord(detailAsr.breakdown).insertRate) : null,
+      deleteRate: asrHasResult ? optionalNumber(asRecord(detailAsr.breakdown).deleteRate) : null,
+      substituteRate: asrHasResult ? optionalNumber(asRecord(detailAsr.breakdown).substituteRate) : null,
       status: typeof detailAsr.status === 'string' ? detailAsr.status : undefined,
     },
     speaker: {
       simBefore,
       simAfter,
-      simDropRate: optionalNumber(asRecord(details.downstreamTts).simDropRate),
-      embeddingDistanceBefore: null,
-      embeddingDistanceAfter: optionalNumber(detailSpeaker.embeddingDistance),
-      source: typeof asRecord(metricSources.speakerSimilarity).source === 'string' ? asRecord(metricSources.speakerSimilarity).source as string : undefined,
+      simDropRate: firstNumber(detailSpeaker, ['simDropRate']) ?? optionalNumber(asRecord(details.downstreamTts).simDropRate),
+      embeddingDistanceBefore: firstNumber(detailSpeaker, ['embeddingDistanceBefore']),
+      embeddingDistanceAfter: firstNumber(detailSpeaker, ['embeddingDistanceAfter', 'embeddingDistance']),
+      simOriginalProtected: firstNumber(detailSpeaker, ['simOriginalProtected', 'simAfter']),
+      embeddingDistance: firstNumber(detailSpeaker, ['embeddingDistance', 'embeddingDistanceAfter']),
+      source: typeof asRecord(metricSources['speaker.*']).source === 'string' ? asRecord(metricSources['speaker.*']).source as string : undefined,
       status: typeof detailSpeaker.status === 'string' ? detailSpeaker.status : undefined,
     },
     quality: {
@@ -491,6 +522,7 @@ function normalizeTaskResult(payload: unknown): TaskResult {
       radarBefore: Array.isArray(charts.radarBefore) ? charts.radarBefore as number[] : undefined,
       radarAfter: Array.isArray(charts.radarAfter) ? charts.radarAfter as number[] : undefined,
       chainRadar: Array.isArray(charts.chainRadar) ? charts.chainRadar as TaskResult['charts']['chainRadar'] : [],
+      speakerRadar: normalizeRadarPoints(charts.speakerRadar),
     },
   }
 }

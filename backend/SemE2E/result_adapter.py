@@ -424,7 +424,7 @@ def runtime_config() -> dict[str, Any]:
         "steps": {"label": "优化步数", "path": "optimization.steps", "default": FORMAL_STEPS, "min": 1, "max": 500, "step": 1, "description": "默认 50，最大 500。"},
         "weightFeature": {"label": "Feature 权重", "path": "timbre.weightFeature", "default": FORMAL_WEIGHT_FEATURE, "min": 0, "max": 1000, "step": 1},
         "weightSemantic": {"label": "Semantic 权重", "path": "semantic.weightSemantic", "default": FORMAL_WEIGHT_SEMANTIC, "min": 0, "max": 500, "step": 1},
-        "weightPsy": {"label": "心理声学权重", "path": "psychoacoustic.weightPsy", "default": FORMAL_WEIGHT_PSY, "min": 0, "max": 0.001, "step": 0.000001},
+        "weightPsy": {"label": "心理声学权重", "path": "psychoacoustic.weightPsy", "default": FORMAL_WEIGHT_PSY, "min": 0, "max": 0.01, "step": 0.000001},
         "weightL2": {"label": "L2 权重", "path": "optimization.weightL2", "default": FORMAL_WEIGHT_L2, "min": 0, "max": 1, "step": 0.01},
     }
     ranges = {
@@ -541,7 +541,10 @@ def diagnose_capabilities() -> dict[str, Any]:
     whisper_available = _module_available("whisper") or _module_available("transformers")
     speaker_available = _module_available("speechbrain")
     pesq_available = _module_available("pesq")
+    stoi_available = _module_available("pystoi")
     tts_available = _module_available("TTS")
+    perception_available = ["snr", "maskingCurve"] + (["pesq"] if pesq_available else []) + (["stoi"] if stoi_available else [])
+    perception_unavailable = ([] if pesq_available else ["pesq"]) + ([] if stoi_available else ["stoi"]) + ["mos", "mosLqo"]
     return {
         "ok": True,
         "device": device,
@@ -567,10 +570,10 @@ def diagnose_capabilities() -> dict[str, Any]:
                 "reason": None if speaker_available else "speaker model dependency speechbrain not installed",
             },
             "perception_eval": {
-                "status": "partial" if not pesq_available else "available",
-                "available": ["snr"] + (["pesq"] if pesq_available else []),
-                "unavailable": ([] if pesq_available else ["pesq"]) + ["mosLqo", "maskingCurve"],
-                "reason": None if pesq_available else "PESQ/MOS-LQO/masking curve evaluators are not installed",
+                "status": "partial",
+                "available": perception_available,
+                "unavailable": perception_unavailable,
+                "reason": "MOS/MOS-LQO require human feedback or a declared calibrated model" if pesq_available and stoi_available else "Install pesq and pystoi to enable objective PESQ/STOI metrics; MOS/MOS-LQO require human feedback or a declared calibrated model",
             },
             "downstream_tts_eval": {
                 "status": "available" if tts_available else "unavailable",
@@ -646,7 +649,7 @@ def _read_weight(config: dict[str, Any], new_key: str, legacy_key: str, default:
         if legacy_key in {"lambdaSemantic", "lambdaTimbre"} and legacy_value < 1:
             warnings.append(f"{legacy_key}={legacy_value} looks like a UI-normalized value; using formal default {default}.")
             return default
-        if legacy_key == "lambdaPsy" and legacy_value > 0.001:
+        if legacy_key == "lambdaPsy" and legacy_value > 0.01:
             warnings.append(f"{legacy_key}={legacy_value} is outside formal psychoacoustic scale; using formal default {default}.")
             return default
         if legacy_key == "lambdaL2" and legacy_value < 0.05:
@@ -905,8 +908,8 @@ def compute_perception(clean_path: Path, protected_path: Path, payload: dict[str
     return perception
 
 
-def compute_mfcc_semantic(clean_path: Path, protected_path: Path) -> dict[str, Any]:
-    details = compute_semantic_token_metrics(clean_path, protected_path, {})
+def compute_mfcc_semantic(clean_path: Path, protected_path: Path, config: dict[str, Any] | None = None) -> dict[str, Any]:
+    details = compute_semantic_token_metrics(clean_path, protected_path, config or {})
     if not details.get("encoderDistances"):
         details["encoderDistances"] = empty_details()["semantic"]["encoderDistances"]
     return details
@@ -972,26 +975,36 @@ def maybe_asr_eval(clean_path: Path, protected_path: Path, payload: dict[str, An
 
 def create_asr_eval(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     original_path, protected_path, result = _task_audio_paths(task_id)
+    request_semantic = ((result.get("request") or {}).get("semantic") or {}) if isinstance(result.get("request"), dict) else {}
+    payload_semantic = payload.get("semantic") if isinstance(payload.get("semantic"), dict) else {}
+    semantic_config = {
+        **request_semantic,
+        **payload_semantic,
+        "asrModel": payload.get("model") or payload_semantic.get("asrModel") or request_semantic.get("asrModel"),
+    }
     asr = maybe_asr_eval(
         original_path,
         protected_path,
         {
             "referenceText": payload.get("referenceText") or payload.get("reference_text"),
-            "semantic": {"asrModel": payload.get("model")},
+            "semantic": semantic_config,
             "forceAsrEval": True,
         },
     )
+    semantic = compute_semantic_token_metrics(original_path, protected_path, semantic_config)
+    asr.setdefault("_metricSources", {})
+    for key in ["tokenChangeRate", "tokenErrorRate", "tokenChangeCount", "tokenTotal", "semanticDrift", "encoderDistances"]:
+        asr[key] = semantic.get(key)
+    asr["_metricSources"].update(semantic.get("_metricSources") or {})
     details = result.setdefault("details", {})
     details["asr"] = asr
+    details["semantic"] = semantic
     primary = result.setdefault("summary", {}).setdefault("primaryMetrics", {})
     for key in ["wer", "cer", "tokenErrorRate", "tokenChangeRate", "semanticDrift"]:
         if key in asr:
             primary[key] = asr.get(key)
     metric_sources = result.setdefault("summary", {}).setdefault("metricSources", {})
     metric_sources.update(asr.get("_metricSources") or {})
-    semantic_sources = ((details.get("semantic") or {}).get("_metricSources") or {})
-    for key in ["asrEval.tokenChangeRate", "asrEval.tokenErrorRate", "asrEval.semanticDrift"]:
-        metric_sources.setdefault(key, semantic_sources.get(key) or metric_source("unavailable", "semantic_tokenizer", reason="Not produced by ASR evaluator", formula="None"))
     result["asrModel"] = asr.get("model")
     result["updatedAt"] = utc_now_iso()
     summary_score = compute_overall_score(result)
@@ -1109,7 +1122,7 @@ def build_task_payload(
         {"snr": details["perception"]["snr"], "pesq": details["perception"]["pesq"]},
     )
 
-    details["semantic"] = compute_mfcc_semantic(input_path, protected_path)
+    details["semantic"] = compute_mfcc_semantic(input_path, protected_path, semantic_cfg)
     metric_sources.update(details["semantic"].get("_metricSources") or {})
     update_chain(
         chains,
@@ -1132,13 +1145,15 @@ def build_task_payload(
     metric_sources["cloneEval.*"] = metric_source("not_run", "clone-voice", reason="Voice clone evaluation is decoupled from protection; run POST /api/tasks/{taskId}/clone-voice", formula="None until clone eval runs")
     metric_sources["cloneEval.cloneConfidenceBefore"] = metric_source("unavailable", "confidence_calibrator", reason="No confidence calibrator is configured", formula="sigmoid(A*similarity+B)")
     metric_sources["cloneEval.cloneConfidenceAfter"] = metric_source("unavailable", "confidence_calibrator", reason="No confidence calibrator is configured", formula="sigmoid(A*similarity+B)")
-    metric_sources["cloneEval.cloneTrend"] = metric_source("not_run", "multi_checkpoint_clone_eval", reason="No repeated checkpoint TTS clone evaluations were run", formula="None")
+    metric_sources["cloneEval.cloneConfidenceDropRate"] = metric_source("unavailable", "confidence_calibrator", reason="No confidence calibrator is configured", formula="(cloneConfidenceBefore-cloneConfidenceAfter)/max(cloneConfidenceBefore,EPS)")
+    metric_sources["cloneEval.cloneTrend"] = metric_source("not_run", "multi_checkpoint_clone_eval", reason="clone trend is disabled; only final clone evaluation is reported", formula="None")
 
     primary = empty_primary_metrics()
     primary.update(
         {
             "wer": details["asr"]["wer"],
             "cer": details["asr"]["cer"],
+            "tokenChangeRate": details["semantic"]["tokenChangeRate"],
             "tokenErrorRate": details["semantic"]["tokenErrorRate"],
             "semanticDrift": details["semantic"]["semanticDrift"],
             "speakerSimilarity": details["speaker"]["simAfter"],
@@ -1195,6 +1210,9 @@ def build_task_payload(
             "semantic": {
                 "enabled": bool(semantic_cfg.get("enabled")),
                 "encoders": semantic_cfg.get("encoders") or [],
+                "tokenizerPath": semantic_cfg.get("tokenizerPath"),
+                "hubertPath": semantic_cfg.get("hubertPath"),
+                "whisperPath": semantic_cfg.get("whisperPath"),
                 "weightSemantic": loss_weights.get("lambdaSem"),
                 "lambdaSemantic": loss_weights.get("lambdaSem"),
             },
@@ -1544,8 +1562,8 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
         "originalCloneAudio": audio_meta(original_clone_path, f"{base_url}/{original_clone_path.name}"),
         "protectedCloneAudio": audio_meta(protected_clone_path, f"{base_url}/{protected_clone_path.name}"),
     }
-    clone_eval = compute_clone_eval(original_path, original_clone_path, protected_clone_path, response)
-    clone_eval_sources = clone_eval.pop("_metricSources", {})
+    clone_eval = compute_clone_eval(original_path, original_clone_path, protected_clone_path, response, protected_audio_path=protected_path)
+    clone_eval_sources = clone_eval.get("_metricSources") or {}
     response["cloneEval"] = clone_eval
     response.update(
         {
@@ -1568,6 +1586,7 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
     clones = result.setdefault("cloneResults", [])
     clones.append(response)
     downstream = (result.setdefault("details", {}).setdefault("downstreamTts", {}))
+    result.setdefault("details", {})["cloneEval"] = clone_eval
     downstream.update(
         {
             "enabled": True,

@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import metric_definitions as metrics
+import result_adapter as adapter
 from api_server import frontend_result
 from result_adapter import build_task_payload
 
@@ -32,6 +33,43 @@ def write_wav(path: Path, samples: np.ndarray, sr: int = 16000) -> None:
 
 
 class MetricDefinitionsTest(unittest.TestCase):
+    def test_semantic_token_metrics_without_tokenizer_returns_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clean_path = root / "clean.wav"
+            protected_path = root / "protected.wav"
+            write_wav(clean_path, np.zeros(160, dtype=np.float32))
+            write_wav(protected_path, np.zeros(160, dtype=np.float32))
+
+            with mock.patch.dict(os.environ, {"SEME2E_ENABLE_TOKENIZER": "0", "SEME2E_ENABLE_MFCC": "0", "SEME2E_ENABLE_SEMANTIC_ENCODERS": "0"}, clear=False):
+                result = metrics.compute_semantic_token_metrics(clean_path, protected_path, {})
+
+        self.assertIsNone(result["tokenChangeRate"])
+        self.assertIsNone(result["tokenErrorRate"])
+        self.assertEqual(result["_metricSources"]["asrEval.tokenChangeRate"]["reason"], "No real tokenizer configured")
+        self.assertEqual(result["_metricSources"]["asrEval.tokenErrorRate"]["reason"], "No real tokenizer configured")
+
+    def test_semantic_token_metrics_with_tokenizer_computes_token_rates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clean_path = root / "clean.wav"
+            protected_path = root / "protected.wav"
+            write_wav(clean_path, np.zeros(160, dtype=np.float32))
+            write_wav(protected_path, np.zeros(160, dtype=np.float32))
+
+            def fake_encode(path: Path) -> list[int]:
+                return [1, 2, 3, 4] if Path(path) == clean_path else [1, 9, 3]
+
+            with mock.patch.dict(os.environ, {"SEME2E_ENABLE_TOKENIZER": "1", "SEME2E_ENABLE_MFCC": "0", "SEME2E_ENABLE_SEMANTIC_ENCODERS": "0"}, clear=False):
+                with mock.patch.object(metrics, "encode_s3_tokens", side_effect=fake_encode):
+                    result = metrics.compute_semantic_token_metrics(clean_path, protected_path, {})
+
+        self.assertEqual(result["tokenChangeCount"], 1)
+        self.assertEqual(result["tokenTotal"], 4)
+        self.assertTrue(math.isclose(result["tokenChangeRate"], 1 / 3, rel_tol=1e-6))
+        self.assertTrue(math.isclose(result["tokenErrorRate"], 0.5, rel_tol=1e-6))
+        self.assertEqual(result["_metricSources"]["asrEval.tokenChangeRate"]["status"], "available")
+
     def test_perturbation_metrics_from_wavs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -81,23 +119,195 @@ class MetricDefinitionsTest(unittest.TestCase):
                 load=lambda path, sr=16000: (np.ones(320, dtype=np.float32), sr),
                 feature=SimpleNamespace(mfcc=lambda y, sr, n_mfcc: np.tile(np.linspace(0.0, 1.0, n_mfcc)[:, None], (1, 4))),
             )
-            old_env = os.environ.get("SEME2E_ENABLE_MFCC")
+            old_env = {
+                "SEME2E_ENABLE_MFCC": os.environ.get("SEME2E_ENABLE_MFCC"),
+                "SEME2E_ENABLE_TOKENIZER": os.environ.get("SEME2E_ENABLE_TOKENIZER"),
+                "SEME2E_ENABLE_SEMANTIC_ENCODERS": os.environ.get("SEME2E_ENABLE_SEMANTIC_ENCODERS"),
+            }
             try:
                 os.environ["SEME2E_ENABLE_MFCC"] = "1"
+                os.environ["SEME2E_ENABLE_TOKENIZER"] = "0"
+                os.environ["SEME2E_ENABLE_SEMANTIC_ENCODERS"] = "0"
                 with mock.patch.dict(sys.modules, {"librosa": fake_librosa}):
                     result = metrics.compute_semantic_token_metrics(clean_path, protected_path, {})
             finally:
-                if old_env is None:
-                    os.environ.pop("SEME2E_ENABLE_MFCC", None)
-                else:
-                    os.environ["SEME2E_ENABLE_MFCC"] = old_env
+                for key, value in old_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
 
         self.assertIsNotNone(result["semanticDrift"])
         self.assertIsNone(result["tokenChangeRate"])
         self.assertIsNone(result["tokenErrorRate"])
         self.assertEqual(result["_metricSources"]["asrEval.semanticDrift"]["source"], "mfcc_proxy")
 
+    def test_semantic_drift_averages_selected_semantic_encoders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clean_path = root / "clean.wav"
+            protected_path = root / "protected.wav"
+            write_wav(clean_path, np.zeros(160, dtype=np.float32))
+            write_wav(protected_path, np.zeros(160, dtype=np.float32))
+
+            class FakeEnsemble:
+                device = "cpu"
+                vector_names = ["s3", "hubert", "whisper", "mfcc"]
+
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                def get_vectors(self, _wave):
+                    self.calls += 1
+                    if self.calls == 1:
+                        return [
+                            np.array([1.0, 0.0]),
+                            np.array([1.0, 0.0]),
+                            np.array([1.0, 0.0]),
+                            np.array([1.0, 0.0]),
+                        ]
+                    return [
+                        np.array([0.0, 1.0]),
+                        np.array([1.0, 0.0]),
+                        np.array([0.0, 1.0]),
+                        np.array([1.0, 0.0]),
+                    ]
+
+            import torch
+
+            fake_torchaudio = SimpleNamespace(
+                load=lambda _path: (torch.zeros(1, 160), 16000),
+                transforms=SimpleNamespace(Resample=lambda orig_freq, new_freq: (lambda wave: wave)),
+            )
+            fake_ensemble = FakeEnsemble()
+            with mock.patch.dict(os.environ, {"SEME2E_ENABLE_TOKENIZER": "0", "SEME2E_ENABLE_MFCC": "0"}, clear=False):
+                with mock.patch.dict(sys.modules, {"torchaudio": fake_torchaudio}):
+                    with mock.patch.object(metrics, "_load_semantic_encoder_ensemble", return_value=fake_ensemble):
+                        result = metrics.compute_semantic_token_metrics(
+                            clean_path,
+                            protected_path,
+                            {"encoders": ["S3", "Whisper"]},
+                        )
+
+        self.assertEqual([item["encoder"] for item in result["encoderDistances"]], ["S3", "Whisper"])
+        self.assertTrue(math.isclose(result["semanticDrift"], 1.0, rel_tol=1e-6))
+        self.assertEqual(result["_metricSources"]["asrEval.semanticDrift"]["source"], "SemanticEncoderEnsemble")
+
+    def test_selected_non_mfcc_semantic_encoders_do_not_fallback_to_mfcc_proxy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clean_path = root / "clean.wav"
+            protected_path = root / "protected.wav"
+            write_wav(clean_path, np.zeros(160, dtype=np.float32))
+            write_wav(protected_path, np.zeros(160, dtype=np.float32))
+
+            fake_librosa = SimpleNamespace(
+                load=lambda path, sr=16000: (np.ones(320, dtype=np.float32), sr),
+                feature=SimpleNamespace(mfcc=lambda y, sr, n_mfcc: np.tile(np.linspace(0.0, 1.0, n_mfcc)[:, None], (1, 4))),
+            )
+            with mock.patch.dict(os.environ, {"SEME2E_ENABLE_TOKENIZER": "0", "SEME2E_ENABLE_MFCC": "1", "SEME2E_ENABLE_SEMANTIC_ENCODERS": "0"}, clear=False):
+                with mock.patch.dict(sys.modules, {"librosa": fake_librosa}):
+                    result = metrics.compute_semantic_token_metrics(
+                        clean_path,
+                        protected_path,
+                        {"encoders": ["S3", "MFCC"]},
+                    )
+
+        self.assertIsNone(result["semanticDrift"])
+        self.assertEqual(result["_metricSources"]["asrEval.semanticDrift"]["source"], "semantic_encoder")
+        self.assertIn("SemanticEncoderEnsemble unavailable", result["_metricSources"]["asrEval.semanticDrift"]["reason"])
+
+    def test_direct_speaker_metrics_without_model_returns_null_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clean_path = root / "clean.wav"
+            protected_path = root / "protected.wav"
+            write_wav(clean_path, np.zeros(160, dtype=np.float32))
+            write_wav(protected_path, np.zeros(160, dtype=np.float32))
+
+            with mock.patch.dict(os.environ, {"SEME2E_ENABLE_SPEAKER": "0"}, clear=False):
+                result = metrics.compute_direct_speaker_metrics(clean_path, protected_path)
+
+        for key in [
+            "simBefore",
+            "simAfter",
+            "simDropRate",
+            "embeddingDistanceBefore",
+            "embeddingDistanceAfter",
+            "simOriginalProtected",
+            "embeddingDistance",
+        ]:
+            self.assertIsNone(result[key])
+        self.assertEqual(result["reason"], "Set SEME2E_ENABLE_SPEAKER=1 to run speaker similarity dependencies")
+
+    def test_direct_speaker_metrics_with_model_computes_similarity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clean_path = root / "clean.wav"
+            protected_path = root / "protected.wav"
+            write_wav(clean_path, np.zeros(160, dtype=np.float32))
+            write_wav(protected_path, np.zeros(160, dtype=np.float32))
+
+            class FakeSpeaker:
+                def score(self, reference_audio: Path, candidate_audio: Path) -> float:
+                    return 0.7
+
+            result = metrics.compute_direct_speaker_metrics(clean_path, protected_path, speaker_model=FakeSpeaker())
+
+        self.assertEqual(result["simAfter"], 0.7)
+        self.assertEqual(result["embeddingDistanceAfter"], 0.30000000000000004)
+        self.assertEqual(result["simOriginalProtected"], 0.7)
+
     def test_clone_eval_scores_against_original_audio_not_protected_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = root / "original.wav"
+            protected = root / "protected.wav"
+            original_clone = root / "original_clone.wav"
+            protected_clone = root / "protected_clone.wav"
+            write_wav(original, np.zeros(160, dtype=np.float32))
+            write_wav(protected, np.zeros(160, dtype=np.float32))
+            write_wav(original_clone, np.zeros(160, dtype=np.float32))
+            write_wav(protected_clone, np.zeros(160, dtype=np.float32))
+
+            calls: list[tuple[Path, Path]] = []
+
+            class FakeSpeaker:
+                def score(self, reference_audio: Path, candidate_audio: Path) -> float:
+                    calls.append((Path(reference_audio), Path(candidate_audio)))
+                    if Path(candidate_audio) == original_clone:
+                        return 0.8
+                    if Path(candidate_audio) == protected_clone:
+                        return 0.4
+                    if Path(candidate_audio) == protected:
+                        return 0.6
+                    return 0.0
+
+            clone_result = {
+                "request": {"model": "fake-tts", "text": "hello"},
+                "originalCloneAudio": {"filename": "original_clone.wav"},
+                "protectedCloneAudio": {"filename": "protected_clone.wav"},
+            }
+            result = metrics.compute_clone_eval(original, original_clone, protected_clone, clone_result, protected_audio_path=protected, speaker_model=FakeSpeaker())
+
+            self.assertEqual(calls, [(original, original_clone), (original, protected_clone), (original, protected)])
+            self.assertEqual(result["directSimilarity"], 0.6)
+            self.assertEqual(result["originalSimilarity"], 0.8)
+            self.assertEqual(result["protectedSimilarity"], 0.4)
+            self.assertTrue(math.isclose(result["similarityDropRate"], 0.5, rel_tol=1e-6))
+            self.assertTrue(math.isclose(result["embeddingDistanceBefore"], 0.2, rel_tol=1e-6))
+            self.assertTrue(math.isclose(result["embeddingDistanceAfter"], 0.6, rel_tol=1e-6))
+            self.assertTrue(math.isclose(result["embeddingDistanceIncreaseRate"], 2.0, rel_tol=1e-6))
+            self.assertIsNone(result["cloneConfidenceBefore"])
+            self.assertIsNone(result["cloneConfidenceAfter"])
+            self.assertIsNone(result["cloneConfidenceDropRate"])
+            self.assertIsNone(result["cloneTrend"])
+            self.assertEqual([item["name"] for item in result["cloneRadar"]], ["直接声纹偏移", "克隆相似度下降", "嵌入距离增加", "保护后克隆防护", "克隆置信度下降"])
+            self.assertTrue(math.isclose(result["cloneRadar"][0]["value"], 40.0, rel_tol=1e-6))
+            self.assertIsNone(result["cloneRadar"][-1]["value"])
+            self.assertEqual(result["cloneRadar"][-1]["status"], "unavailable")
+
+    def test_clone_eval_metric_sources_use_ecapa_model_without_confidence_calibrator(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             original = root / "original.wav"
@@ -107,23 +317,173 @@ class MetricDefinitionsTest(unittest.TestCase):
             write_wav(original_clone, np.zeros(160, dtype=np.float32))
             write_wav(protected_clone, np.zeros(160, dtype=np.float32))
 
-            calls: list[tuple[Path, Path]] = []
+            class FakeSpeaker:
+                def score(self, reference_audio: Path, candidate_audio: Path) -> float:
+                    return 0.9 if Path(candidate_audio) == original_clone else 0.3
+
+            source_info = metrics.metric_source(
+                "available",
+                "speechbrain/spkrec-ecapa-voxceleb",
+                formula="cosine(Emb(a),Emb(b))",
+                metric="ECAPA-TDNN speaker embedding cosine similarity",
+            )
+            with mock.patch.object(metrics, "_build_speaker_scorer", return_value=(FakeSpeaker(), "speechbrain/spkrec-ecapa-voxceleb", source_info)):
+                result = metrics.compute_clone_eval(
+                    original,
+                    original_clone,
+                    protected_clone,
+                    {"request": {"model": "fake-tts"}},
+                )
+
+        source = result["_metricSources"]["cloneEval.*"]
+        self.assertEqual(source["status"], "available")
+        self.assertEqual(source["source"], "speechbrain/spkrec-ecapa-voxceleb")
+        self.assertEqual(source["metric"], "ECAPA-TDNN speaker embedding cosine similarity")
+        self.assertIsNone(result["cloneConfidenceBefore"])
+        self.assertIsNone(result["cloneConfidenceAfter"])
+        self.assertIsNone(result["cloneConfidenceDropRate"])
+        self.assertEqual(result["_metricSources"]["cloneEval.cloneConfidenceDropRate"]["status"], "unavailable")
+
+    def test_clone_defense_score_uses_available_weighted_formula(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = root / "original.wav"
+            protected = root / "protected.wav"
+            original_clone = root / "original_clone.wav"
+            protected_clone = root / "protected_clone.wav"
+            for path in [original, protected, original_clone, protected_clone]:
+                write_wav(path, np.zeros(160, dtype=np.float32))
 
             class FakeSpeaker:
                 def score(self, reference_audio: Path, candidate_audio: Path) -> float:
-                    calls.append((Path(reference_audio), Path(candidate_audio)))
-                    return 0.8 if Path(candidate_audio) == original_clone else 0.4
+                    if Path(candidate_audio) == original_clone:
+                        return 0.8
+                    if Path(candidate_audio) == protected_clone:
+                        return 0.6
+                    return 0.5
 
-            clone_result = {
-                "request": {"model": "fake-tts", "text": "hello"},
-                "originalCloneAudio": {"filename": "original_clone.wav"},
-                "protectedCloneAudio": {"filename": "protected_clone.wav"},
+            result = metrics.compute_clone_eval(
+                original,
+                original_clone,
+                protected_clone,
+                {"request": {"model": "fake-tts"}},
+                protected_audio_path=protected,
+                speaker_model=FakeSpeaker(),
+            )
+
+        expected = 100.0 * ((0.5 * 0.45) + (1.0 * 0.35)) / (0.45 + 0.35)
+        self.assertTrue(math.isclose(result["cloneDefenseScore"], expected, rel_tol=1e-6))
+
+    def test_create_asr_eval_merges_semantic_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = root / "original.wav"
+            protected = root / "protected.wav"
+            write_wav(original, np.zeros(160, dtype=np.float32))
+            write_wav(protected, np.zeros(160, dtype=np.float32))
+            stored_result = {"details": {}, "summary": {"primaryMetrics": {}, "metricSources": {}}}
+            fake_asr = {"wer": 0.1, "cer": 0.2, "status": "available", "_metricSources": {"asrEval.*": {"status": "available", "source": "fake_asr"}}}
+            fake_semantic = {
+                "tokenChangeRate": 0.25,
+                "tokenErrorRate": 0.5,
+                "tokenChangeCount": 1,
+                "tokenTotal": 4,
+                "semanticDrift": 0.1,
+                "encoderDistances": [{"encoder": "S3", "distance": 0.1}],
+                "_metricSources": {"asrEval.tokenErrorRate": {"status": "available", "source": "fake_tokenizer"}},
             }
-            result = metrics.compute_clone_eval(original, original_clone, protected_clone, clone_result, speaker_model=FakeSpeaker())
 
-            self.assertEqual(calls, [(original, original_clone), (original, protected_clone)])
-            self.assertEqual(result["protectedSimilarity"], 0.4)
-            self.assertIsNone(result["cloneTrend"])
+            with mock.patch.object(adapter, "_task_audio_paths", return_value=(original, protected, stored_result)):
+                with mock.patch.object(adapter, "maybe_asr_eval", return_value=fake_asr):
+                    with mock.patch.object(adapter, "compute_semantic_token_metrics", return_value=fake_semantic):
+                        with mock.patch.object(adapter, "save_result"):
+                            response = adapter.create_asr_eval("task_test", {"model": "fake"})
+
+        self.assertEqual(response["asr"]["tokenChangeRate"], 0.25)
+        self.assertEqual(response["asr"]["tokenErrorRate"], 0.5)
+        self.assertEqual(stored_result["details"]["semantic"], fake_semantic)
+        self.assertEqual(stored_result["details"]["asr"]["encoderDistances"], fake_semantic["encoderDistances"])
+        self.assertEqual(stored_result["summary"]["metricSources"]["asrEval.tokenErrorRate"]["source"], "fake_tokenizer")
+
+    def test_create_clone_voice_writes_clone_eval_to_details(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task_root = root / "tasks"
+            task_root.mkdir()
+            (task_root / "task_test").mkdir()
+            original = root / "original.wav"
+            protected = root / "protected.wav"
+            write_wav(original, np.zeros(160, dtype=np.float32))
+            write_wav(protected, np.zeros(160, dtype=np.float32))
+            stored_result = {"details": {}, "summary": {"primaryMetrics": {}, "metricSources": {}}}
+
+            def fake_clone_to_file(reference_path: Path, text: str, output_path: Path, **kwargs: object) -> str:
+                write_wav(output_path, np.zeros(160, dtype=np.float32))
+                return "fake_tts"
+
+            fake_clone_eval = {
+                "originalSimilarity": 0.9,
+                "protectedSimilarity": 0.3,
+                "similarityDropRate": 2 / 3,
+                "embeddingDistanceBefore": 0.1,
+                "embeddingDistanceAfter": 0.7,
+                "embeddingDistanceIncreaseRate": 6.0,
+                "cloneConfidenceBefore": None,
+                "cloneConfidenceAfter": None,
+                "cloneTrend": None,
+                "_metricSources": {"cloneEval.*": {"status": "available", "source": "fake_speaker"}},
+            }
+
+            with mock.patch.object(adapter, "TASK_DIR", task_root):
+                with mock.patch.object(adapter, "_task_audio_paths", return_value=(original, protected, stored_result)):
+                    with mock.patch.object(adapter, "_module_available", return_value=True):
+                        with mock.patch.object(adapter, "_tts_clone_to_file", side_effect=fake_clone_to_file):
+                            with mock.patch.object(adapter, "compute_clone_eval", return_value=fake_clone_eval):
+                                response = adapter.create_clone_voice("task_test", {"text": "hello", "model": "xtts-v2"})
+
+        self.assertEqual(response["cloneEval"]["originalSimilarity"], 0.9)
+        self.assertEqual(response["cloneEval"]["protectedSimilarity"], 0.3)
+        self.assertEqual(response["cloneEval"]["similarityDropRate"], 2 / 3)
+        self.assertEqual(stored_result["details"]["cloneEval"]["originalSimilarity"], 0.9)
+        self.assertEqual(stored_result["summary"]["metricSources"]["cloneEval.*"]["source"], "fake_speaker")
+
+    def test_optimization_trace_maps_to_frontend_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clean_path = root / "clean.wav"
+            protected_path = root / "protected.wav"
+            samples = np.sin(np.linspace(0, 2 * np.pi, 800, endpoint=False)).astype(np.float32) * 0.2
+            write_wav(clean_path, samples)
+            write_wav(protected_path, samples + 0.001)
+            payload = {"optimization": {"steps": 1, "weightL2": 0.01}, "semantic": {}, "timbre": {}, "psychoacoustic": {}}
+            trace_point = {
+                "step": 1,
+                "Lfeat": 0.1,
+                "Lsem": 0.2,
+                "Lpsy": 0.3,
+                "L2": 0.4,
+                "total": 1.0,
+                "snr": 20.0,
+                "stepElapsedSec": 0.25,
+            }
+            with mock.patch.dict(os.environ, {"SEME2E_ENABLE_SPEAKER": "0", "SEME2E_ENABLE_TOKENIZER": "0", "SEME2E_ENABLE_MFCC": "0", "SEME2E_ENABLE_SEMANTIC_ENCODERS": "0"}, clear=False):
+                result = build_task_payload(
+                    "task_test",
+                    payload,
+                    clean_path,
+                    protected_path,
+                    None,
+                    "2026.6.26 00:00:00",
+                    "2026.6.26 00:00:01",
+                    {"source": "test_guard", "optimization_trace": [trace_point]},
+                )
+            frontend = frontend_result(result)
+
+        self.assertEqual(frontend["generation"]["optimizationTrace"][0]["stepElapsedSec"], 0.25)
+        self.assertEqual(frontend["generation"]["optimizationTrace"][0]["snr"], 20.0)
+        self.assertEqual(frontend["lossFinal"]["total"], 1.0)
+        self.assertEqual(frontend["lossFinal"]["snr"], 20.0)
+        self.assertEqual(frontend["averageStepSec"], 0.25)
 
     def test_build_task_payload_keeps_asr_and_clone_eval_empty_until_called(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -142,7 +502,7 @@ class MetricDefinitionsTest(unittest.TestCase):
                 "psychoacoustic": {"enabled": True, "weightPsy": 0.1},
                 "optimization": {"epsilon": 0.01, "steps": 1, "weightL2": 0.01},
             }
-            with mock.patch.dict(os.environ, {"SEME2E_ENABLE_SPEAKER": "0"}):
+            with mock.patch.dict(os.environ, {"SEME2E_ENABLE_SPEAKER": "0", "SEME2E_ENABLE_TOKENIZER": "0", "SEME2E_ENABLE_SEMANTIC_ENCODERS": "0"}):
                 result = build_task_payload(
                     "task_test",
                     payload,
@@ -157,14 +517,19 @@ class MetricDefinitionsTest(unittest.TestCase):
 
         self.assertIsNone(frontend["asrEval"])
         self.assertIsNone(frontend["cloneEval"])
+        self.assertIsNone(frontend["asr"]["semanticDrift"])
         self.assertIsNotNone(frontend["perturbation"]["l2Norm"])
         self.assertIsNotNone(frontend["perturbation"]["l2Rms"])
         self.assertIsNotNone(frontend["perturbation"]["linfNorm"])
         self.assertIsNotNone(frontend["perturbation"]["clippingRate"])
-        self.assertIsNone(frontend["protectionQuality"]["pesq"])
-        self.assertIsNone(frontend["protectionQuality"]["stoi"])
-        self.assertTrue(frontend["metricSources"]["protectionQuality.pesq"]["reason"])
-        self.assertTrue(frontend["metricSources"]["protectionQuality.stoi"]["reason"])
+        if frontend["protectionQuality"]["pesq"] is None:
+            self.assertTrue(frontend["metricSources"]["protectionQuality.pesq"]["reason"])
+        else:
+            self.assertEqual(frontend["metricSources"]["protectionQuality.pesq"]["status"], "available")
+        if frontend["protectionQuality"]["stoi"] is None:
+            self.assertTrue(frontend["metricSources"]["protectionQuality.stoi"]["reason"])
+        else:
+            self.assertEqual(frontend["metricSources"]["protectionQuality.stoi"]["status"], "available")
         self.assertIsInstance(frontend["charts"]["psychoacoustic"], list)
         self.assertIsInstance(frontend["charts"]["optimizationTrend"], list)
 

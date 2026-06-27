@@ -372,7 +372,7 @@ def validate_protection_config(payload: ProtectTaskRequest, req_id: str) -> JSON
     legacy_errors = [
         _legacy_weight_error(semantic, "weightSemantic", "lambdaSemantic", 1.0),
         _legacy_weight_error(timbre, "weightFeature", "lambdaTimbre", 1.0),
-        _legacy_weight_error(psychoacoustic := (payload.psychoacoustic or {}), "weightPsy", "lambdaPsy", None, 0.001),
+        _legacy_weight_error(psychoacoustic := (payload.psychoacoustic or {}), "weightPsy", "lambdaPsy", None, 0.01),
         _legacy_weight_error(payload.optimization or {}, "weightL2", "lambdaL2", 0.05),
     ]
     legacy_errors = [item for item in legacy_errors if item]
@@ -588,7 +588,6 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
     sim_after = _number(_coalesce(primary.get("speakerSimilarity"), (details.get("speaker") or {}).get("simOriginalProtected")))
     sim_before = None
     asr = details.get("asr") or {}
-    semantic = details.get("semantic") or {}
     generation = details.get("generation") or {}
     perception = details.get("perception") or {}
     charts = result.get("charts") or {}
@@ -598,8 +597,9 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
     loss_final = generation.get("lossFinal")
     loss_weights = generation.get("lossWeights") or {}
     asr_status = asr.get("status")
+    asr_has_result = asr_status in {"available", "computed", "partial", "completed", "success"}
     asr_eval = None
-    if asr_status in {"available", "computed", "partial", "completed", "success"}:
+    if asr_has_result:
         asr_eval = {
             "model": asr.get("model"),
             "asrModel": asr.get("model"),
@@ -645,6 +645,21 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
             "cloneDefenseScore": latest_clone.get("cloneDefenseScore"),
             "createdAt": latest_clone.get("createdAt") or result.get("updatedAt"),
         }
+    detail_clone_eval = details.get("cloneEval")
+    if clone_eval is None and isinstance(detail_clone_eval, dict):
+        has_clone_metric = any(
+            detail_clone_eval.get(key) is not None
+            for key in [
+                "originalSimilarity",
+                "protectedSimilarity",
+                "similarityDropRate",
+                "embeddingDistanceBefore",
+                "embeddingDistanceAfter",
+                "embeddingDistanceIncreaseRate",
+            ]
+        )
+        if has_clone_metric or detail_clone_eval.get("status") not in {None, "unavailable", "not_run"}:
+            clone_eval = detail_clone_eval
 
     original_audio = _frontend_audio(audio.get("original"), "original.wav")
     protected_audio = _frontend_audio(audio.get("protected"), "protected.wav")
@@ -712,16 +727,16 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
         "cloneEval": clone_eval,
         "cloneResults": clone_results,
         "asr": {
-            "originalText": asr.get("referenceText") or asr.get("cleanTranscription"),
-            "protectedText": asr.get("protectedTranscription"),
-            "wer": _coalesce(primary.get("wer"), asr.get("wer")),
-            "cer": _coalesce(primary.get("cer"), asr.get("cer")),
-            "tokenErrorRate": _coalesce(primary.get("tokenErrorRate"), asr.get("tokenErrorRate"), semantic.get("tokenErrorRate")),
-            "tokenChangeRate": _coalesce(primary.get("tokenChangeRate"), asr.get("tokenChangeRate"), semantic.get("tokenChangeRate")),
-            "semanticDrift": _coalesce(primary.get("semanticDrift"), asr.get("semanticDrift"), semantic.get("semanticDrift")),
-            "insertRate": ((asr.get("breakdown") or {}).get("insertRate")),
-            "deleteRate": ((asr.get("breakdown") or {}).get("deleteRate")),
-            "substituteRate": ((asr.get("breakdown") or {}).get("substituteRate")),
+            "originalText": (asr.get("referenceText") or asr.get("cleanTranscription")) if asr_has_result else None,
+            "protectedText": asr.get("protectedTranscription") if asr_has_result else None,
+            "wer": _coalesce(primary.get("wer"), asr.get("wer")) if asr_has_result else None,
+            "cer": _coalesce(primary.get("cer"), asr.get("cer")) if asr_has_result else None,
+            "tokenErrorRate": asr.get("tokenErrorRate") if asr_has_result else None,
+            "tokenChangeRate": asr.get("tokenChangeRate") if asr_has_result else None,
+            "semanticDrift": asr.get("semanticDrift") if asr_has_result else None,
+            "insertRate": ((asr.get("breakdown") or {}).get("insertRate")) if asr_has_result else None,
+            "deleteRate": ((asr.get("breakdown") or {}).get("deleteRate")) if asr_has_result else None,
+            "substituteRate": ((asr.get("breakdown") or {}).get("substituteRate")) if asr_has_result else None,
             "status": asr.get("status"),
         },
         "speaker": {
@@ -730,6 +745,8 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
             "simDropRate": (details.get("speaker") or {}).get("simDropRate"),
             "embeddingDistanceBefore": (details.get("speaker") or {}).get("embeddingDistanceBefore"),
             "embeddingDistanceAfter": _coalesce((details.get("speaker") or {}).get("embeddingDistanceAfter"), (details.get("speaker") or {}).get("embeddingDistance")),
+            "simOriginalProtected": (details.get("speaker") or {}).get("simOriginalProtected"),
+            "embeddingDistance": (details.get("speaker") or {}).get("embeddingDistance"),
             "source": ((metric_sources.get("speaker.*") or {}).get("source")),
             "status": (details.get("speaker") or {}).get("status"),
         },
@@ -1438,9 +1455,9 @@ def list_tasks() -> list[dict[str, Any]]:
                 "cloneError": clone_error,
                 "hasAsrResult": bool(has_asr_result),
                 "hasCloneResult": bool(has_clone_result),
-                "wer": asr_eval.get("wer") if asr_eval else None,
-                "simDropRate": _coalesce(clone_eval.get("similarityDropRate") if clone_eval else None, (details.get("speaker") or {}).get("simDropRate")),
-                "pesq": protection_quality.get("pesq") if protection_quality else None,
+                "processingModel": frontend_payload.get("processingModel") or (details.get("generation") or {}).get("source"),
+                "asrModel": asr_eval.get("asrModel") or asr_eval.get("model") or asr_details.get("model"),
+                "cloneModel": clone_eval.get("cloneModel") or clone_eval.get("model"),
                 "createdAt": payload.get("createdAt") or (status or {}).get("createdAt"),
                 "updatedAt": payload.get("updatedAt") or (status or {}).get("updatedAt"),
                 "elapsedSec": protection_elapsed,

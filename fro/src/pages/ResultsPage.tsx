@@ -22,7 +22,7 @@ import {
 import { cloneVoice, downloadEvidenceZip, downloadProtectedAudio, exportReport, getCapabilities, getTaskResult, getTaskStatus, listTasks, runAsrEval } from '@/services/apiClient'
 import { useAppStore } from '@/store/appStore'
 import { useTaskStore } from '@/store/taskStore'
-import type { AsrEval, AsrMetrics, CapabilitiesResponse, CloneEval, CloneVoiceRequest, CloneVoiceResult, DiffOp, LossFinal, LossTrendPoint, ProtectionRuntimeConfig, TaskResult, TaskStatusResponse } from '@/types/task'
+import type { AsrEval, AsrMetrics, CapabilitiesResponse, CloneEval, CloneVoiceRequest, CloneVoiceResult, DiffOp, LossFinal, LossTrendPoint, ProtectionRuntimeConfig, RadarPoint, TaskResult, TaskStatusResponse } from '@/types/task'
 import type { AudioFileMeta } from '@/types/audio'
 import { downloadBlob } from '@/utils/download'
 import { cn } from '@/lib/utils'
@@ -177,8 +177,6 @@ export function ResultsPage() {
 }
 
 function SummaryBar({ result, onTaskInfoClick, onDownloadClick }: { result: TaskResult; onTaskInfoClick: () => void; onDownloadClick: () => void }) {
-  const verdict = result.verdict || '防护结果已生成'
-
   return (
     <section className="ui-card grid min-h-[74px] grid-cols-[250px_180px_250px_170px_230px_minmax(260px,1fr)] items-center px-5 max-2xl:grid-cols-[1.05fr_0.78fr_1.08fr_0.75fr_1fr_1.42fr] max-xl:h-auto max-xl:grid-cols-3 max-xl:gap-y-4 max-xl:py-4">
       <SummaryItem icon={<ClipboardList />} label="任务 ID" value={result.taskId} copy buttonTitle="查看任务信息" onClick={onTaskInfoClick} />
@@ -186,11 +184,10 @@ function SummaryBar({ result, onTaskInfoClick, onDownloadClick }: { result: Task
       <SummaryItem icon={<Clock3 />} label="完成时间" value={result.completedAt ?? '-'} />
       <SummaryItem icon={<Clock3 />} label="处理耗时" value={typeof result.elapsedSec === 'number' ? formatElapsed(result.elapsedSec) : '-'} />
       <SummaryItem icon={<Sparkles />} label="防护模式" value={modeText[result.mode] ?? result.mode} green />
-      <button type="button" onClick={onDownloadClick} className="flex h-full min-h-[58px] items-center justify-end gap-4 border-l border-cyan-300/10 pl-5 text-left transition hover:bg-cyan-400/[0.035]">
-        <span className="text-xs text-slate-500">结果操作</span>
+      <button type="button" onClick={onDownloadClick} className="flex h-full min-h-[58px] items-center justify-center gap-4 border-l border-cyan-300/10 pl-5 transition hover:bg-cyan-400/[0.035]">
         <ShieldCheck className="h-11 w-11 text-cyan-300" />
         <div className="min-w-0 text-left">
-          <p className="text-[27px] font-black leading-none text-cyan-200">{verdict}</p>
+          <p className="text-[27px] font-black leading-none text-cyan-200">已生成防护报告</p>
           <p className="mt-1 text-xs text-slate-400">点击此处下载</p>
         </div>
       </button>
@@ -325,6 +322,24 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
   const asrLevel = activeAsrEval?.metricLevel === 'word' || activeAsrEval?.metricLevel === 'char' ? activeAsrEval.metricLevel : chooseEditLevel(originalText, protectedText)
   const asrEditStats = activeAsrEval && originalText && protectedText ? computeEditMetrics(originalText, protectedText, asrLevel) : null
   const activeCloneEval = cloneResult?.cloneEval ?? cloneResultToEval(cloneResult) ?? result.cloneEval ?? null
+  const compareTabs = [
+    {
+      key: 'protect',
+      label: '保护',
+      modelTitle: result.processingModel ?? result.generation?.source ?? '未生成',
+    },
+    {
+      key: 'asr',
+      label: 'ASR',
+      modelTitle: activeAsrEval?.model ?? activeAsrEval?.asrModel ?? result.asrModel ?? '未生成',
+    },
+    {
+      key: 'clone',
+      label: '克隆',
+      modelTitle: `克隆 ${activeCloneEval?.cloneModel ?? '未生成'} · 评估 ${activeCloneEval?.speakerEvalModel ?? '未生成'}`,
+    },
+  ] as const
+  const activeModelTitle = compareTabs.find((tab) => tab.key === activePanel)?.modelTitle ?? '未生成'
 
   useEffect(() => {
     return () => {
@@ -495,21 +510,20 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
 
   return (
     <section className="ui-card h-full p-5">
-      <div className="flex flex-wrap items-center justify-between gap-3">
+      <div className="grid grid-cols-[auto_minmax(180px,1fr)_auto] items-center gap-3 max-xl:grid-cols-1 max-xl:items-start">
         <div className="flex flex-wrap items-center gap-3">
           <SectionTitle info>结果对比</SectionTitle>
           <div className="flex items-center gap-2">
-            {[
-              ['protect', '保护'],
-              ['asr', 'ASR'],
-              ['clone', '克隆'],
-            ].map(([key, label]) => (
+            {compareTabs.map(({ key, label }) => (
               <button key={key} type="button" onClick={() => setActivePanel(key as ComparePanel)} className={cn('h-9 rounded-[7px] border border-cyan-300/14 px-3 text-sm font-black text-slate-300 transition hover:text-white', activePanel === key && 'bg-cyan-400/14 text-cyan-200')} title={`查看${label}结果`}>
                 {label}
               </button>
             ))}
           </div>
         </div>
+        <p className="min-w-0 truncate text-center text-xs font-black tracking-normal text-cyan-100/85 max-xl:text-left" title={activeModelTitle}>
+          {activeModelTitle}
+        </p>
         <div className="flex items-center gap-2">
           <button type="button" onClick={() => setCloneModalOpen(true)} className="inline-flex h-9 items-center gap-2 rounded-[7px] border border-cyan-300/18 bg-cyan-400/10 px-3 text-sm font-black text-cyan-100 hover:bg-cyan-400/16">
             <TestTube2 className="h-4 w-4" />
@@ -526,10 +540,10 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
           <ProtectTab result={result} originalAudio={originalAudio} protectedAudio={protectedAudio} onProtectedPlayRequest={loadProtectedAudio} />
         ) : null}
         {activePanel === 'asr' ? (
-          <AsrTab asrEval={activeAsrEval} editStats={asrEditStats} />
+          <AsrTab result={result} asrEval={activeAsrEval} editStats={asrEditStats} />
         ) : null}
         {activePanel === 'clone' ? (
-          <CloneTab cloneEval={activeCloneEval} loading={cloneLoading} status={cloneTaskStatus} />
+          <CloneTab result={result} cloneEval={activeCloneEval} loading={cloneLoading} status={cloneTaskStatus} />
         ) : null}
       </div>
       {cloneModalOpen ? (
@@ -603,7 +617,7 @@ function ProtectTab({
   )
 }
 
-function AsrTab({ asrEval, editStats }: { asrEval?: AsrEval | null; editStats: EditMetrics | null }) {
+function AsrTab({ result, asrEval, editStats }: { result: TaskResult; asrEval?: AsrEval | null; editStats: EditMetrics | null }) {
   if (!asrEval) {
     return (
       <EmptyState
@@ -622,6 +636,9 @@ function AsrTab({ asrEval, editStats }: { asrEval?: AsrEval | null; editStats: E
   const wer = asrEval.wer ?? (editStats?.level === 'word' ? editStats.werOrCer : undefined)
   const cer = asrEval.cer ?? (editStats?.level === 'char' ? editStats.werOrCer : undefined)
   const tokenDiff = asrEval.tokenErrorRate ?? asrEval.tokenChangeRate
+  const tokenReason = metricReason(result, ['asrEval.tokenErrorRate', 'asrEval.tokenChangeRate'])
+  const semanticReason = metricReason(result, ['asrEval.semanticDrift'])
+  const semanticFoot = semanticReason ? `来源：${semanticReason}` : metricSourceLabel(result, ['asrEval.semanticDrift'])
 
   return (
     <div className="space-y-5">
@@ -630,8 +647,8 @@ function AsrTab({ asrEval, editStats }: { asrEval?: AsrEval | null; editStats: E
         <div className="grid grid-cols-2 content-center gap-3">
           <ScoreBox label="WER（词错率）" value={formatMetricValue(wer, 'percent')} red compact />
           <ScoreBox label="CER（字错率）" value={formatMetricValue(cer, 'percent')} red compact />
-          <ScoreBox label="Token 错误率" value={formatMetricValue(tokenDiff, 'percent')} red compact />
-          <ScoreBox label="SD（语义漂移）" value={formatMetricValue(asrEval.semanticDrift, 'percent')} red compact />
+          <ScoreBox label="Token 错误率" value={formatMetricValue(tokenDiff, 'percent')} foot={tokenDiff == null ? tokenReason : undefined} red compact />
+          <ScoreBox label="SD（语义漂移）" value={formatMetricValue(asrEval.semanticDrift, 'number')} foot={semanticFoot} red compact />
           <ScoreBox label="IR（插入率）" value={formatMetricValue(insertRate, 'percent')} red compact />
           <ScoreBox label="DR（删除率）" value={formatMetricValue(deleteRate, 'percent')} red compact />
         </div>
@@ -639,8 +656,8 @@ function AsrTab({ asrEval, editStats }: { asrEval?: AsrEval | null; editStats: E
       </div>
       <div className="grid grid-cols-[1.05fr_0.95fr] gap-5 max-lg:grid-cols-1">
         <MetricPanel title="语义链路分析">
-          <ScoreBox label="语义表示漂移" value={formatMetricValue(asrEval.semanticDrift, 'percent')} />
-          <ScoreBox label="Token 序列差异" value={formatMetricValue(tokenDiff, 'percent')} />
+          <ScoreBox label="语义表示漂移" value={formatMetricValue(asrEval.semanticDrift, 'number')} foot={semanticFoot} />
+          <ScoreBox label="Token 序列差异" value={formatMetricValue(tokenDiff, 'percent')} foot={tokenDiff == null ? tokenReason : undefined} />
           <ScoreBox label="指标层级" value={asrEval.metricLevel ?? editStats?.level ?? '未生成'} />
         </MetricPanel>
         <RateBreakdown substituteRate={substituteRate} insertRate={insertRate} deleteRate={deleteRate} />
@@ -650,7 +667,7 @@ function AsrTab({ asrEval, editStats }: { asrEval?: AsrEval | null; editStats: E
   )
 }
 
-function CloneTab({ cloneEval, loading, status }: { cloneEval?: CloneEval | null; loading: boolean; status: TaskStatusResponse | null }) {
+function CloneTab({ result, cloneEval, loading, status }: { result: TaskResult; cloneEval?: CloneEval | null; loading: boolean; status: TaskStatusResponse | null }) {
   if (loading) {
     return (
       <div className="grid items-center gap-6 pl-1 lg:grid-cols-[minmax(0,1fr)_58px_minmax(0,1fr)]">
@@ -670,8 +687,11 @@ function CloneTab({ cloneEval, loading, status }: { cloneEval?: CloneEval | null
     )
   }
 
+  const cloneReason = cloneEval.reason ? shortMetricReason(cloneEval.reason) : metricReason(result, ['cloneEval.*'])
+
   return (
     <div className="space-y-5">
+      {cloneReason ? <MetricNotice text={`克隆指标未生成原因：${cloneReason}`} /> : null}
       <div className="grid items-center gap-6 pl-1 lg:grid-cols-[minmax(0,1fr)_58px_minmax(0,1fr)]">
         {cloneEval.originalCloneAudio ? <AudioCard title="克隆原语音" audio={cloneEval.originalCloneAudio} color="#a78bfa" /> : <EmptyMetricCard title="克隆原语音" text="后端未返回克隆原语音" />}
         <div className="mx-auto grid h-12 w-12 place-items-center rounded-full border border-violet-300/28 bg-slate-950/70 text-[18px] font-black text-white">VS</div>
@@ -682,7 +702,7 @@ function CloneTab({ cloneEval, loading, status }: { cloneEval?: CloneEval | null
           <CloneIdentityPanel cloneEval={cloneEval} />
           <CloneResultPanel cloneEval={cloneEval} />
         </div>
-        <CloneVisualizationPanel cloneEval={cloneEval} />
+        <CloneVisualizationPanel result={result} cloneEval={cloneEval} />
       </div>
       <div className="grid grid-cols-1 gap-5">
         <InsightPanel title="克隆结果解读" items={generateCloneInsights(cloneEval)} />
@@ -733,6 +753,14 @@ function EmptyState({ title, text }: { title: string; text: string }) {
   )
 }
 
+function MetricNotice({ text }: { text: string }) {
+  return (
+    <div className="rounded-[7px] border border-amber-300/20 bg-amber-300/[0.06] px-3 py-2 text-xs leading-5 text-amber-100">
+      {text}
+    </div>
+  )
+}
+
 function MetricPanel({ title, children }: { title: string; children: ReactNode }) {
   return (
     <section className="rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
@@ -778,7 +806,10 @@ function RateBreakdown({ substituteRate, insertRate, deleteRate }: { substituteR
 function CloneIdentityPanel({ cloneEval }: { cloneEval: CloneEval }) {
   const similarityDropRate = optionalNumber(cloneEval.similarityDropRate) ?? computeDropRate(cloneEval.originalSimilarity, cloneEval.protectedSimilarity)
   const embeddingIncreaseRate = optionalNumber(cloneEval.embeddingDistanceIncreaseRate) ?? computeRateChange(cloneEval.embeddingDistanceBefore, cloneEval.embeddingDistanceAfter)
-  const confidenceDropRate = optionalNumber(cloneEval.cloneConfidenceDropRate) ?? computeDropRate(cloneEval.cloneConfidenceBefore, cloneEval.cloneConfidenceAfter)
+  const confidenceDropRate = optionalNumber(cloneEval.cloneConfidenceDropRate)
+  const confidenceBefore = formatCloneConfidence(cloneEval.cloneConfidenceBefore)
+  const confidenceAfter = formatCloneConfidence(cloneEval.cloneConfidenceAfter)
+  const confidenceDelta = confidenceDropRate === null ? '未生成 / 未配置校准模型' : `↓ ${formatMetricValue(confidenceDropRate, 'percent')}`
 
   return (
     <section className="rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
@@ -802,10 +833,10 @@ function CloneIdentityPanel({ cloneEval }: { cloneEval: CloneEval }) {
         />
         <FeatureStatCard
           title="克隆可置信度"
-          before={formatMetricValue(cloneEval.cloneConfidenceBefore, 'percent')}
-          after={formatMetricValue(cloneEval.cloneConfidenceAfter, 'percent')}
-          delta={`↓ ${formatMetricValue(confidenceDropRate, 'percent')}`}
-          foot="缺失时不推断"
+          before={confidenceBefore}
+          after={confidenceAfter}
+          delta={confidenceDelta}
+          foot="未配置校准模型时不把 SIM 当作 cloneConfidence"
           tone="green"
         />
       </div>
@@ -828,20 +859,24 @@ function CloneResultPanel({ cloneEval }: { cloneEval: CloneEval }) {
   )
 }
 
-function CloneVisualizationPanel({ cloneEval }: { cloneEval: CloneEval }) {
+function CloneVisualizationPanel({ result, cloneEval }: { result: TaskResult; cloneEval: CloneEval }) {
+  const radar = cloneEval.cloneRadar ?? result.speakerFeatureMap?.radar ?? result.charts?.speakerRadar ?? null
+  const availableRadar = (radar ?? []).filter((item) => typeof item.value === 'number' && Number.isFinite(item.value))
+
   return (
     <section className="flex min-h-[360px] flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
       <div className="flex items-center justify-between gap-4">
-        <SectionTitle>说话人特征图</SectionTitle>
-        <span className="text-[10px] text-slate-500">雷达 / 趋势由后端返回</span>
+        <SectionTitle>说话人防护雷达图</SectionTitle>
+        <span className="text-[10px] text-slate-500">由后端真实指标动态生成</span>
       </div>
-      <div className="mt-5 grid min-h-0 flex-1 grid-rows-[minmax(180px,1fr)_minmax(120px,0.62fr)] gap-4">
-        <div className="overflow-hidden rounded-[9px] border border-cyan-300/12 bg-slate-950/16 p-4">
-          {cloneEval.cloneRadar?.length ? <CloneRadarPreview cloneEval={cloneEval} /> : <ChartEmptyState text="后端未返回说话人特征雷达数据" />}
-        </div>
-        <div className="overflow-hidden rounded-[9px] border border-cyan-300/12 bg-slate-950/16 p-4">
-          {cloneEval.cloneTrend?.length ? <CloneTrendPreview cloneEval={cloneEval} /> : <ChartEmptyState text="克隆趋势需后端返回逐步评估数据，当前仅展示最终评估结果" />}
-        </div>
+      <div className="mt-5 min-h-[320px] flex-1 overflow-hidden rounded-[9px] border border-cyan-300/12 bg-slate-950/16 p-4">
+        {!radar?.length ? (
+          <ChartEmptyState text="后端未返回说话人防护雷达数据" />
+        ) : availableRadar.length < 3 ? (
+          <ChartEmptyState text="后端返回的可用雷达指标不足，至少需要 3 个真实指标" />
+        ) : (
+          <CloneRadarPreview radar={radar} availableRadar={availableRadar} />
+        )}
       </div>
     </section>
   )
@@ -851,21 +886,67 @@ function ChartEmptyState({ text }: { text: string }) {
   return <div className="grid h-full min-h-[110px] place-items-center text-center text-xs leading-5 text-slate-500">{text}</div>
 }
 
-function CloneRadarPreview({ cloneEval }: { cloneEval: CloneEval }) {
+function CloneRadarPreview({ radar, availableRadar }: { radar: RadarPoint[]; availableRadar: RadarPoint[] }) {
+  const width = 360
+  const height = 300
+  const centerX = width / 2
+  const centerY = height / 2
+  const radius = 104
+  const axisPoints = availableRadar.map((item, index) => {
+    const angle = -Math.PI / 2 + (index / availableRadar.length) * Math.PI * 2
+    const normalized = Math.max(0, Math.min(100, item.value ?? 0)) / 100
+    return {
+      item,
+      angle,
+      axisX: centerX + Math.cos(angle) * radius,
+      axisY: centerY + Math.sin(angle) * radius,
+      valueX: centerX + Math.cos(angle) * radius * normalized,
+      valueY: centerY + Math.sin(angle) * radius * normalized,
+      labelX: centerX + Math.cos(angle) * (radius + 34),
+      labelY: centerY + Math.sin(angle) * (radius + 26),
+    }
+  })
+  const polygon = axisPoints.map((point) => `${point.valueX.toFixed(1)},${point.valueY.toFixed(1)}`).join(' ')
+  const missing = radar.filter((item) => !(typeof item.value === 'number' && Number.isFinite(item.value)))
+  const missingNames = missing.map((item) => item.reason ? `${item.name}（${item.reason}）` : item.name).filter(Boolean)
+
   return (
-    <div className="grid h-full content-center grid-cols-2 gap-3 text-sm text-slate-300">
-      {cloneEval.cloneRadar?.map((item, index) => (
-        <p key={`${item.name ?? index}`} className="flex justify-between gap-3 rounded-[6px] bg-white/[0.025] px-3 py-2">
-          <span>{String(item.name ?? item.label ?? `指标 ${index + 1}`)}</span>
-          <span className="font-mono text-cyan-200">{formatMetricValue(typeof item.value === 'number' ? item.value : null, 'number')}</span>
-        </p>
-      ))}
+    <div className="flex h-full min-h-[300px] flex-col">
+      <div className="min-h-0 flex-1">
+        <svg viewBox={`0 0 ${width} ${height}`} className="h-full min-h-[260px] w-full">
+          {[0.25, 0.5, 0.75, 1].map((scale) => (
+            <polygon
+              key={scale}
+              points={axisPoints.map((point) => `${(centerX + Math.cos(point.angle) * radius * scale).toFixed(1)},${(centerY + Math.sin(point.angle) * radius * scale).toFixed(1)}`).join(' ')}
+              fill="none"
+              stroke="rgba(148,163,184,.16)"
+              strokeWidth="1"
+            />
+          ))}
+          {axisPoints.map((point) => (
+            <line key={point.item.name} x1={centerX} y1={centerY} x2={point.axisX} y2={point.axisY} stroke="rgba(148,163,184,.18)" strokeWidth="1" />
+          ))}
+          <polygon points={polygon} fill="rgba(34,211,238,.18)" stroke="#67e8f9" strokeWidth="2" />
+          {axisPoints.map((point) => (
+            <g key={point.item.name}>
+              <circle cx={point.valueX} cy={point.valueY} r="3.5" fill="#fcd34d" />
+              <text x={point.labelX} y={point.labelY} textAnchor={point.labelX < centerX - 8 ? 'end' : point.labelX > centerX + 8 ? 'start' : 'middle'} fontSize="11" fontWeight="700" fill="#cbd5e1">
+                {point.item.name}
+              </text>
+              <text x={point.labelX} y={point.labelY + 14} textAnchor={point.labelX < centerX - 8 ? 'end' : point.labelX > centerX + 8 ? 'start' : 'middle'} fontSize="10" fill="#67e8f9">
+                {formatMetricValue(point.item.value, 'number')}
+              </text>
+            </g>
+          ))}
+        </svg>
+      </div>
+      {missingNames.length ? (
+        <div className="overflow-hidden rounded-[9px] border border-cyan-300/12 bg-slate-950/16 p-4">
+          <p className="text-xs leading-5 text-slate-500">部分指标未生成：{missingNames.join('；')}</p>
+        </div>
+      ) : null}
     </div>
   )
-}
-
-function CloneTrendPreview({ cloneEval }: { cloneEval: CloneEval }) {
-  return <div className="grid h-full min-h-[110px] place-items-center text-center text-xs leading-5 text-slate-500">后端已返回 {cloneEval.cloneTrend?.length ?? 0} 个克隆趋势点。</div>
 }
 
 function AsrEvalModal({
@@ -1201,7 +1282,7 @@ function renderDiffOps(diffOps: DiffOp[]): ReactNode[] {
   return nodes
 }
 
-function ScoreBox({ label, value, red, compact }: { label: string; value: string; red?: boolean; compact?: boolean }) {
+function ScoreBox({ label, value, red, compact, foot }: { label: string; value: string; red?: boolean; compact?: boolean; foot?: string }) {
   return (
     <div className={cn('rounded-[9px] border border-cyan-300/12 bg-slate-950/16 text-center', compact ? 'min-h-[64px] p-2.5' : 'min-h-[82px] p-3')}>
       <p className="mx-auto max-w-full text-[11px] leading-4 text-slate-400">{label}</p>
@@ -1210,6 +1291,7 @@ function ScoreBox({ label, value, red, compact }: { label: string; value: string
           {value}
         </span>
       </div>
+      {foot ? <p className="mt-1 line-clamp-2 text-[10px] leading-4 text-slate-500" title={foot}>{foot}</p> : null}
     </div>
   )
 }
@@ -1233,7 +1315,52 @@ function QualityPanel({ result, embedded }: { result: TaskResult; embedded?: boo
   const snr = optionalNumber(result.protectionQuality?.snr) ?? optionalNumber(result.quality.snr)
   const pesq = optionalNumber(result.protectionQuality?.pesq) ?? optionalNumber(result.quality.pesq)
   const stoi = optionalNumber(result.protectionQuality?.stoi)
-  const mosLqo = optionalNumber(result.protectionQuality?.mosLqo ?? result.protectionQuality?.mos) ?? optionalNumber(result.quality.mosLqo)
+  const backendMos = optionalNumber(result.protectionQuality?.mos)
+  const manualMosKey = `manual-mos:${result.taskId || 'current'}`
+  const [manualMos, setManualMos] = useState<number | null>(null)
+  const [editingMos, setEditingMos] = useState(false)
+  const [mosDraft, setMosDraft] = useState('')
+  const mos = backendMos ?? manualMos
+  const missingReasons = [
+    pesq === null ? ['PESQ', metricReason(result, ['protectionQuality.pesq'])] : null,
+    stoi === null ? ['STOI', metricReason(result, ['protectionQuality.stoi'])] : null,
+  ].filter((item): item is [string, string] => Boolean(item?.[1]))
+
+  useEffect(() => {
+    const saved = window.localStorage.getItem(manualMosKey)
+    if (saved === null) {
+      setManualMos(null)
+      return
+    }
+    const value = Number(saved)
+    setManualMos(Number.isFinite(value) ? clamp(value, 1, 5) : null)
+  }, [manualMosKey])
+
+  const startMosEdit = () => {
+    if (backendMos !== null) return
+    setMosDraft(manualMos === null ? '' : String(manualMos))
+    setEditingMos(true)
+  }
+
+  const commitMosEdit = () => {
+    const trimmed = mosDraft.trim()
+    if (!trimmed) {
+      window.localStorage.removeItem(manualMosKey)
+      setManualMos(null)
+      setEditingMos(false)
+      return
+    }
+    const value = Number(trimmed)
+    if (!Number.isFinite(value)) {
+      setEditingMos(false)
+      return
+    }
+    const normalized = Math.round(clamp(value, 1, 5) * 10) / 10
+    window.localStorage.setItem(manualMosKey, String(normalized))
+    setManualMos(normalized)
+    setEditingMos(false)
+  }
+
   return (
     <section className={cn(embedded ? 'mt-5' : 'ui-card p-5')}>
       <SectionTitle>感知质量评估</SectionTitle>
@@ -1241,8 +1368,44 @@ function QualityPanel({ result, embedded }: { result: TaskResult; embedded?: boo
         <QualityMetric label="SNR（信噪比）" value={formatMetricValue(snr, 'db')} tag={snr === null ? '未生成' : 'computed'} tone="green" />
         <QualityMetric label="PESQ" value={formatMetricValue(pesq, 'number')} tag={pesq === null ? '未生成' : 'perception'} tone="blue" />
         <QualityMetric label="STOI" value={formatMetricValue(stoi, 'number')} tag={stoi === null ? '未生成' : 'perception'} tone="blue" />
-        <QualityMetric label="MOS-LQO" value={formatMetricValue(mosLqo, 'number')} tag={mosLqo === null ? '未生成' : 'perception'} tone="orange" />
+        <QualityMetric
+          label="MOS（人工）"
+          value={
+            editingMos ? (
+              <input
+                autoFocus
+                className="h-7 w-20 rounded-[6px] border border-orange-300/28 bg-slate-950/80 px-2 text-center text-[18px] font-black leading-none text-orange-200 outline-none focus:border-orange-200"
+                inputMode="decimal"
+                max={5}
+                min={1}
+                onBlur={commitMosEdit}
+                onChange={(event) => setMosDraft(event.target.value)}
+                onClick={(event) => event.stopPropagation()}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') commitMosEdit()
+                  if (event.key === 'Escape') setEditingMos(false)
+                }}
+                step={0.1}
+                type="number"
+                value={mosDraft}
+              />
+            ) : mos === null ? (
+              '自行评价'
+            ) : (
+              formatMetricValue(mos, 'number')
+            )
+          }
+          onClick={backendMos === null ? startMosEdit : undefined}
+          tag={backendMos === null ? (manualMos === null ? '点击输入' : '人工反馈') : 'perception'}
+          title={backendMos === null ? '点击输入 1-5 分人工 MOS' : undefined}
+          tone="orange"
+        />
       </div>
+      {missingReasons.length ? (
+        <p className="mt-3 text-xs leading-5 text-slate-500">
+          未生成原因：{missingReasons.map(([name, reason]) => `${name}: ${reason}`).join('；')}
+        </p>
+      ) : null}
     </section>
   )
 }
@@ -1253,8 +1416,14 @@ function PsychoacousticPanel({ result }: { result: TaskResult }) {
       <div className="flex items-center justify-between gap-4">
         <SectionTitle>心理声学阈值分析（关键频段）</SectionTitle>
         <div className="flex shrink-0 gap-4 text-[10px] text-slate-400">
-          <span className="text-emerald-300">— 掩蔽阈值</span>
-          <span className="text-lime-300">— 防护扰动谱</span>
+          <span className="flex items-center gap-1.5 text-cyan-200">
+            <span className="h-0 w-5 border-t-2 border-dashed border-cyan-300" />
+            掩蔽阈值
+          </span>
+          <span className="flex items-center gap-1.5 text-amber-200">
+            <span className="h-0 w-5 border-t-2 border-amber-300" />
+            防护扰动谱
+          </span>
         </div>
       </div>
       <div className="mt-5 min-h-0 flex-1 overflow-hidden rounded-[9px] border border-cyan-300/12 bg-slate-950/16 px-4 py-3">
@@ -1264,11 +1433,24 @@ function PsychoacousticPanel({ result }: { result: TaskResult }) {
   )
 }
 
-function QualityMetric({ label, value, tag, tone }: { label: string; value: string; tag: string; tone: 'green' | 'blue' | 'orange' }) {
+function QualityMetric({ label, value, tag, tone, onClick, title }: { label: string; value: ReactNode; tag: string; tone: 'green' | 'blue' | 'orange'; onClick?: () => void; title?: string }) {
   return (
-    <div className="h-[86px] rounded-[9px] border border-cyan-300/12 bg-slate-950/16 p-3 text-center">
+    <div
+      className={cn('h-[86px] rounded-[9px] border border-cyan-300/12 bg-slate-950/16 p-3 text-center', onClick && 'cursor-pointer transition hover:border-orange-300/28 hover:bg-orange-300/[0.04]')}
+      onClick={onClick}
+      onKeyDown={(event) => {
+        if (!onClick) return
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault()
+          onClick()
+        }
+      }}
+      role={onClick ? 'button' : undefined}
+      tabIndex={onClick ? 0 : undefined}
+      title={title}
+    >
       <p className="whitespace-nowrap text-[11px] text-slate-400">{label}</p>
-      <p className={cn('mt-1 text-[20px] font-black leading-none', tone === 'green' && 'text-emerald-300', tone === 'blue' && 'text-cyan-300', tone === 'orange' && 'text-orange-300')}>{value}</p>
+      <div className={cn('mt-1 flex h-6 items-center justify-center text-[20px] font-black leading-none', tone === 'green' && 'text-emerald-300', tone === 'blue' && 'text-cyan-300', tone === 'orange' && 'text-orange-300')}>{value}</div>
       <span className={cn('mt-1.5 inline-block rounded px-3 py-0.5 text-[11px] font-bold', tone === 'green' && 'bg-emerald-400/14 text-emerald-300', tone === 'blue' && 'bg-cyan-400/14 text-cyan-300', tone === 'orange' && 'bg-orange-400/14 text-orange-300')}>{tag}</span>
     </div>
   )
@@ -1494,10 +1676,46 @@ function formatMetricValue(value: unknown, type: 'percent' | 'db' | 'seconds' | 
   return numberValue.toFixed(3).replace(/\.?0+$/, '')
 }
 
+function formatCloneConfidence(value: unknown) {
+  return optionalNumber(value) === null ? '未生成 / 未配置校准模型' : formatMetricValue(value, 'percent')
+}
+
 function optionalNumber(value: unknown) {
   if (value === null || value === undefined || value === '') return null
   const numberValue = typeof value === 'number' ? value : Number(value)
   return Number.isFinite(numberValue) ? numberValue : null
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value))
+}
+
+function metricSource(result: TaskResult, keys: string[]) {
+  for (const key of keys) {
+    const source = result.metricSources?.[key]
+    if (source) return source
+  }
+  return undefined
+}
+
+function metricReason(result: TaskResult, keys: string[]) {
+  const reason = metricSource(result, keys)?.reason
+  return reason ? shortMetricReason(reason) : ''
+}
+
+function metricSourceLabel(result: TaskResult, keys: string[]) {
+  const source = metricSource(result, keys)
+  if (!source?.source) return ''
+  return `来源：${source.source}`
+}
+
+function shortMetricReason(reason: string) {
+  if (/torchcodec|libtorchcodec|FFmpeg/i.test(reason)) return '语义 tokenizer 依赖 torchcodec/FFmpeg 未正确加载'
+  if (/local cache|Hub|connection|Internet/i.test(reason)) return '说话人模型未在本地缓存，且当前无法从 Hub 加载'
+  const pesqSampleRate = /PESQ supports 8000 or 16000 Hz, got (\d+)/i.exec(reason)
+  if (pesqSampleRate) return `PESQ 仅支持 8k/16k，当前 ${pesqSampleRate[1]} Hz`
+  if (/confidence calibrator/i.test(reason) || /calibrated clone confidence/i.test(reason)) return '未配置克隆置信度校准模型'
+  return reason.split('\n')[0].trim()
 }
 
 function formatLossNumber(value: unknown) {
@@ -1567,31 +1785,8 @@ function averageStepSecFromTrace(trace: LossTrendPoint[]) {
   return values.reduce((sum, value) => sum + value, 0) / values.length
 }
 
-function firstLastChange(trace: LossTrendPoint[], key: keyof Pick<LossTrendPoint, 'Lfeat' | 'Lsem' | 'Lpsy' | 'L2'>, direction: 'drop' | 'increase') {
-  const values = trace.map((point) => optionalNumber(point[key])).filter((value): value is number => value !== null)
-  if (values.length < 2) return null
-  return direction === 'drop' ? computeDropRate(values[0], values.at(-1)) : computeRateChange(values[0], values.at(-1))
-}
-
-function generateProtectionInsights(result: TaskResult) {
-  const trace = result.optimizationTrace ?? result.generation?.optimizationTrace ?? []
-  const snr = optionalNumber(result.perturbation?.snr) ?? optionalNumber(result.protectionQuality?.snr) ?? optionalNumber(result.quality.snr)
-  const pesq = optionalNumber(result.protectionQuality?.pesq) ?? optionalNumber(result.quality.pesq)
-  const mosLqo = optionalNumber(result.protectionQuality?.mosLqo ?? result.protectionQuality?.mos) ?? optionalNumber(result.quality.mosLqo)
-  const items: string[] = []
-  if (getAudioSource(result.protectedAudio)) items.push('保护扰动已成功生成，后端返回了保护音频。')
-  else items.push('后端未返回保护音频，无法确认保护扰动是否生成。')
-  const featDrop = firstLastChange(trace, 'Lfeat', 'drop')
-  const semDrop = firstLastChange(trace, 'Lsem', 'drop')
-  if ((featDrop ?? 0) > 0.1 || (semDrop ?? 0) > 0.1) items.push('loss trace 显示机器表示空间发生偏移，可作为保护链路的过程证据。')
-  const psyIncrease = firstLastChange(trace, 'Lpsy', 'increase')
-  const l2Increase = firstLastChange(trace, 'L2', 'increase')
-  if ((psyIncrease ?? 0) > 0.2 || (l2Increase ?? 0) > 0.2) items.push('扰动相关 loss 首尾上升超过 20%，可能提升防护强度，也会增加听感风险。')
-  if (snr !== null && snr < 10) items.push('SNR 低于 10 dB，建议提高保真相关 lambda 或降低保护强度。')
-  if (pesq !== null && pesq < 2.5) items.push('PESQ 低于 2.5，存在听感退化风险。')
-  if (mosLqo !== null && mosLqo < 3.0) items.push('MOS-LQO 低于 3.0，建议提高 lambdaPsy / lambda2。')
-  if (pesq === null || mosLqo === null) items.push('部分听感指标未生成，当前不做强结论。')
-  return items
+function generateProtectionInsights(_result: TaskResult) {
+  return ['已生成防护报告']
 }
 
 function generateAsrInsights(asrEval: AsrEval, editStats: EditMetrics | null) {
@@ -1660,36 +1855,71 @@ function LineChart({ result, large }: { result: TaskResult; large?: boolean }) {
         })
       : []
   const points = spectrumPoints.length ? spectrumPoints : result.charts.psychoacoustic
+  const [windowStart, setWindowStart] = useState(0)
   const width = 720
   const height = large ? 220 : 58
+  const windowSize = large ? Math.min(points.length, 48) : points.length
+  const maxStart = Math.max(0, points.length - windowSize)
+  const start = Math.min(windowStart, maxStart)
+  const visiblePoints = large && points.length > windowSize ? points.slice(start, start + windowSize) : points
   if (points.length === 0) {
     return <div className="grid h-full place-items-center text-xs text-slate-500">后端未返回心理声学频谱数据</div>
   }
-  const values = points.flatMap((p) => [p.maskingThreshold, p.perturbation].filter((value): value is number => typeof value === 'number' && Number.isFinite(value)))
+  const values = visiblePoints.flatMap((p) => [p.maskingThreshold, p.perturbation].filter((value): value is number => typeof value === 'number' && Number.isFinite(value)))
   const max = Math.max(...values, 1)
   const min = Math.min(...values, 0)
   const span = Math.max(1, max - min)
   const toPoints = (key: 'maskingThreshold' | 'perturbation') =>
-    points
+    visiblePoints
       .map((point, index) => {
-        const x = (index / Math.max(1, points.length - 1)) * width
-        const y = height - 6 - (((point[key] ?? 0) - min) / span) * (height - 12)
+        const value = point[key]
+        if (typeof value !== 'number' || !Number.isFinite(value)) return null
+        const x = (index / Math.max(1, visiblePoints.length - 1)) * width
+        const y = height - 6 - ((value - min) / span) * (height - 12)
         return `${x.toFixed(1)},${y.toFixed(1)}`
       })
+      .filter((point): point is string => point !== null)
       .join(' ')
+  const labelEvery = Math.max(1, Math.ceil(visiblePoints.length / 8))
+  const firstFrequency = visiblePoints[0]?.frequency
+  const lastFrequency = visiblePoints.at(-1)?.frequency
 
   return (
-    <svg viewBox={`0 0 ${width} ${height}`} className={cn('w-full overflow-hidden', large ? 'h-full min-h-[220px]' : 'h-[58px]')}>
-      {(large ? [34, 78, 122, 166] : [10, 28, 46]).map((y) => (
-        <line key={y} x1="0" x2={width} y1={y} y2={y} stroke="rgba(148,163,184,.13)" />
-      ))}
-      <polyline points={toPoints('maskingThreshold')} fill="none" stroke="#22c55e" strokeWidth="2" />
-      <polyline points={toPoints('perturbation')} fill="none" stroke="#86efac" strokeDasharray="6 5" strokeWidth="2" />
-      {points.filter((_, index) => index % 4 === 0).map((point, index) => (
-        <text key={point.frequency} x={index * 4 * (width / Math.max(1, points.length - 1))} y={height - 4} fontSize={large ? '11' : '9'} fill="#64748b">
-          {point.frequency >= 1000 ? `${Math.round(point.frequency / 1000)}k` : point.frequency}
-        </text>
-      ))}
-    </svg>
+    <div className="flex h-full min-h-[220px] flex-col">
+      <svg viewBox={`0 0 ${width} ${height}`} className={cn('min-h-0 w-full flex-1 overflow-hidden', large ? 'h-full min-h-[190px]' : 'h-[58px]')}>
+        {(large ? [34, 78, 122, 166] : [10, 28, 46]).map((y) => (
+          <line key={y} x1="0" x2={width} y1={y} y2={y} stroke="rgba(148,163,184,.13)" />
+        ))}
+        <polyline points={toPoints('maskingThreshold')} fill="none" stroke="#67e8f9" strokeDasharray="6 5" strokeWidth="2" />
+        <polyline points={toPoints('perturbation')} fill="none" stroke="#fcd34d" strokeWidth="2" />
+        {visiblePoints.filter((_, index) => index % labelEvery === 0).map((point, labelIndex) => (
+          <text key={`${point.frequency}-${labelIndex}`} x={labelIndex * labelEvery * (width / Math.max(1, visiblePoints.length - 1))} y={height - 4} fontSize={large ? '11' : '9'} fill="#64748b">
+            {point.frequency >= 1000 ? `${Math.round(point.frequency / 1000)}k` : Math.round(point.frequency)}
+          </text>
+        ))}
+      </svg>
+      {large && maxStart > 0 ? (
+        <div className="mt-2 flex items-center gap-3 text-[10px] text-slate-500">
+          <span className="w-14 text-right">{formatFrequency(firstFrequency)}</span>
+          <input
+            type="range"
+            min={0}
+            max={maxStart}
+            value={start}
+            onChange={(event) => setWindowStart(Number(event.target.value))}
+            className="h-1 min-w-0 flex-1 accent-cyan-300"
+            aria-label="频率范围"
+          />
+          <span className="w-14">{formatFrequency(lastFrequency)}</span>
+        </div>
+      ) : null}
+    </div>
   )
+}
+
+function formatFrequency(value: unknown) {
+  const hz = optionalNumber(value)
+  if (hz === null) return '-'
+  if (hz >= 1000) return `${(hz / 1000).toFixed(hz >= 10000 ? 0 : 1)}k`
+  return `${Math.round(hz)}`
 }

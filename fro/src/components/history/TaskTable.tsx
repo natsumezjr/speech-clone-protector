@@ -80,14 +80,16 @@ function statusTextForView(task: HistoryTask, view: HistoryView) {
   return `${label}完成`
 }
 
+function modelForView(task: HistoryTask, view: HistoryView) {
+  if (view === 'asr') return task.asrModel
+  if (view === 'clone') return task.cloneModel
+  return task.processingModel
+}
+
 function modeLabel(task: HistoryTask) {
   const base = baseModeText[task.mode] ?? task.mode
   const target = task.targetMode ? targetText[task.targetMode] ?? task.targetMode : '联合保护'
   return `${base}${target}`
-}
-
-function formatMetric(value: number | null | undefined, digits = 2) {
-  return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '未生成'
 }
 
 function ParamModal({ task, onClose }: { task: HistoryTask; onClose: () => void }) {
@@ -169,7 +171,7 @@ export function TaskTable({ tasks, view, onDeleted }: { tasks: HistoryTask[]; vi
         <table className="w-full min-w-[1120px] text-center text-sm">
           <thead className="border-b border-cyan-300/10 bg-slate-950/32 text-xs text-slate-400">
             <tr>
-              {['文件名', '模式', '状态', '进度', 'WER', 'Feature 相似度下降', 'PESQ', '起始image.png时间', '处理时间', '操作'].map((head) => (
+              {['文件名', '模式', '状态', '进度', '模型名称', '起始时间', '处理时间', '操作'].map((head) => (
                 <th key={head} className="px-4 py-3 font-medium">
                   {head}
                 </th>
@@ -204,9 +206,7 @@ export function TaskTable({ tasks, view, onDeleted }: { tasks: HistoryTask[]; vi
                     </div>
                     <p className="mt-1 text-center font-mono text-xs text-slate-500">{Math.round(progress * 100)}%</p>
                   </td>
-                  <td className="px-4 py-4 text-slate-300">{formatMetric(task.wer)}</td>
-                  <td className="px-4 py-4 text-slate-300">{formatMetric(task.simDropRate)}</td>
-                  <td className="px-4 py-4 text-slate-300">{formatMetric(task.pesq)}</td>
+                  <td className="px-4 py-4 text-slate-300">{modelForView(task, view) || '-'}</td>
                   <td className="px-4 py-4 text-slate-400">{formatDate(task.createdAt)}</td>
                   <td className="px-4 py-4 text-slate-300">{elapsed !== null ? seconds(elapsed) : '-'}</td>
                   <td className="px-4 py-4">

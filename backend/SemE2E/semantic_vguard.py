@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -417,6 +418,7 @@ class SemanticE2EVGuard:
 
         trace_steps = trace_step_numbers(self.max_items)
         for step in tqdm(range(self.max_items)):
+            step_start = time.perf_counter()
             step_number = step + 1
             if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("TASK_CANCELLED")
@@ -466,19 +468,6 @@ class SemanticE2EVGuard:
                     "total": float(loss.item()),
                     "snr": float(self.calculate_snr(wave, adv_wave.detach()).item()),
                 }
-                optimization_trace.append(trace_point)
-            if progress_callback is not None:
-                try:
-                    progress_callback(
-                        step=step_number,
-                        total=self.max_items,
-                        loss_items=loss_items,
-                        trace=trace_point,
-                    )
-                except Exception as exc:
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise RuntimeError("TASK_CANCELLED") from exc
-                    pass
 
             if verbose and step % 50 == 0:
                 print(step, loss_items, self.lr)
@@ -499,6 +488,21 @@ class SemanticE2EVGuard:
             noise = torch.clamp(adv_wave.data - wave, min=-self.epsilon, max=self.epsilon)
             adv_wave = torch.clamp(wave + noise, min=-1.0, max=1.0)
             adv_wave.requires_grad = True
+            if trace_point is not None:
+                trace_point["stepElapsedSec"] = time.perf_counter() - step_start
+                optimization_trace.append(trace_point)
+            if progress_callback is not None:
+                try:
+                    progress_callback(
+                        step=step_number,
+                        total=self.max_items,
+                        loss_items=loss_items,
+                        trace=trace_point,
+                    )
+                except Exception as exc:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise RuntimeError("TASK_CANCELLED") from exc
+                    pass
 
         snr = self.calculate_snr(wave, adv_wave.detach()).item()
         adv_wave = adv_wave[:, :original_length]

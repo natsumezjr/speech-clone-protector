@@ -12,6 +12,8 @@ import numpy as np
 
 
 EPS = 1.0e-12
+_S3_TOKENIZER_CACHE: dict[tuple[str, str], Any] = {}
+_SEMANTIC_ENCODER_CACHE: dict[tuple[str, str, str, str], Any] = {}
 
 
 def now_iso() -> str:
@@ -47,8 +49,10 @@ def weighted_available_mean(items: dict[str, tuple[float | None, float]]) -> flo
     return weighted / weight_sum
 
 
-def metric_source(status: str, source: str, reason: str | None = None, formula: str | None = None) -> dict[str, Any]:
+def metric_source(status: str, source: str, reason: str | None = None, formula: str | None = None, metric: str | None = None) -> dict[str, Any]:
     payload: dict[str, Any] = {"status": status, "source": source}
+    if metric:
+        payload["metric"] = metric
     if reason:
         payload["reason"] = reason
     if formula:
@@ -58,6 +62,44 @@ def metric_source(status: str, source: str, reason: str | None = None, formula: 
 
 def _module_available(name: str) -> bool:
     return importlib.util.find_spec(name) is not None
+
+
+def load_s3_tokenizer(model_name_or_path: str | None = None, device: str | None = None) -> Any:
+    """Load the S3 semantic tokenizer used for real token metrics."""
+
+    model = model_name_or_path or os.getenv("SEME2E_TOKENIZER_MODEL") or "speech_tokenizer_v1_25hz"
+    resolved_device = device or os.getenv("SEME2E_TOKENIZER_DEVICE") or os.getenv("SEME2E_API_DEVICE") or "cpu"
+    cache_key = (str(model), str(resolved_device))
+    if cache_key not in _S3_TOKENIZER_CACHE:
+        import s3tokenizer
+
+        _S3_TOKENIZER_CACHE[cache_key] = s3tokenizer.load_model(model).to(resolved_device).eval()
+    return _S3_TOKENIZER_CACHE[cache_key]
+
+
+def _to_device(value: Any, device: str) -> Any:
+    return value.to(device) if hasattr(value, "to") else value
+
+
+def encode_s3_tokens(audio_path: Path | str) -> list[int]:
+    import s3tokenizer
+    import torch
+
+    device = os.getenv("SEME2E_TOKENIZER_DEVICE") or os.getenv("SEME2E_API_DEVICE") or "cpu"
+    tokenizer = load_s3_tokenizer(device=device)
+    try:
+        audio = s3tokenizer.load_audio(str(audio_path))
+    except Exception:
+        waveform, sample_rate = _read_audio(Path(audio_path))
+        if sample_rate != 16000:
+            waveform = _resample(waveform, sample_rate, 16000)
+        audio = torch.from_numpy(waveform.astype(np.float32))
+    mel = s3tokenizer.log_mel_spectrogram(audio)
+    mels, mels_lens = s3tokenizer.padding([mel])
+    codes, codes_lens = tokenizer.quantize(_to_device(mels, device), _to_device(mels_lens, device))
+    length = int(codes_lens[0].item() if hasattr(codes_lens[0], "item") else codes_lens[0])
+    tokens = codes[0, :length].detach().cpu().long().flatten().tolist()
+    return [int(item) for item in tokens]
 
 
 def _read_audio(path: Path) -> tuple[np.ndarray, int]:
@@ -176,16 +218,18 @@ def compute_quality_metrics(
         "protectionQuality.mosLqo": metric_source("unavailable", "objective_mos_lqo_model", reason="No explicit MOS-LQO objective model is configured", formula="None without an explicit MOS-LQO model"),
     }
     pesq_value = None
-    if sr not in {8000, 16000}:
-        sources["protectionQuality.pesq"] = metric_source("unavailable", "pesq", reason=f"PESQ supports 8000 or 16000 Hz, got {sr}", formula="pesq(sr, x, xp, mode)")
-    elif not _module_available("pesq"):
+    if not _module_available("pesq"):
         sources["protectionQuality.pesq"] = metric_source("unavailable", "pesq", reason="Python package 'pesq' is not installed", formula="pesq(sr, x, xp, mode)")
     else:
         try:
             from pesq import pesq
 
-            pesq_value = float(pesq(sr, x, xp, "wb" if sr == 16000 else "nb"))
-            sources["protectionQuality.pesq"] = metric_source("available", "pesq", formula="pesq(sr, x, xp, mode)")
+            pesq_sr = sr if sr in {8000, 16000} else 16000
+            pesq_x = x if pesq_sr == sr else _resample(x, sr, pesq_sr)
+            pesq_xp = xp if pesq_sr == sr else _resample(xp, sr, pesq_sr)
+            pesq_value = float(pesq(pesq_sr, pesq_x, pesq_xp, "wb" if pesq_sr == 16000 else "nb"))
+            reason = None if pesq_sr == sr else f"Audio was resampled from {sr} Hz to 16000 Hz for PESQ compatibility"
+            sources["protectionQuality.pesq"] = metric_source("available", "pesq", reason=reason, formula="pesq(sr_supported, x, xp, mode)")
         except Exception as exc:
             sources["protectionQuality.pesq"] = metric_source("error", "pesq", reason=str(exc), formula="pesq(sr, x, xp, mode)")
 
@@ -344,6 +388,7 @@ def _normalize_loss_point(item: dict[str, Any], index: int, weights: dict[str, f
         "Lpsy": finite_float(item.get("Lpsy", item.get("lossPsy", item.get("loss_psy", item.get("L_psy"))))),
         "L2": finite_float(item.get("L2", item.get("lossL2", item.get("loss_l2", item.get("l2Norm"))))),
         "total": finite_float(item.get("total", item.get("lossTotal", item.get("loss_total", item.get("objective"))))),
+        "snr": finite_float(item.get("snr", item.get("SNR"))),
         "stepElapsedSec": finite_float(item.get("stepElapsedSec", item.get("elapsedSec", item.get("step_time")))),
     }
     if point["total"] is None and all(point[key] is not None for key in ["Lfeat", "Lsem", "Lpsy", "L2"]):
@@ -544,8 +589,140 @@ def compute_asr_metrics(
     }
 
 
+def _edit_distance(reference: Sequence[Any], hypothesis: Sequence[Any]) -> int:
+    substitutions, deletions, insertions, _ = _edit_counts_and_ops(reference, hypothesis)
+    return substitutions + deletions + insertions
+
+
+def _pool_vector(value: Any) -> np.ndarray:
+    try:
+        import torch
+
+        if isinstance(value, torch.Tensor):
+            tensor = value.detach().float().cpu()
+            if tensor.ndim == 0:
+                tensor = tensor.reshape(1)
+            if tensor.ndim >= 2:
+                tensor = tensor.reshape(-1, tensor.shape[-1]).mean(dim=0)
+            return tensor.numpy().astype(np.float64).reshape(-1)
+    except Exception:
+        pass
+    arr = np.asarray(value, dtype=np.float64)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    if arr.ndim >= 2:
+        arr = arr.reshape(-1, arr.shape[-1]).mean(axis=0)
+    return arr.reshape(-1)
+
+
+def _cosine_distance(clean_vec: Any, protected_vec: Any) -> tuple[float, float]:
+    clean = _pool_vector(clean_vec)
+    protected = _pool_vector(protected_vec)
+    dim = min(clean.shape[0], protected.shape[0])
+    if dim <= 0:
+        raise ValueError("empty semantic vector")
+    clean = clean[:dim]
+    protected = protected[:dim]
+    denom = float(np.linalg.norm(clean) * np.linalg.norm(protected) + EPS)
+    cosine = float(np.dot(clean, protected) / denom)
+    return cosine, clamp(1.0 - cosine)
+
+
+def _canonical_semantic_encoder_name(value: Any) -> str | None:
+    normalized = str(value or "").strip().lower().replace("_", "-")
+    if not normalized:
+        return None
+    if normalized in {"s3", "speech-tokenizer", "semantic-tokenizer", "tokenizer", "cosyvoice"}:
+        return "s3"
+    if "hubert" in normalized:
+        return "hubert"
+    if "whisper" in normalized:
+        return "whisper"
+    if normalized == "mfcc" or "mfcc" in normalized:
+        return "mfcc"
+    return normalized
+
+
+def _selected_semantic_encoder_names(config: dict[str, Any]) -> set[str] | None:
+    semantic = config.get("semantic") if isinstance(config.get("semantic"), dict) else {}
+    raw = config.get("encoders") or semantic.get("encoders") or config.get("selectedSemanticEncoders")
+    if not isinstance(raw, list) or not raw:
+        return None
+    selected = {_canonical_semantic_encoder_name(item) for item in raw}
+    selected = {item for item in selected if item}
+    return selected or None
+
+
+def _load_semantic_encoder_ensemble(config: dict[str, Any]) -> Any | None:
+    if os.getenv("SEME2E_ENABLE_SEMANTIC_ENCODERS", "1") != "1":
+        return None
+    try:
+        from semantic_encoders import SemanticEncoderEnsemble
+
+        device = os.getenv("SEME2E_SEMANTIC_ENCODER_DEVICE") or os.getenv("SEME2E_API_DEVICE") or os.getenv("SEME2E_TOKENIZER_DEVICE") or "cpu"
+        tokenizer_path = (
+            os.getenv("SEME2E_SEMANTIC_TOKENIZER_MODEL")
+            or os.getenv("SEME2E_TOKENIZER_MODEL")
+            or config.get("tokenizerPath")
+            or "speech_tokenizer_v1_25hz"
+        )
+        hubert_path = os.getenv("SEME2E_HUBERT_MODEL") or config.get("hubertModel") or config.get("hubertPath") or "facebook/hubert-large-ll60k"
+        whisper_path = os.getenv("SEME2E_WHISPER_MODEL") or config.get("whisperModel") or config.get("whisperPath") or "openai/whisper-large-v3"
+        cache_key = (str(device), str(tokenizer_path), str(hubert_path), str(whisper_path))
+        if cache_key not in _SEMANTIC_ENCODER_CACHE:
+            _SEMANTIC_ENCODER_CACHE[cache_key] = SemanticEncoderEnsemble(
+                device=device,
+                tokenizer_path=tokenizer_path,
+                hubert_path=hubert_path,
+                whisper_path=whisper_path,
+                sample_rate=16000,
+            )
+        return _SEMANTIC_ENCODER_CACHE[cache_key]
+    except Exception:
+        return None
+
+
+def _compute_semantic_encoder_distances(clean_path: Path, protected_path: Path, config: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+    ensemble = _load_semantic_encoder_ensemble(config)
+    if ensemble is None:
+        return [], None
+    import torch
+    import torchaudio
+
+    def load_wave(path: Path) -> Any:
+        wave, sr = torchaudio.load(str(path))
+        wave = wave.mean(dim=0, keepdim=True)
+        if sr != 16000:
+            wave = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)(wave)
+        return wave.to(ensemble.device)
+
+    with torch.no_grad():
+        clean_vectors = ensemble.get_vectors(load_wave(clean_path))
+        protected_vectors = ensemble.get_vectors(load_wave(protected_path))
+    names = list(getattr(ensemble, "vector_names", [])) or ["s3", "hubert", "whisper", "mfcc"]
+    display_names = {"s3": "S3", "hubert": "HuBERT", "whisper": "Whisper", "mfcc": "MFCC"}
+    selected = _selected_semantic_encoder_names(config)
+    distances = []
+    for name, clean_vec, protected_vec in zip(names, clean_vectors, protected_vectors):
+        canonical_name = _canonical_semantic_encoder_name(name)
+        if selected is not None and canonical_name not in selected:
+            continue
+        cosine, drift = _cosine_distance(clean_vec, protected_vec)
+        distances.append(
+            {
+                "encoder": display_names.get(str(canonical_name or name).lower(), str(name)),
+                "cosineBeforeAfter": cosine,
+                "distance": drift,
+                "status": "available",
+                "source": "SemanticEncoderEnsemble",
+            }
+        )
+    return distances, "SemanticEncoderEnsemble"
+
+
 def compute_semantic_token_metrics(clean_path: Path, protected_path: Path, config: dict[str, Any]) -> dict[str, Any]:
-    del config
+    config = config or {}
+    selected_encoders = _selected_semantic_encoder_names(config)
     details = {
         "tokenChangeRate": None,
         "tokenErrorRate": None,
@@ -555,13 +732,82 @@ def compute_semantic_token_metrics(clean_path: Path, protected_path: Path, confi
         "encoderDistances": [],
         "status": "unavailable",
         "_metricSources": {
-            "asrEval.tokenChangeRate": metric_source("unavailable", "semantic_tokenizer", reason="No real tokenizer is configured", formula="edit/token mismatch over encoded tokens"),
-            "asrEval.tokenErrorRate": metric_source("unavailable", "semantic_tokenizer", reason="No real tokenizer is configured", formula="edit_distance(tokens,tokens_p)/max(len(tokens),1)"),
+            "asrEval.tokenChangeRate": metric_source("unavailable", "semantic_tokenizer", reason="No real tokenizer configured", formula="edit/token mismatch over encoded tokens"),
+            "asrEval.tokenErrorRate": metric_source("unavailable", "semantic_tokenizer", reason="No real tokenizer configured", formula="edit_distance(tokens,tokens_p)/max(len(tokens),1)"),
             "asrEval.semanticDrift": metric_source("unavailable", "semantic_encoder", reason="No real semantic encoder is configured", formula="mean(1-cosine(pool(F_k(x)),pool(F_k(xp))))"),
         },
     }
-    if os.getenv("SEME2E_ENABLE_MFCC", "0") != "1":
-        details["reason"] = "Set SEME2E_ENABLE_MFCC=1 to compute MFCC proxy semantic drift."
+    if os.getenv("SEME2E_ENABLE_TOKENIZER", "1") == "1":
+        try:
+            tokens = encode_s3_tokens(clean_path)
+            tokens_p = encode_s3_tokens(protected_path)
+            length = min(len(tokens), len(tokens_p))
+            token_change_count = sum(a != b for a, b in zip(tokens[:length], tokens_p[:length]))
+            token_change_rate = token_change_count / max(length, 1)
+            token_error_rate = _edit_distance(tokens, tokens_p) / max(len(tokens), 1)
+            details.update(
+                {
+                    "tokenChangeRate": token_change_rate,
+                    "tokenErrorRate": token_error_rate,
+                    "tokenChangeCount": token_change_count,
+                    "tokenTotal": len(tokens),
+                    "status": "partial",
+                }
+            )
+            source = os.getenv("SEME2E_TOKENIZER_MODEL") or "speech_tokenizer_v1_25hz"
+            details["_metricSources"]["asrEval.tokenChangeRate"] = metric_source(
+                "available",
+                source,
+                formula="sum(tokens[i]!=tokens_p[i] for i<L)/max(L,1)",
+            )
+            details["_metricSources"]["asrEval.tokenErrorRate"] = metric_source(
+                "available",
+                source,
+                formula="edit_distance(tokens,tokens_p)/max(len(tokens),1)",
+            )
+        except Exception as exc:
+            details["status"] = "error"
+            details["error"] = str(exc)
+            details["_metricSources"]["asrEval.tokenChangeRate"] = metric_source("error", "semantic_tokenizer", reason=str(exc), formula="edit/token mismatch over encoded tokens")
+            details["_metricSources"]["asrEval.tokenErrorRate"] = metric_source("error", "semantic_tokenizer", reason=str(exc), formula="edit_distance(tokens,tokens_p)/max(len(tokens),1)")
+
+    try:
+        encoder_distances, encoder_source = _compute_semantic_encoder_distances(clean_path, protected_path, config)
+        if encoder_distances:
+            drift_values = [finite_float(item.get("distance")) for item in encoder_distances]
+            drift_values = [value for value in drift_values if value is not None]
+            details.update(
+                {
+                    "semanticDrift": float(np.mean(drift_values)) if drift_values else None,
+                    "encoderDistances": encoder_distances,
+                    "status": "available" if details.get("tokenErrorRate") is not None else "partial",
+                }
+            )
+            details["_metricSources"]["asrEval.semanticDrift"] = metric_source(
+                "available",
+                encoder_source or "SemanticEncoderEnsemble",
+                reason=f"selectedSemanticEncoders={sorted(selected_encoders)}" if selected_encoders else None,
+                formula="mean_k(1-cosine(pool(F_k(x)),pool(F_k(xp)))) over selected semantic encoders",
+            )
+            return details
+    except Exception as exc:
+        details["status"] = "error"
+        details["error"] = str(exc)
+        details["_metricSources"]["asrEval.semanticDrift"] = metric_source("error", "SemanticEncoderEnsemble", reason=str(exc), formula="mean(1-cosine(pool(F_k(x)),pool(F_k(xp))))")
+
+    selected_requires_ensemble = selected_encoders is not None and bool(selected_encoders - {"mfcc"})
+    if selected_requires_ensemble:
+        details.setdefault("reason", f"SemanticEncoderEnsemble unavailable for selected semantic encoders: {sorted(selected_encoders)}")
+        details["_metricSources"]["asrEval.semanticDrift"] = metric_source(
+            "unavailable",
+            "semantic_encoder",
+            reason=details["reason"],
+            formula="mean_k(1-cosine(pool(F_k(x)),pool(F_k(xp)))) over selected semantic encoders",
+        )
+        return details
+
+    if os.getenv("SEME2E_ENABLE_MFCC", "1") != "1":
+        details.setdefault("reason", "Set SEME2E_ENABLE_MFCC=1 to compute MFCC proxy semantic drift.")
         return details
     try:
         import librosa
@@ -583,12 +829,12 @@ def compute_semantic_token_metrics(clean_path: Path, protected_path: Path, confi
                     {
                         "encoder": "MFCC",
                         "cosineBeforeAfter": cosine,
-                        "distance": float(np.linalg.norm(clean_mfcc - protected_mfcc)),
+                        "distance": drift,
                         "status": "partial",
                         "source": "mfcc_proxy",
                     }
                 ],
-                "status": "partial",
+                "status": "partial" if details.get("tokenErrorRate") is not None else "partial",
             }
         )
         details["_metricSources"]["asrEval.semanticDrift"] = metric_source(
@@ -607,16 +853,17 @@ def compute_semantic_token_metrics(clean_path: Path, protected_path: Path, confi
 def _build_speaker_scorer() -> tuple[Any | None, str, dict[str, Any]]:
     metric = os.getenv("SEME2E_SPEAKER_METRIC", "ecapa")
     model = os.getenv("SEME2E_SPEAKER_MODEL", "speechbrain/spkrec-ecapa-voxceleb")
-    source = f"speaker_similarity:{metric}:{model}"
-    if os.getenv("SEME2E_ENABLE_SPEAKER", "0") != "1":
-        return None, source, metric_source("unavailable", source, reason="Set SEME2E_ENABLE_SPEAKER=1 to run speaker similarity dependencies", formula="cosine(Emb(a),Emb(b))")
+    source = model
+    metric_label = "ECAPA-TDNN speaker embedding cosine similarity" if metric.lower() == "ecapa" else f"{metric} speaker embedding cosine similarity"
+    if os.getenv("SEME2E_ENABLE_SPEAKER", "1") != "1":
+        return None, source, metric_source("unavailable", source, reason="Set SEME2E_ENABLE_SPEAKER=1 to run speaker similarity dependencies", formula="cosine(Emb(a),Emb(b))", metric=metric_label)
     try:
         from speaker_similarity import build_speaker_similarity
 
         scorer = build_speaker_similarity(metric, model, os.getenv("SEME2E_API_DEVICE", "cpu"))
-        return scorer, source, metric_source("available", source, formula="cosine(Emb(a),Emb(b))")
+        return scorer, source, metric_source("available", source, formula="cosine(Emb(a),Emb(b))", metric=metric_label)
     except Exception as exc:
-        return None, source, metric_source("error", source, reason=str(exc), formula="cosine(Emb(a),Emb(b))")
+        return None, source, metric_source("error", source, reason=str(exc), formula="cosine(Emb(a),Emb(b))", metric=metric_label)
 
 
 def compute_direct_speaker_metrics(clean_path: Path, protected_path: Path, speaker_model: Any | None = None) -> dict[str, Any]:
@@ -659,12 +906,48 @@ def compute_direct_speaker_metrics(clean_path: Path, protected_path: Path, speak
                 "status": "available",
             }
         )
-        base["_metricSources"]["speaker.*"] = metric_source("available", source, formula="directSimilarity=cosine(Emb(x),Emb(xp)); simDropRate=1-directSimilarity")
+        base["_metricSources"]["speaker.*"] = metric_source("available", source, formula="directSimilarity=cosine(Emb(x),Emb(xp)); simDropRate=1-directSimilarity", metric=source_info.get("metric"))
     except Exception as exc:
         base["status"] = "error"
         base["error"] = str(exc)
-        base["_metricSources"]["speaker.*"] = metric_source("error", source, reason=str(exc), formula="directSimilarity=cosine(Emb(x),Emb(xp))")
+        base["_metricSources"]["speaker.*"] = metric_source("error", source, reason=str(exc), formula="directSimilarity=cosine(Emb(x),Emb(xp))", metric=source_info.get("metric"))
     return base
+
+
+def clone_radar_point(name: str, value: float | None, reason: str | None = None) -> dict[str, Any]:
+    point: dict[str, Any] = {
+        "name": name,
+        "value": value,
+        "status": "available" if value is not None else "unavailable",
+    }
+    if value is None and reason:
+        point["reason"] = reason
+    return point
+
+
+def build_clone_radar(
+    direct_similarity: float | None,
+    similarity_drop_rate: float | None,
+    embedding_distance_increase_rate: float | None,
+    protected_similarity: float | None,
+    clone_confidence_drop_rate: float | None,
+    *,
+    direct_reason: str | None = None,
+    clone_reason: str | None = None,
+    confidence_reason: str | None = None,
+) -> list[dict[str, Any]]:
+    direct_offset_score = 100.0 * clamp(1.0 - direct_similarity, 0.0, 1.0) if direct_similarity is not None else None
+    similarity_drop_score = 100.0 * clamp(similarity_drop_rate / 0.5, 0.0, 1.0) if similarity_drop_rate is not None else None
+    distance_increase_score = 100.0 * clamp(embedding_distance_increase_rate / 1.0, 0.0, 1.0) if embedding_distance_increase_rate is not None else None
+    protected_clone_defense_score = 100.0 * clamp(1.0 - protected_similarity, 0.0, 1.0) if protected_similarity is not None else None
+    confidence_drop_score = 100.0 * clamp(clone_confidence_drop_rate / 0.5, 0.0, 1.0) if clone_confidence_drop_rate is not None else None
+    return [
+        clone_radar_point("直接声纹偏移", direct_offset_score, direct_reason or "speaker similarity is not available"),
+        clone_radar_point("克隆相似度下降", similarity_drop_score, clone_reason or "clone similarity metrics are not available"),
+        clone_radar_point("嵌入距离增加", distance_increase_score, clone_reason or "clone embedding distance metrics are not available"),
+        clone_radar_point("保护后克隆防护", protected_clone_defense_score, clone_reason or "protected clone similarity is not available"),
+        clone_radar_point("克隆置信度下降", confidence_drop_score, confidence_reason or "no calibrated clone confidence model"),
+    ]
 
 
 def compute_clone_eval(
@@ -672,6 +955,7 @@ def compute_clone_eval(
     original_clone_path: Path,
     protected_clone_path: Path,
     clone_result: dict[str, Any],
+    protected_audio_path: Path | None = None,
     speaker_model: Any | None = None,
     confidence_calibrator: Any | None = None,
 ) -> dict[str, Any]:
@@ -681,12 +965,14 @@ def compute_clone_eval(
     if scorer is None:
         scorer, source, source_info = _build_speaker_scorer()
     request = clone_result.get("request") or {}
+    unavailable_reason = source_info.get("reason") or "speaker similarity is not available"
     eval_payload = {
         "cloneModel": request.get("model"),
         "speakerEvalModel": source,
         "targetText": request.get("text"),
         "originalCloneAudio": clone_result.get("originalCloneAudio"),
         "protectedCloneAudio": clone_result.get("protectedCloneAudio"),
+        "directSimilarity": None,
         "originalSimilarity": None,
         "protectedSimilarity": None,
         "similarityDropRate": None,
@@ -696,11 +982,15 @@ def compute_clone_eval(
         "cloneConfidenceBefore": None,
         "cloneConfidenceAfter": None,
         "cloneConfidenceDropRate": None,
-        "cloneRadar": [
-            {"name": "相似度下降", "value": None},
-            {"name": "嵌入距离增加", "value": None},
-            {"name": "置信度下降", "value": None},
-        ],
+        "cloneRadar": build_clone_radar(
+            None,
+            None,
+            None,
+            None,
+            None,
+            direct_reason=unavailable_reason if protected_audio_path is not None else "protected audio path is not available",
+            clone_reason=unavailable_reason,
+        ),
         "cloneTrend": None,
         "cloneDefenseScore": None,
         "createdAt": now_iso(),
@@ -709,7 +999,8 @@ def compute_clone_eval(
             "cloneEval.*": source_info,
             "cloneEval.cloneConfidenceBefore": metric_source("unavailable", "confidence_calibrator", reason="No confidence calibrator is configured", formula="sigmoid(A*similarity+B)"),
             "cloneEval.cloneConfidenceAfter": metric_source("unavailable", "confidence_calibrator", reason="No confidence calibrator is configured", formula="sigmoid(A*similarity+B)"),
-            "cloneEval.cloneTrend": metric_source("not_run", "multi_checkpoint_clone_eval", reason="No repeated checkpoint TTS clone evaluations were run", formula="None"),
+            "cloneEval.cloneConfidenceDropRate": metric_source("unavailable", "confidence_calibrator", reason="No confidence calibrator is configured", formula="(cloneConfidenceBefore-cloneConfidenceAfter)/max(cloneConfidenceBefore,EPS)"),
+            "cloneEval.cloneTrend": metric_source("not_run", "multi_checkpoint_clone_eval", reason="clone trend is disabled; only final clone evaluation is reported", formula="None"),
         },
     }
     if scorer is None:
@@ -718,6 +1009,11 @@ def compute_clone_eval(
     try:
         original_similarity = finite_float(scorer.score(original_audio_path, original_clone_path))
         protected_similarity = finite_float(scorer.score(original_audio_path, protected_clone_path))
+        direct_similarity = None
+        direct_reason = "protected audio path is not available"
+        if protected_audio_path is not None:
+            direct_similarity = finite_float(scorer.score(original_audio_path, protected_audio_path))
+            direct_reason = None if direct_similarity is not None else "speaker similarity is not available"
         if original_similarity is None or protected_similarity is None:
             raise ValueError("speaker scorer returned non-finite clone similarity")
         similarity_drop_rate = (original_similarity - protected_similarity) / max(original_similarity, EPS)
@@ -736,12 +1032,13 @@ def compute_clone_eval(
         clone_score_base = weighted_available_mean(
             {
                 "S_sim": (s_sim, 0.45),
-                "S_dist": (s_dist, 0.25),
-                "S_conf": (s_conf, 0.15),
+                "S_dist": (s_dist, 0.35),
+                "S_conf": (s_conf, 0.20),
             }
         )
         eval_payload.update(
             {
+                "directSimilarity": direct_similarity,
                 "originalSimilarity": original_similarity,
                 "protectedSimilarity": protected_similarity,
                 "similarityDropRate": similarity_drop_rate,
@@ -751,11 +1048,15 @@ def compute_clone_eval(
                 "cloneConfidenceBefore": conf_before,
                 "cloneConfidenceAfter": conf_after,
                 "cloneConfidenceDropRate": conf_drop,
-                "cloneRadar": [
-                    {"name": "相似度下降", "value": 100.0 * s_sim},
-                    {"name": "嵌入距离增加", "value": 100.0 * s_dist},
-                    {"name": "置信度下降", "value": 100.0 * s_conf if s_conf is not None else None},
-                ],
+                "cloneRadar": build_clone_radar(
+                    direct_similarity,
+                    similarity_drop_rate,
+                    embedding_increase,
+                    protected_similarity,
+                    conf_drop,
+                    direct_reason=direct_reason,
+                    confidence_reason="no calibrated clone confidence model",
+                ),
                 "cloneDefenseScore": 100.0 * clone_score_base if clone_score_base is not None else None,
                 "status": "available",
             }
@@ -763,15 +1064,17 @@ def compute_clone_eval(
         eval_payload["_metricSources"]["cloneEval.*"] = metric_source(
             "available",
             source,
-            formula="originalSimilarity=SIM(originalAudio,originalCloneAudio); protectedSimilarity=SIM(originalAudio,protectedCloneAudio)",
+            formula="originalSimilarity=SIM(originalAudio,originalCloneAudio); protectedSimilarity=SIM(originalAudio,protectedCloneAudio); similarityDropRate=(originalSimilarity-protectedSimilarity)/max(originalSimilarity,EPS); embeddingDistanceBefore=1-originalSimilarity; embeddingDistanceAfter=1-protectedSimilarity; embeddingDistanceIncreaseRate=(embeddingDistanceAfter-embeddingDistanceBefore)/max(embeddingDistanceBefore,EPS)",
+            metric=source_info.get("metric"),
         )
         if conf_drop is not None:
             eval_payload["_metricSources"]["cloneEval.cloneConfidenceBefore"] = metric_source("available", "confidence_calibrator", formula="sigmoid(A*similarity+B)")
             eval_payload["_metricSources"]["cloneEval.cloneConfidenceAfter"] = metric_source("available", "confidence_calibrator", formula="sigmoid(A*similarity+B)")
+            eval_payload["_metricSources"]["cloneEval.cloneConfidenceDropRate"] = metric_source("available", "confidence_calibrator", formula="(cloneConfidenceBefore-cloneConfidenceAfter)/max(cloneConfidenceBefore,EPS)")
     except Exception as exc:
         eval_payload["status"] = "error"
         eval_payload["error"] = str(exc)
-        eval_payload["_metricSources"]["cloneEval.*"] = metric_source("error", source, reason=str(exc), formula="SIM(originalAudio,cloneAudio)")
+        eval_payload["_metricSources"]["cloneEval.*"] = metric_source("error", source, reason=str(exc), formula="SIM(originalAudio,cloneAudio)", metric=source_info.get("metric"))
     return eval_payload
 
 

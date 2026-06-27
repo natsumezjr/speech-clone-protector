@@ -53,11 +53,13 @@ class ECAPASpeakerSimilarity:
             from speechbrain.inference.speaker import EncoderClassifier
         except ImportError:
             from speechbrain.pretrained import EncoderClassifier
+        from speechbrain.utils.fetching import LocalStrategy
 
         savedir = ROOT / "checkpoints" / "ecapa"
         self.model = EncoderClassifier.from_hparams(
             source=self.model_path,
             savedir=str(savedir),
+            local_strategy=LocalStrategy.COPY,
             run_opts={"device": self.device_name},
         )
 

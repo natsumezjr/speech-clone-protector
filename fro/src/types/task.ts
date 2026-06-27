@@ -108,6 +108,8 @@ export interface SpeakerMetrics {
   simDropRate: number | null
   embeddingDistanceBefore: number | null
   embeddingDistanceAfter: number | null
+  simOriginalProtected?: number | null
+  embeddingDistance?: number | null
   source?: string
   status?: string
 }
@@ -137,6 +139,7 @@ export interface LossTrendPoint {
   Lpsy: number | null
   L2: number | null
   total?: number | null
+  snr?: number | null
   stepElapsedSec?: number | null
 }
 
@@ -146,6 +149,7 @@ export interface LossFinal {
   Lpsy: number | null
   L2: number | null
   total?: number | null
+  snr?: number | null
 }
 
 export interface PsychoacousticPoint {
@@ -195,6 +199,13 @@ export interface LossWeights {
 
 export type AsrEval = AsrMetrics
 
+export interface RadarPoint {
+  name: string
+  value: number | null
+  status?: 'available' | 'unavailable' | 'partial' | 'not_run' | 'error' | string
+  reason?: string | null
+}
+
 export interface CloneEval {
   cloneModel?: string | null
   speakerEvalModel?: string | null
@@ -210,15 +221,19 @@ export interface CloneEval {
   cloneConfidenceBefore?: number | null
   cloneConfidenceAfter?: number | null
   cloneConfidenceDropRate?: number | null
-  cloneRadar?: Array<Record<string, string | number>> | null
+  cloneRadar?: RadarPoint[] | null
   cloneTrend?: Array<Record<string, number>> | null
   cloneDefenseScore?: number | null
   createdAt?: string | null
+  status?: string | null
+  reason?: string | null
 }
 
 export interface MetricSource {
   source?: string
   status?: string
+  reason?: string
+  formula?: string
 }
 
 export interface ApiErrorPayload {
@@ -374,6 +389,9 @@ export interface TaskResult {
   asrEval?: AsrEval | null
   cloneEval?: CloneEval | null
   cloneResults?: CloneVoiceResult[]
+  speakerFeatureMap?: {
+    radar?: RadarPoint[] | null
+  } | null
   asr: AsrMetrics
   speaker: SpeakerMetrics
   quality: QualityMetrics
@@ -395,6 +413,7 @@ export interface TaskResult {
     radarBefore?: number[]
     radarAfter?: number[]
     chainRadar?: Array<{ name: string; value: number | null; status?: string }>
+    speakerRadar?: RadarPoint[] | null
   }
 }
 
@@ -473,9 +492,9 @@ export interface HistoryTask {
   elapsedSec?: number | null
   updatedAt?: string | null
   error?: string | ApiErrorPayload | null
-  wer: number | null
-  simDropRate: number | null
-  pesq: number | null
+  processingModel?: string | null
+  asrModel?: string | null
+  cloneModel?: string | null
   createdAt: string
 }
 
