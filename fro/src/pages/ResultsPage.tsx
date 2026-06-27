@@ -30,6 +30,7 @@ import { AudioPlayer } from '@/components/audio/AudioPlayer'
 import { formatDurationSeconds, getAudioDuration, getAudioSource } from '@/utils/audio'
 import { TrendChart } from '@/components/charts/TrendChart'
 import { MathText } from '@/components/common/MathText'
+import { cloneMetricDisplay, computeAbsoluteDrop, formatCloneMetricNumber, generateCloneMetricInsights } from '@/utils/cloneMetricDisplay'
 
 const statusText: Record<TaskResult['status'], string> = {
   queued: '排队中',
@@ -827,8 +828,7 @@ function RateBreakdown({ substituteShare, insertShare }: { substituteShare?: num
 }
 
 function CloneIdentityPanel({ cloneEval }: { cloneEval: CloneEval }) {
-  const similarityDropRate = optionalNumber(cloneEval.similarityDropRate) ?? computeDropRate(cloneEval.originalSimilarity, cloneEval.protectedSimilarity)
-  const embeddingIncreaseRate = optionalNumber(cloneEval.embeddingDistanceIncreaseRate) ?? computeRateChange(cloneEval.embeddingDistanceBefore, cloneEval.embeddingDistanceAfter)
+  const cloneMetrics = cloneMetricDisplay(cloneEval)
   const confidenceBefore = optionalNumber(cloneEval.cloneConfidenceBefore)
   const confidenceAfter = optionalNumber(cloneEval.cloneConfidenceAfter)
   const confidenceDropRate = optionalNumber(cloneEval.cloneConfidenceDropRate)
@@ -840,18 +840,18 @@ function CloneIdentityPanel({ cloneEval }: { cloneEval: CloneEval }) {
       <div className="mt-5 grid grid-cols-[repeat(auto-fit,minmax(210px,1fr))] gap-3">
         <DeltaStatCard
           title="Speaker Similarity（越低越好）"
-          before={formatMetricValue(cloneEval.originalSimilarity, 'number')}
-          after={formatMetricValue(cloneEval.protectedSimilarity, 'number')}
-          delta={`↓ ${formatRatioPercent(similarityDropRate, { clampToUnit: true })}`}
-          foot="来源：后端声纹相似度评估"
+          before={cloneMetrics.similarityBefore}
+          after={cloneMetrics.similarityAfter}
+          delta={cloneMetrics.similarityDeltaText}
+          foot="ECAPA 余弦相似度，范围 [-1, 1]；保护后越低表示越不像原说话人"
           tone="green"
         />
         <DeltaStatCard
-          title="Embedding 距离（cosine distance，越大越好）"
-          before={formatMetricValue(cloneEval.embeddingDistanceBefore, 'number')}
-          after={formatMetricValue(cloneEval.embeddingDistanceAfter, 'number')}
-          delta={`↑ ${formatRatioPercent(embeddingIncreaseRate, { clampToUnit: true })}`}
-          foot="来源：后端 speaker embedding 距离"
+          title="Embedding 距离（1 - cosine similarity，范围 0~2，越大越好）"
+          before={cloneMetrics.embeddingDistanceBefore}
+          after={cloneMetrics.embeddingDistanceAfter}
+          delta={cloneMetrics.embeddingDistanceDeltaText}
+          foot="cosine distance = 1 - similarity，范围 [0, 2]；大于 1 表示相似度已低于 0"
           tone="red"
         />
         {hasCloneConfidence ? (
@@ -873,15 +873,15 @@ function CloneIdentityPanel({ cloneEval }: { cloneEval: CloneEval }) {
 }
 
 function CloneResultPanel({ cloneEval }: { cloneEval: CloneEval }) {
-  const similarityDropRate = optionalNumber(cloneEval.similarityDropRate) ?? computeDropRate(cloneEval.originalSimilarity, cloneEval.protectedSimilarity)
+  const similarityDropAbs = computeAbsoluteDrop(cloneEval.originalSimilarity, cloneEval.protectedSimilarity)
 
   return (
     <section className="rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
       <SectionTitle>克隆防护结果</SectionTitle>
       <div className="mt-5 grid grid-cols-[repeat(auto-fit,minmax(150px,1fr))] gap-3">
-        <ScoreBox label="原始克隆相似度" value={formatMetricValue(cloneEval.originalSimilarity, 'number')} />
-        <ScoreBox label="保护后克隆相似度" value={formatMetricValue(cloneEval.protectedSimilarity, 'number')} />
-        <ScoreBox label="防护下降率" value={formatRatioPercent(similarityDropRate, { clampToUnit: true })} />
+        <ScoreBox label="原始克隆相似度" value={formatCloneMetricNumber(cloneEval.originalSimilarity)} />
+        <ScoreBox label="保护后克隆相似度" value={formatCloneMetricNumber(cloneEval.protectedSimilarity)} />
+        <ScoreBox label="相似度下降量" value={formatCloneMetricNumber(similarityDropAbs)} />
       </div>
     </section>
   )
@@ -1857,20 +1857,6 @@ function lastStep(points: LossTrendPoint[]) {
   return step && step > 0 ? step : null
 }
 
-function computeRateChange(before: number | null | undefined, after: number | null | undefined) {
-  const beforeValue = optionalNumber(before)
-  const afterValue = optionalNumber(after)
-  if (beforeValue === null || afterValue === null) return null
-  return (afterValue - beforeValue) / Math.max(Math.abs(beforeValue), 1e-8)
-}
-
-function computeDropRate(before: number | null | undefined, after: number | null | undefined) {
-  const beforeValue = optionalNumber(before)
-  const afterValue = optionalNumber(after)
-  if (beforeValue === null || afterValue === null) return null
-  return (beforeValue - afterValue) / Math.max(beforeValue, 1e-8)
-}
-
 function computeEpsilonUsageRate(perturbation: TaskResult['perturbation']) {
   if (!perturbation) return null
   const epsilon = optionalNumber(perturbation.epsilon)
@@ -2056,16 +2042,7 @@ function generateAsrInsights(asrEval: AsrEval, editStats: EditMetrics | null, re
 }
 
 function generateCloneInsights(cloneEval: CloneEval) {
-  const similarityDropRate = optionalNumber(cloneEval.similarityDropRate) ?? computeDropRate(cloneEval.originalSimilarity, cloneEval.protectedSimilarity)
-  const embeddingIncreaseRate = optionalNumber(cloneEval.embeddingDistanceIncreaseRate) ?? computeRateChange(cloneEval.embeddingDistanceBefore, cloneEval.embeddingDistanceAfter)
-  const items: string[] = []
-  if ((similarityDropRate ?? 0) > 0) items.push('保护后克隆相似度下降，声音身份链路防护有效。')
-  if ((embeddingIncreaseRate ?? 0) > 0) items.push('embedding 距离增加，身份表示空间被拉远。')
-  if ([cloneEval.originalSimilarity, cloneEval.protectedSimilarity, cloneEval.embeddingDistanceBefore, cloneEval.embeddingDistanceAfter].some((value) => optionalNumber(value) === null)) {
-    items.push('部分克隆指标未生成，不做强结论。')
-  }
-  if (items.length === 0) items.push('语音克隆评估已执行，但后端未返回足够指标用于生成结论。')
-  return items
+  return generateCloneMetricInsights(cloneEval)
 }
 
 function cloneResultToEval(cloneResult?: CloneVoiceResult): CloneEval | null {
