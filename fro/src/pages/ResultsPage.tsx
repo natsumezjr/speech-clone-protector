@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import {
   CheckCircle2,
+  ChevronDown,
   ClipboardList,
   Clock3,
   Copy,
@@ -19,10 +20,10 @@ import {
   Volume2,
   X,
 } from 'lucide-react'
-import { cloneVoice, downloadEvidenceZip, downloadProtectedAudio, exportReport, getCapabilities, getTaskResult, getTaskStatus, listTasks, runAsrEval } from '@/services/apiClient'
+import { cloneVoice, downloadEvidenceZip, downloadProtectedAudio, exportReport, getCapabilities, getPsychoacousticSlice, getTaskResult, getTaskStatus, listTasks, runAsrEval } from '@/services/apiClient'
 import { useAppStore } from '@/store/appStore'
 import { useTaskStore } from '@/store/taskStore'
-import type { AsrEval, AsrMetrics, CapabilitiesResponse, CloneEval, CloneVoiceRequest, CloneVoiceResult, DiffOp, LossFinal, LossTrendPoint, ProtectionRuntimeConfig, RadarPoint, TaskResult, TaskStatusResponse } from '@/types/task'
+import type { AsrEval, AsrMetrics, CapabilitiesResponse, CloneEval, CloneVoiceRequest, CloneVoiceResult, DiffOp, LossFinal, LossTrendPoint, ProtectionRuntimeConfig, PsychoacousticPoint, PsychoacousticSliceResponse, RadarPoint, TaskResult, TaskStatusResponse } from '@/types/task'
 import type { AudioFileMeta } from '@/types/audio'
 import { downloadBlob } from '@/utils/download'
 import { cn } from '@/lib/utils'
@@ -1492,25 +1493,191 @@ function QualityPanel({ result, embedded }: { result: TaskResult; embedded?: boo
 }
 
 function PsychoacousticPanel({ result }: { result: TaskResult }) {
+  const pushToast = useAppStore((state) => state.pushToast)
+  const [psychoMode, setPsychoMode] = useState<'mean' | 'frame'>('mean')
+  const [selectedTimeSec, setSelectedTimeSec] = useState<number | null>(null)
+  const [actualTimeSec, setActualTimeSec] = useState<number | null>(null)
+  const [frameIndex, setFrameIndex] = useState<number | null>(null)
+  const [sliceData, setSliceData] = useState<PsychoacousticSliceResponse | null>(null)
+  const [timeDialogOpen, setTimeDialogOpen] = useState(false)
+  const [timeDraft, setTimeDraft] = useState('')
+  const [sliceLoading, setSliceLoading] = useState(false)
+  const [sliceError, setSliceError] = useState<string | null>(null)
+  const [modeMenuOpen, setModeMenuOpen] = useState(false)
+  const protectedDuration = optionalNumber(result.protectedAudio.durationSec) ?? optionalNumber(result.protectedAudio.duration)
+  const originalDuration = optionalNumber(result.originalAudio.durationSec) ?? optionalNumber(result.originalAudio.duration)
+  const audioDurationSec = protectedDuration ?? originalDuration ?? getAudioDuration(result.protectedAudio) ?? getAudioDuration(result.originalAudio)
+  const chartPoints = psychoMode === 'frame' && sliceData ? psychoPointsFromSlice(sliceData) : psychoPointsFromResult(result)
+  const modeLabel = psychoMode === 'frame' ? `t = ${(actualTimeSec ?? selectedTimeSec ?? 0).toFixed(2)} s 对应帧` : 't 平均聚合'
+  const modeDescription =
+    psychoMode === 'frame'
+      ? frameIndex !== null && actualTimeSec !== null
+        ? `当前显示 t = ${actualTimeSec.toFixed(2)}s 附近第 ${frameIndex} 帧的心理声学阈值与扰动谱。`
+        : '当前显示指定时间附近的单帧心理声学曲线。'
+      : '该图为 STFT 时频结果沿时间帧取平均后的频率维曲线。'
+
+  useEffect(() => {
+    setPsychoMode('mean')
+    setSelectedTimeSec(null)
+    setActualTimeSec(null)
+    setFrameIndex(null)
+    setSliceData(null)
+    setTimeDialogOpen(false)
+    setTimeDraft('')
+    setSliceError(null)
+    setModeMenuOpen(false)
+  }, [result.taskId])
+
+  const restoreMeanMode = () => {
+    setPsychoMode('mean')
+    setSelectedTimeSec(null)
+    setActualTimeSec(null)
+    setFrameIndex(null)
+    setSliceData(null)
+    setSliceError(null)
+    setModeMenuOpen(false)
+  }
+
+  const openFrameDialog = () => {
+    setModeMenuOpen(false)
+    setSliceError(null)
+    setTimeDraft(selectedTimeSec !== null ? selectedTimeSec.toFixed(2) : '')
+    setTimeDialogOpen(true)
+  }
+
+  const confirmFrameTime = async () => {
+    const duration = optionalNumber(audioDurationSec)
+    if (duration === null) {
+      setSliceError('后端未返回音频时长，暂无法指定时间帧。')
+      return
+    }
+    const timeValue = Number(timeDraft)
+    if (!Number.isFinite(timeValue) || timeValue < 0 || timeValue > duration) {
+      setSliceError(`请输入 0 到 ${duration.toFixed(2)} 秒之间的时间。`)
+      return
+    }
+    setSliceLoading(true)
+    setSliceError(null)
+    try {
+      const response = await getPsychoacousticSlice(result.taskId, { mode: 'frame', timeSec: timeValue })
+      setPsychoMode('frame')
+      setSelectedTimeSec(timeValue)
+      setActualTimeSec(response.actualTimeSec ?? timeValue)
+      setFrameIndex(response.frameIndex ?? null)
+      setSliceData(response)
+      setTimeDialogOpen(false)
+    } catch (error) {
+      const message = '指定时间帧心理声学曲线加载失败，请稍后重试。'
+      setSliceError(message)
+      pushToast({ kind: 'error', title: '加载失败', description: error instanceof Error ? error.message : message })
+    } finally {
+      setSliceLoading(false)
+    }
+  }
+
   return (
-    <section className="flex min-h-[296px] flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
-      <div className="flex items-center justify-between gap-4">
-        <SectionTitle>心理声学阈值分析（关键频段）</SectionTitle>
-        <div className="flex shrink-0 gap-4 text-[10px] text-slate-400">
-          <span className="flex items-center gap-1.5 text-cyan-200">
-            <span className="h-0 w-5 border-t-2 border-dashed border-cyan-300" />
-            掩蔽阈值
-          </span>
-          <span className="flex items-center gap-1.5 text-amber-200">
-            <span className="h-0 w-5 border-t-2 border-amber-300" />
-            防护扰动谱
-          </span>
+    <>
+      <section className="flex min-h-[296px] flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
+        <div className="flex items-center justify-between gap-4 max-md:flex-wrap">
+          <SectionTitle>心理声学阈值分析</SectionTitle>
+          <div className="flex min-w-[180px] flex-1 justify-center">
+            <PsychoacousticModeDropdown label={modeLabel} open={modeMenuOpen} onToggle={() => setModeMenuOpen((open) => !open)} onMean={restoreMeanMode} onFrame={openFrameDialog} />
+          </div>
+          <div className="flex shrink-0 gap-4 text-[10px] text-slate-400">
+            <span className="flex items-center gap-1.5 text-cyan-200">
+              <span className="h-0 w-5 border-t-2 border-dashed border-cyan-300" />
+              掩蔽阈值
+            </span>
+            <span className="flex items-center gap-1.5 text-amber-200">
+              <span className="h-0 w-5 border-t-2 border-amber-300" />
+              防护扰动谱
+            </span>
+          </div>
         </div>
-      </div>
-      <div className="mt-5 min-h-0 flex-1 overflow-hidden rounded-[9px] border border-cyan-300/12 bg-slate-950/16 px-4 py-3">
-        <LineChart result={result} large />
-      </div>
-    </section>
+        <div className="mt-5 min-h-0 flex-1 overflow-hidden rounded-[9px] border border-cyan-300/12 bg-slate-950/16 px-4 py-3">
+          <LineChart result={result} large pointsOverride={chartPoints} />
+        </div>
+        <p className="mt-3 text-[11px] leading-5 text-slate-500">{modeDescription}</p>
+        {sliceError && !timeDialogOpen ? <p className="mt-2 text-[11px] text-rose-300">{sliceError}</p> : null}
+      </section>
+
+      {timeDialogOpen ? (
+        <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/68 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="选择心理声学分析时间点">
+          <form
+            className="ui-card w-full max-w-[440px] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.46)]"
+            onSubmit={(event) => {
+              event.preventDefault()
+              void confirmFrameTime()
+            }}
+          >
+            <div className="mb-5 flex items-center justify-between gap-4">
+              <h3 className="text-[20px] font-black text-white">选择心理声学分析时间点</h3>
+              <button type="button" onClick={() => setTimeDialogOpen(false)} className="grid h-9 w-9 place-items-center rounded-full border border-cyan-300/14 bg-white/[0.035] text-slate-300 hover:text-white" aria-label="取消">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <label className="text-[12px] font-bold text-slate-300" htmlFor="psycho-time-sec">
+              时间 t（秒）
+            </label>
+            <input
+              id="psycho-time-sec"
+              className="mt-2 h-11 w-full rounded-[7px] border border-cyan-300/14 bg-slate-950/70 px-3 text-slate-100 outline-none focus:border-cyan-300"
+              inputMode="decimal"
+              onChange={(event) => {
+                setTimeDraft(event.target.value)
+                setSliceError(null)
+              }}
+              placeholder="例如 1.25"
+              type="number"
+              min={0}
+              max={optionalNumber(audioDurationSec) ?? undefined}
+              step={0.01}
+              value={timeDraft}
+            />
+            <p className="mt-3 text-[12px] leading-5 text-slate-500">
+              请输入 0 到 {optionalNumber(audioDurationSec)?.toFixed(2) ?? '未生成'} 秒之间的时间，系统将换算到最接近的 STFT 帧。
+            </p>
+            {sliceError ? <p className="mt-3 text-[12px] text-rose-300">{sliceError}</p> : null}
+            <div className="mt-6 flex justify-end gap-3">
+              <button type="button" onClick={() => setTimeDialogOpen(false)} className="h-10 rounded-[7px] border border-cyan-300/14 bg-white/[0.035] px-4 text-sm font-bold text-slate-300 hover:text-white">
+                取消
+              </button>
+              <button type="submit" disabled={sliceLoading} className="cyan-button flex h-10 items-center gap-2 rounded-[7px] px-4 text-sm font-black disabled:cursor-not-allowed disabled:opacity-60">
+                {sliceLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                确认查看
+              </button>
+            </div>
+          </form>
+        </div>
+      ) : null}
+    </>
+  )
+}
+
+function PsychoacousticModeDropdown({ label, open, onToggle, onMean, onFrame }: { label: string; open: boolean; onToggle: () => void; onMean: () => void; onFrame: () => void }) {
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex h-9 min-w-[168px] items-center justify-center gap-2 rounded-[7px] border border-cyan-300/18 bg-slate-950/55 px-4 text-[12px] font-black text-cyan-100 shadow-[0_0_22px_rgba(34,211,238,0.08)] transition hover:border-cyan-300/36 hover:bg-cyan-300/[0.06]"
+        aria-haspopup="menu"
+        aria-expanded={open}
+      >
+        <span>{label}</span>
+        <ChevronDown className={cn('h-3.5 w-3.5 transition', open && 'rotate-180')} />
+      </button>
+      {open ? (
+        <div className="absolute left-1/2 top-11 z-20 w-[180px] -translate-x-1/2 rounded-[8px] border border-cyan-300/18 bg-slate-950/95 p-1 shadow-[0_18px_45px_rgba(0,0,0,0.42)]" role="menu">
+          <button type="button" onClick={onMean} className="block h-9 w-full rounded-[6px] px-3 text-left text-[12px] font-bold text-slate-200 hover:bg-cyan-300/[0.08] hover:text-cyan-100" role="menuitem">
+            t 平均聚合
+          </button>
+          <button type="button" onClick={onFrame} className="block h-9 w-full rounded-[6px] px-3 text-left text-[12px] font-bold text-slate-200 hover:bg-cyan-300/[0.08] hover:text-cyan-100" role="menuitem">
+            指定 t 对应帧
+          </button>
+        </div>
+      ) : null}
+    </div>
   )
 }
 
@@ -2055,6 +2222,28 @@ function cloneResultToEval(cloneResult?: CloneVoiceResult): CloneEval | null {
   }
 }
 
+function psychoPointsFromResult(result: TaskResult): PsychoacousticPoint[] {
+  if (result.psychoacoustic?.maskingThreshold?.length && result.psychoacoustic.perturbationSpectrum?.length) {
+    const perturbationByFrequency = new Map(result.psychoacoustic.perturbationSpectrum.map((item) => [item.frequencyHz, item.powerDb]))
+    return result.psychoacoustic.maskingThreshold.map((point) => ({
+      frequency: point.frequencyHz,
+      maskingThreshold: point.thresholdDb,
+      perturbation: perturbationByFrequency.get(point.frequencyHz),
+    }))
+  }
+  return result.charts.psychoacoustic
+}
+
+function psychoPointsFromSlice(slice: PsychoacousticSliceResponse): PsychoacousticPoint[] {
+  if (slice.charts?.psychoacoustic?.length) return slice.charts.psychoacoustic
+  const perturbationByFrequency = new Map(slice.perturbationSpectrum.map((item) => [item.frequencyHz, item.powerDb]))
+  return slice.maskingThreshold.map((point) => ({
+    frequency: point.frequencyHz,
+    maskingThreshold: point.thresholdDb,
+    perturbation: perturbationByFrequency.get(point.frequencyHz),
+  }))
+}
+
 function TinyWave({ color, className }: { color: string; className?: string }) {
   return (
     <svg viewBox="0 0 520 90" className={cn('h-full w-full', className)} preserveAspectRatio="none">
@@ -2067,19 +2256,8 @@ function TinyWave({ color, className }: { color: string; className?: string }) {
   )
 }
 
-function LineChart({ result, large }: { result: TaskResult; large?: boolean }) {
-  const spectrumPoints =
-    result.psychoacoustic?.maskingThreshold && result.psychoacoustic.perturbationSpectrum
-      ? result.psychoacoustic.maskingThreshold.map((point) => {
-          const matched = result.psychoacoustic?.perturbationSpectrum?.find((item) => item.frequencyHz === point.frequencyHz)
-          return {
-            frequency: point.frequencyHz,
-            maskingThreshold: point.thresholdDb,
-            perturbation: matched?.powerDb,
-          }
-        })
-      : []
-  const points = spectrumPoints.length ? spectrumPoints : result.charts.psychoacoustic
+function LineChart({ result, large, pointsOverride }: { result: TaskResult; large?: boolean; pointsOverride?: PsychoacousticPoint[] }) {
+  const points = pointsOverride ?? psychoPointsFromResult(result)
   const [windowStart, setWindowStart] = useState(0)
   const width = 720
   const height = large ? 220 : 58
@@ -2087,6 +2265,9 @@ function LineChart({ result, large }: { result: TaskResult; large?: boolean }) {
   const maxStart = Math.max(0, points.length - windowSize)
   const start = Math.min(windowStart, maxStart)
   const visiblePoints = large && points.length > windowSize ? points.slice(start, start + windowSize) : points
+  useEffect(() => {
+    setWindowStart(0)
+  }, [points.length])
   if (points.length === 0) {
     return <div className="grid h-full place-items-center text-xs text-slate-500">后端未返回心理声学频谱数据</div>
   }

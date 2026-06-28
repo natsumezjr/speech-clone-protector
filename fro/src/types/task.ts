@@ -177,6 +177,33 @@ export interface PsychoacousticPoint {
   perturbationPsd?: number
 }
 
+export type PsychoacousticSliceMode = 'mean' | 'frame'
+
+export interface PsychoacousticSliceResponse {
+  mode: PsychoacousticSliceMode
+  requestedTimeSec?: number | null
+  actualTimeSec?: number | null
+  frameIndex?: number | null
+  frameCount?: number | null
+  sampleRate?: number | null
+  hopLength?: number | null
+  nFft?: number | null
+  aggregation?: 'time_mean' | 'single_frame'
+  lPsy?: number | null
+  overMaskRate?: number | null
+  maskingThreshold: Array<{ frequencyHz: number; thresholdDb: number }>
+  perturbationSpectrum: Array<{ frequencyHz: number; powerDb: number }>
+  charts?: {
+    psychoacoustic?: Array<{
+      frequency: number
+      maskingThreshold: number
+      perturbation?: number
+      perturbationPsd?: number
+    }>
+  }
+  metricSources?: Record<string, MetricSource>
+}
+
 export type DiffOp =
   | { type: 'equal' | 'insert' | 'delete'; text: string }
   | { type: 'replace'; from: string; to: string }
@@ -204,6 +231,11 @@ export interface ProtectionQuality {
 export interface PsychoacousticMetrics {
   lPsy?: number | null
   overMaskRate?: number | null
+  frameCount?: number | null
+  sampleRate?: number | null
+  hopLength?: number | null
+  nFft?: number | null
+  aggregation?: 'time_mean' | 'single_frame' | string | null
   maskingThreshold?: Array<{ frequencyHz: number; thresholdDb: number }> | null
   perturbationSpectrum?: Array<{ frequencyHz: number; powerDb: number }> | null
 }

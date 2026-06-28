@@ -2,7 +2,7 @@ import axios from 'axios'
 import { apiBaseUrl } from '@/config/runtime'
 import type { ApiClient } from '@/types/api'
 import type { AudioFileMeta } from '@/types/audio'
-import type { ApiErrorPayload, AsrEvalRequest, AsrEvalResponse, CloneVoiceRequest, CloneVoiceResult, HistoryTask, ProtectionTaskRequest, TaskDetailsResponse, TaskResult, TaskStatusResponse } from '@/types/task'
+import type { ApiErrorPayload, AsrEvalRequest, AsrEvalResponse, CloneVoiceRequest, CloneVoiceResult, HistoryTask, ProtectionTaskRequest, PsychoacousticSliceResponse, TaskDetailsResponse, TaskResult, TaskStatusResponse } from '@/types/task'
 import { formatStructuredApiError } from '@/utils/apiError'
 
 const http = axios.create({
@@ -259,6 +259,11 @@ function normalizePsychoacoustic(value: unknown): TaskResult['psychoacoustic'] {
   return {
     lPsy: firstNumber(record, ['lPsy', 'Lpsy', 'lossPsy']),
     overMaskRate: firstNumber(record, ['overMaskRate', 'over_mask_rate', 'psychoacousticViolationRate']),
+    frameCount: firstNumber(record, ['frameCount', 'frame_count']),
+    sampleRate: firstNumber(record, ['sampleRate', 'sample_rate']),
+    hopLength: firstNumber(record, ['hopLength', 'hop_length']),
+    nFft: firstNumber(record, ['nFft', 'n_fft', 'nfft']),
+    aggregation: firstString(record, ['aggregation']),
     maskingThreshold: Array.isArray(record.maskingThreshold) ? (record.maskingThreshold as NonNullable<TaskResult['psychoacoustic']>['maskingThreshold']) : null,
     perturbationSpectrum: Array.isArray(record.perturbationSpectrum) ? (record.perturbationSpectrum as NonNullable<TaskResult['psychoacoustic']>['perturbationSpectrum']) : null,
   }
@@ -615,6 +620,16 @@ export const backendClient: ApiClient = {
   async getTaskResult(taskId: string): Promise<TaskResult> {
     const response = await http.get(`/api/tasks/${taskId}/result`)
     return normalizeTaskResult(response.data)
+  },
+  async getPsychoacousticSlice(taskId: string, params): Promise<PsychoacousticSliceResponse> {
+    const response = await http.get(`/api/tasks/${taskId}/psychoacoustic-slice`, { params })
+    const data = asRecord(response.data)
+    return {
+      ...(data as unknown as PsychoacousticSliceResponse),
+      maskingThreshold: Array.isArray(data.maskingThreshold) ? (data.maskingThreshold as PsychoacousticSliceResponse['maskingThreshold']) : [],
+      perturbationSpectrum: Array.isArray(data.perturbationSpectrum) ? (data.perturbationSpectrum as PsychoacousticSliceResponse['perturbationSpectrum']) : [],
+      charts: asRecord(data.charts) as PsychoacousticSliceResponse['charts'],
+    }
   },
   async getTaskDetails(taskId: string): Promise<TaskDetailsResponse> {
     const response = await http.get(`/api/tasks/${taskId}/details`)

@@ -24,6 +24,7 @@ from metric_definitions import (
     compute_overall_score,
     compute_perturbation_metrics,
     compute_psychoacoustic_metrics,
+    compute_psychoacoustic_slice,
     compute_quality_metrics,
     compute_semantic_token_metrics,
     metric_source,
@@ -892,6 +893,11 @@ def compute_perception(clean_path: Path, protected_path: Path, payload: dict[str
                 "psychoacoustic": {
                     "lPsy": psycho.get("lPsy"),
                     "overMaskRate": psycho.get("overMaskRate"),
+                    "frameCount": psycho.get("frameCount"),
+                    "sampleRate": psycho.get("sampleRate"),
+                    "hopLength": psycho.get("hopLength"),
+                    "nFft": psycho.get("nFft"),
+                    "aggregation": psycho.get("aggregation"),
                     "maskingThreshold": psycho.get("maskingThreshold"),
                     "perturbationSpectrum": psycho.get("perturbationSpectrum"),
                 },
@@ -1283,6 +1289,18 @@ def save_result(task_dir: Path, result: dict[str, Any]) -> None:
 def load_result(task_id: str) -> dict[str, Any]:
     with (TASK_DIR / task_id / "result.json").open("r", encoding="utf-8") as file:
         return json.load(file)
+
+
+def create_psychoacoustic_slice(task_id: str, mode: str = "mean", time_sec: float | None = None) -> dict[str, Any]:
+    original_path, protected_path, result = _task_audio_paths(task_id)
+    x, xp, delta, sr = align_audio_pair(original_path, protected_path)
+    audio = result.get("audio") or {}
+    protected_meta = audio.get("protected") or {}
+    original_meta = audio.get("original") or {}
+    duration_sec = to_float(protected_meta.get("durationSec") or protected_meta.get("duration"))
+    if duration_sec is None:
+        duration_sec = to_float(original_meta.get("durationSec") or original_meta.get("duration"))
+    return compute_psychoacoustic_slice(x, xp, delta, sr, mode=mode, time_sec=time_sec, duration_sec=duration_sec)
 
 
 def new_task_id() -> str:

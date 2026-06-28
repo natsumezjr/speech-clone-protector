@@ -311,14 +311,14 @@ def compute_quality_metrics(
     }
 
 
-def _stft(audio: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray]:
+def _stft_with_meta(audio: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     try:
         from scipy.signal import stft
 
         nperseg = min(1024, max(64, len(audio)))
         noverlap = nperseg // 2
         freqs, _, zxx = stft(audio, fs=sr, nperseg=nperseg, noverlap=noverlap, boundary=None)
-        return freqs.astype(np.float64), zxx
+        return freqs.astype(np.float64), zxx, {"nFft": int(nperseg), "hopLength": int(nperseg - noverlap), "center": False}
     except Exception:
         nfft = min(1024, max(64, int(2 ** math.floor(math.log2(max(len(audio), 64))))))
         hop = max(1, nfft // 2)
@@ -330,7 +330,12 @@ def _stft(audio: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray]:
                 frame = np.pad(frame, (0, nfft - len(frame)))
             frames.append(np.fft.rfft(frame * window))
         freqs = np.fft.rfftfreq(nfft, d=1.0 / sr)
-        return freqs.astype(np.float64), np.asarray(frames, dtype=np.complex64).T
+        return freqs.astype(np.float64), np.asarray(frames, dtype=np.complex64).T, {"nFft": int(nfft), "hopLength": int(hop), "center": False}
+
+
+def _stft(audio: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray]:
+    freqs, zxx, _ = _stft_with_meta(audio, sr)
+    return freqs, zxx
 
 
 def _absolute_threshold_hearing(freqs: np.ndarray) -> np.ndarray:
@@ -339,10 +344,9 @@ def _absolute_threshold_hearing(freqs: np.ndarray) -> np.ndarray:
     return np.clip(ath - 80.0, -120.0, 40.0)
 
 
-def compute_psychoacoustic_metrics(x: np.ndarray, xp: np.ndarray, delta: np.ndarray, sr: int) -> dict[str, Any]:
-    del xp
-    freqs, x_stft = _stft(x, sr)
-    _, d_stft = _stft(delta, sr)
+def _psychoacoustic_state(x: np.ndarray, delta: np.ndarray, sr: int) -> dict[str, Any]:
+    freqs, x_stft, stft_meta = _stft_with_meta(x, sr)
+    _, d_stft, _ = _stft_with_meta(delta, sr)
     min_time = min(x_stft.shape[1], d_stft.shape[1])
     x_power = np.abs(x_stft[:, :min_time]) ** 2
     d_power = np.abs(d_stft[:, :min_time]) ** 2
@@ -351,10 +355,20 @@ def compute_psychoacoustic_metrics(x: np.ndarray, xp: np.ndarray, delta: np.ndar
     ath = _absolute_threshold_hearing(freqs)[:, None]
     theta = np.maximum(ath, psd_signal - 18.0)
     violation = np.maximum(0.0, psd_delta - theta)
-    l_psy = float(np.mean(violation)) if violation.size else None
-    over_mask_rate = float(np.mean(violation > 0.0)) if violation.size else None
-    threshold = np.mean(theta, axis=1) if theta.size else np.asarray([], dtype=np.float64)
-    perturbation = 10.0 * np.log10(np.mean(d_power, axis=1) + EPS) if d_power.size else np.asarray([], dtype=np.float64)
+    return {
+        "freqs": freqs,
+        "psdDelta": psd_delta,
+        "theta": theta,
+        "violation": violation,
+        "sampleRate": int(sr),
+        "hopLength": int(stft_meta["hopLength"]),
+        "nFft": int(stft_meta["nFft"]),
+        "center": bool(stft_meta.get("center")),
+        "frameCount": int(min_time),
+    }
+
+
+def _psychoacoustic_curve(freqs: np.ndarray, threshold: np.ndarray, perturbation: np.ndarray) -> dict[str, Any]:
     stride = max(1, int(math.ceil(len(freqs) / 96)))
     masking_threshold = [
         {"frequencyHz": float(freqs[i]), "thresholdDb": float(threshold[i])}
@@ -374,21 +388,136 @@ def compute_psychoacoustic_metrics(x: np.ndarray, xp: np.ndarray, delta: np.ndar
         for index, item in enumerate(masking_threshold)
         if index < len(perturbation_spectrum)
     ]
+    return {
+        "maskingThreshold": masking_threshold,
+        "perturbationSpectrum": perturbation_spectrum,
+        "chart": chart,
+    }
+
+
+def compute_psychoacoustic_metrics(x: np.ndarray, xp: np.ndarray, delta: np.ndarray, sr: int) -> dict[str, Any]:
+    del xp
+    state = _psychoacoustic_state(x, delta, sr)
+    freqs = state["freqs"]
+    psd_delta = state["psdDelta"]
+    theta = state["theta"]
+    violation = state["violation"]
+    l_psy = float(np.mean(violation)) if violation.size else None
+    over_mask_rate = float(np.mean(violation > 0.0)) if violation.size else None
+    threshold = np.mean(theta, axis=1) if theta.size else np.asarray([], dtype=np.float64)
+    perturbation = np.mean(psd_delta, axis=1) if psd_delta.size else np.asarray([], dtype=np.float64)
+    curve = _psychoacoustic_curve(freqs, threshold, perturbation)
     sources = {
         "psychoacoustic.*": metric_source(
             "available",
             "engineering_stft_masking_threshold",
             reason="Engineering approximation from signal STFT PSD and absolute-threshold curve; not a calibrated psychoacoustic model",
-            formula="V=max(0,PSD_delta-Theta); lPsy=mean(V); overMaskRate=mean(V>0)",
-        )
+            formula="Theta=max(ATH,PSD_signal-18); V=max(0,PSD_delta-Theta); lPsy=mean_{t,f}(V); overMaskRate=mean_{t,f}(V>0); maskingThreshold[f]=mean_t(Theta[t,f]); perturbationSpectrum[f]=mean_t(PSD_delta[t,f])",
+        ),
+        "psychoacoustic.slice": metric_source(
+            "available",
+            "stft_psychoacoustic_lazy_slice",
+            reason="Default result contains only time-mean curves; single-frame curves are computed lazily by /api/tasks/{taskId}/psychoacoustic-slice",
+            formula="mean mode: maskingThreshold[f]=mean_t(Theta[t,f]); perturbationSpectrum[f]=mean_t(PSD_delta[t,f]); lPsy and overMaskRate are full time-frequency statistics",
+        ),
     }
     return {
         "lPsy": l_psy,
         "overMaskRate": over_mask_rate,
-        "maskingThreshold": masking_threshold,
-        "perturbationSpectrum": perturbation_spectrum,
-        "chart": chart,
+        "frameCount": state["frameCount"],
+        "sampleRate": state["sampleRate"],
+        "hopLength": state["hopLength"],
+        "nFft": state["nFft"],
+        "aggregation": "time_mean",
+        "maskingThreshold": curve["maskingThreshold"],
+        "perturbationSpectrum": curve["perturbationSpectrum"],
+        "chart": curve["chart"],
         "_metricSources": sources,
+    }
+
+
+def compute_psychoacoustic_slice(
+    x: np.ndarray,
+    xp: np.ndarray,
+    delta: np.ndarray,
+    sr: int,
+    mode: str = "mean",
+    time_sec: float | None = None,
+    duration_sec: float | None = None,
+) -> dict[str, Any]:
+    del xp
+    mode = (mode or "mean").strip().lower()
+    if mode not in {"mean", "frame"}:
+        raise ValueError("mode must be 'mean' or 'frame'")
+
+    state = _psychoacoustic_state(x, delta, sr)
+    freqs = state["freqs"]
+    psd_delta = state["psdDelta"]
+    theta = state["theta"]
+    violation = state["violation"]
+    frame_count = int(state["frameCount"])
+    sample_rate = int(state["sampleRate"])
+    hop_length = int(state["hopLength"])
+    audio_duration = float(duration_sec) if duration_sec is not None and math.isfinite(float(duration_sec)) else (len(x) / float(sr) if sr else 0.0)
+    requested_time: float | None = None
+    actual_time: float | None = None
+    frame_index: int | None = None
+
+    if mode == "frame":
+        if time_sec is None:
+            raise ValueError("timeSec is required when mode=frame")
+        requested_time = float(time_sec)
+        if not math.isfinite(requested_time) or requested_time < 0.0 or requested_time > audio_duration:
+            raise ValueError(f"timeSec must be between 0 and {audio_duration:.6f} seconds")
+        if frame_count <= 0:
+            raise ValueError("psychoacoustic STFT has no frames")
+        frame_index = int(math.floor((requested_time * sample_rate / max(1, hop_length)) + 0.5))
+        frame_index = min(max(frame_index, 0), frame_count - 1)
+        actual_time = frame_index * hop_length / float(sample_rate) if sample_rate else None
+        threshold = theta[:, frame_index] if theta.size else np.asarray([], dtype=np.float64)
+        perturbation = psd_delta[:, frame_index] if psd_delta.size else np.asarray([], dtype=np.float64)
+        aggregation = "single_frame"
+        formula = (
+            "frame mode: frameIndex=round(timeSec*sampleRate/hopLength), clamped to [0,frameCount-1]; "
+            "maskingThreshold[f]=Theta[frameIndex,f]; perturbationSpectrum[f]=PSD_delta[frameIndex,f]; "
+            "lPsy and overMaskRate are full time-frequency statistics"
+        )
+    else:
+        threshold = np.mean(theta, axis=1) if theta.size else np.asarray([], dtype=np.float64)
+        perturbation = np.mean(psd_delta, axis=1) if psd_delta.size else np.asarray([], dtype=np.float64)
+        aggregation = "time_mean"
+        formula = (
+            "mean mode: maskingThreshold[f]=mean_t(Theta[t,f]); perturbationSpectrum[f]=mean_t(PSD_delta[t,f]); "
+            "lPsy and overMaskRate are full time-frequency statistics"
+        )
+
+    curve = _psychoacoustic_curve(freqs, threshold, perturbation)
+    l_psy = float(np.mean(violation)) if violation.size else None
+    over_mask_rate = float(np.mean(violation > 0.0)) if violation.size else None
+    source_reason = "STFT uses center=False; actualTimeSec is frameIndex*hopLength/sampleRate"
+    return {
+        "mode": mode,
+        "requestedTimeSec": requested_time,
+        "actualTimeSec": actual_time,
+        "frameIndex": frame_index,
+        "frameCount": frame_count,
+        "sampleRate": sample_rate,
+        "hopLength": hop_length,
+        "nFft": int(state["nFft"]),
+        "aggregation": aggregation,
+        "lPsy": l_psy,
+        "overMaskRate": over_mask_rate,
+        "maskingThreshold": curve["maskingThreshold"],
+        "perturbationSpectrum": curve["perturbationSpectrum"],
+        "charts": {"psychoacoustic": curve["chart"]},
+        "metricSources": {
+            "psychoacoustic.slice": metric_source(
+                "available",
+                "stft_psychoacoustic_lazy_slice",
+                reason=source_reason,
+                formula=formula,
+            )
+        },
     }
 
 

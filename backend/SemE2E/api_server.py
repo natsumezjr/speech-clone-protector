@@ -26,6 +26,7 @@ from result_adapter import (
     ProtectGenerationError,
     create_asr_eval,
     create_clone_voice,
+    create_psychoacoustic_slice,
     create_task,
     diagnose_capabilities,
     ensure_runtime_dirs,
@@ -1536,6 +1537,43 @@ def task_result(task_id: str) -> JSONResponse:
         )
     result = load_result(task_id)
     return JSONResponse(frontend_result(result))
+
+
+@app.get("/api/tasks/{task_id}/psychoacoustic-slice")
+def task_psychoacoustic_slice(task_id: str, mode: str = "mean", timeSec: float | None = None) -> JSONResponse:
+    if not (TASK_DIR / task_id / "result.json").exists():
+        status = read_task_status(task_id)
+        return structured_error(
+            code="TASK_RESULT_NOT_READY",
+            message=status.get("message") or "Task result is not ready yet.",
+            status_code=409,
+            request_id_value=request_id(),
+            task_id=task_id,
+            stage=status.get("stage") or "protect_generation",
+            details={"status": status.get("status"), "progress": status.get("progress"), "error": status.get("error")},
+        )
+    try:
+        return JSONResponse(create_psychoacoustic_slice(task_id, mode=mode, time_sec=timeSec))
+    except ValueError as exc:
+        return structured_error(
+            code="INVALID_PSYCHOACOUSTIC_SLICE_REQUEST",
+            message=str(exc),
+            status_code=400,
+            request_id_value=request_id(),
+            task_id=task_id,
+            stage="psychoacoustic_slice",
+            details={"mode": mode, "timeSec": timeSec},
+        )
+    except Exception as exc:
+        return structured_error(
+            code="PSYCHOACOUSTIC_SLICE_FAILED",
+            message="Failed to compute psychoacoustic slice.",
+            status_code=500,
+            request_id_value=request_id(),
+            task_id=task_id,
+            stage="psychoacoustic_slice",
+            details={"mode": mode, "timeSec": timeSec, "error": str(exc)},
+        )
 
 
 @app.get("/api/tasks/{task_id}/details")

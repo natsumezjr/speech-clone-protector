@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import json
 import os
 import sys
 import tempfile
@@ -17,6 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import metric_definitions as metrics
+import api_server as api
 import result_adapter as adapter
 from api_server import frontend_result
 from result_adapter import build_task_payload
@@ -89,6 +91,80 @@ class MetricDefinitionsTest(unittest.TestCase):
             self.assertTrue(math.isclose(result["linfNorm"], float(np.max(np.abs(expected_delta))), rel_tol=1e-5))
             self.assertEqual(result["clippingRate"], 0.25)
             self.assertIsNotNone(result["snr"])
+
+    def _fake_psycho_state(self) -> dict[str, object]:
+        theta = np.array([[1.0, 3.0, 5.0], [10.0, 14.0, 18.0]], dtype=np.float64)
+        psd_delta = np.array([[0.0, 4.0, 8.0], [20.0, 22.0, 24.0]], dtype=np.float64)
+        return {
+            "freqs": np.array([100.0, 200.0], dtype=np.float64),
+            "psdDelta": psd_delta,
+            "theta": theta,
+            "violation": np.maximum(0.0, psd_delta - theta),
+            "sampleRate": 10,
+            "hopLength": 5,
+            "nFft": 8,
+            "center": False,
+            "frameCount": 3,
+        }
+
+    def test_psychoacoustic_slice_mean_uses_time_mean_curves_and_global_stats(self) -> None:
+        with mock.patch.object(metrics, "_psychoacoustic_state", return_value=self._fake_psycho_state()):
+            result = metrics.compute_psychoacoustic_slice(np.zeros(10), np.zeros(10), np.zeros(10), 10, mode="mean", duration_sec=1.0)
+
+        expected_violation = np.maximum(0.0, self._fake_psycho_state()["psdDelta"] - self._fake_psycho_state()["theta"])
+        self.assertEqual(result["aggregation"], "time_mean")
+        self.assertIsNone(result["frameIndex"])
+        self.assertEqual(result["maskingThreshold"][0]["thresholdDb"], 3.0)
+        self.assertEqual(result["maskingThreshold"][1]["thresholdDb"], 14.0)
+        self.assertEqual(result["perturbationSpectrum"][0]["powerDb"], 4.0)
+        self.assertEqual(result["perturbationSpectrum"][1]["powerDb"], 22.0)
+        self.assertTrue(math.isclose(result["lPsy"], float(np.mean(expected_violation)), rel_tol=1e-9))
+        self.assertTrue(math.isclose(result["overMaskRate"], float(np.mean(expected_violation > 0.0)), rel_tol=1e-9))
+
+    def test_psychoacoustic_slice_frame_uses_selected_frame_not_mean(self) -> None:
+        with mock.patch.object(metrics, "_psychoacoustic_state", return_value=self._fake_psycho_state()):
+            result = metrics.compute_psychoacoustic_slice(np.zeros(10), np.zeros(10), np.zeros(10), 10, mode="frame", time_sec=0.5, duration_sec=1.0)
+
+        self.assertEqual(result["aggregation"], "single_frame")
+        self.assertEqual(result["frameIndex"], 1)
+        self.assertEqual(result["actualTimeSec"], 0.5)
+        self.assertEqual(result["frameCount"], 3)
+        self.assertEqual(result["maskingThreshold"][0]["thresholdDb"], 3.0)
+        self.assertEqual(result["maskingThreshold"][1]["thresholdDb"], 14.0)
+        self.assertEqual(result["perturbationSpectrum"][0]["powerDb"], 4.0)
+        self.assertEqual(result["perturbationSpectrum"][1]["powerDb"], 22.0)
+        self.assertNotEqual(result["maskingThreshold"][0]["thresholdDb"], 1.0)
+
+    def test_psychoacoustic_slice_frame_zero_and_duration_are_clamped_to_legal_frames(self) -> None:
+        with mock.patch.object(metrics, "_psychoacoustic_state", return_value=self._fake_psycho_state()):
+            first = metrics.compute_psychoacoustic_slice(np.zeros(10), np.zeros(10), np.zeros(10), 10, mode="frame", time_sec=0.0, duration_sec=1.0)
+            last = metrics.compute_psychoacoustic_slice(np.zeros(10), np.zeros(10), np.zeros(10), 10, mode="frame", time_sec=1.0, duration_sec=1.0)
+
+        self.assertEqual(first["frameIndex"], 0)
+        self.assertEqual(last["frameIndex"], 2)
+        self.assertEqual(last["frameIndex"], last["frameCount"] - 1)
+
+    def test_psychoacoustic_slice_rejects_time_outside_duration(self) -> None:
+        with mock.patch.object(metrics, "_psychoacoustic_state", return_value=self._fake_psycho_state()):
+            with self.assertRaisesRegex(ValueError, "between 0 and 1.000000"):
+                metrics.compute_psychoacoustic_slice(np.zeros(10), np.zeros(10), np.zeros(10), 10, mode="frame", time_sec=-0.01, duration_sec=1.0)
+            with self.assertRaisesRegex(ValueError, "between 0 and 1.000000"):
+                metrics.compute_psychoacoustic_slice(np.zeros(10), np.zeros(10), np.zeros(10), 10, mode="frame", time_sec=1.01, duration_sec=1.0)
+
+    def test_psychoacoustic_slice_route_returns_400_for_invalid_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp)
+            task_dir = task_root / "task_test"
+            task_dir.mkdir()
+            (task_dir / "result.json").write_text("{}", encoding="utf-8")
+            with mock.patch.object(api, "TASK_DIR", task_root):
+                with mock.patch.object(api, "create_psychoacoustic_slice", side_effect=ValueError("timeSec must be between 0 and 1.000000 seconds")):
+                    response = api.task_psychoacoustic_slice("task_test", mode="frame", timeSec=-0.01)
+
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(payload["error"]["code"], "INVALID_PSYCHOACOUSTIC_SLICE_REQUEST")
+        self.assertIn("between 0 and 1.000000", payload["error"]["message"])
 
     def test_asr_edit_rates_and_error_shares_use_separate_denominators(self) -> None:
         result = metrics.compute_asr_metrics(
