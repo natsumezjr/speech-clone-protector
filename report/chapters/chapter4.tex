@@ -1,0 +1,852 @@
+\chapter{作品测试与分析}\label{ux7b2cux56dbux7ae0-ux4f5cux54c1ux6d4bux8bd5ux4e0eux5206ux6790}
+
+本章对 V-Guard
+系统进行功能完整性、语义保护效果、声音身份保护效果、音频质量与听感、系统性能与资源占用等方面的测试与分析。测试不只验证算法能否生成受保护音频，还进一步检查受保护音频进入真实下游链路后的防护效果，即自动语音识别系统是否还能稳定识别语义内容、零样本语音克隆系统是否还能稳定复刻目标说话人的声音身份，以及系统输出是否具备继续播放、传播和展示的工程可用性。
+
+本章重点采用``原始音频---保护音频''成对对比方式进行评价。每条测试样本同时保留原始版本与
+V-Guard 保护版本，随后分别进入 ASR 评估、XTTS-v2 语音克隆、克隆结果 ASR
+评估和 ECAPA-TDNN 声纹相似度评估流程。测试结果表明，V-Guard 在当前 50 条
+LibriTTS 测试样本上能够显著破坏机器语义链路和声音身份链路：保护后音频在
+Whisper Medium 上的平均 WER 达到 127.10\%，在 wav2vec2-base-960h
+上的平均 WER 达到 105.18\%；以保护音频作为 XTTS-v2
+参考音频生成的克隆语音，其 ECAPA 说话人相似度由原始参考条件下的 0.557
+降至 -0.062，全部 50 条样本均低于 0.30 的身份防护判定阈值。
+
+当前完成的实测主要覆盖算法后端与下游攻击验证闭环，已经形成主实验、高保真参数组、跨克隆后端迁移性、信道变换鲁棒性和损失项消融的结构化结果文件。
+
+\section{测试目标与测试思路}\label{ux6d4bux8bd5ux76eeux6807ux4e0eux6d4bux8bd5ux601dux8def}
+
+V-Guard
+的测试目标是验证系统能否在声音资产公开发布前，为原始语音生成对人耳尽量可接受、但会干扰机器语音理解与声音身份提取的保护扰动。围绕该目标，测试从七个方面展开：
+
+1.功能完整性：验证数据集构建、批量保护、保护音频保存、ASR 评估、TTS
+克隆评估和结果导出等后端流程是否贯通。
+
+2.语义保护效果：验证受保护音频是否显著提高 ASR
+转写错误率，从而削弱机器对语音内容的稳定理解能力。
+
+3.声音身份保护效果：验证受保护音频作为语音克隆参考音频时，克隆结果是否明显偏离原始说话人的声纹表示。
+
+4.音频质量与听感：验证保护扰动的幅度、SNR
+和波形相关性是否处于可分析范围，判断当前参数下防护强度与听感保真之间的权衡。
+
+5.跨模型迁移与信道鲁棒性：验证保护音频在不同克隆后端和常见传播变换后是否仍能保持防护效果。
+
+6.消融实验：验证语义损失、身份相关损失和质量正则项对防护强度与音频质量权衡的贡献。
+
+7.系统性能与资源占用：验证 50
+轮优化在服务器环境中能否稳定完成，并统计优化阶段耗时和实时率。
+
+测试采用双链路评价思路。第一条链路是语义链路，即原始音频和保护音频分别输入
+ASR 后，与 LibriTTS 标注文本计算 WER 和
+CER。第二条链路是声音身份链路，即原始音频和保护音频分别作为语音克隆参考音频生成同一目标文本，再使用
+ECAPA-TDNN 计算克隆语音与原始说话人的相似度。若保护后 WER
+明显升高且克隆声纹相似度明显下降，则说明保护扰动不仅影响 ASR
+识别，还能传导到真实语音克隆流程。在主实验之外，本章进一步加入高保真参数组、跨克隆后端、信道变换和损失项消融，用于分析防护效果的边界和各模块贡献。
+
+本章采用如下判定口径：
+
+{\def\LTcaptype{table} % do not increment counter
+\begin{longtable}[]{@{}
+  >{\centering\arraybackslash}m{(\linewidth - 4\tabcolsep) * \real{0.1200}}
+  >{\centering\arraybackslash}m{(\linewidth - 4\tabcolsep) * \real{0.2823}}
+  >{\centering\arraybackslash}m{(\linewidth - 4\tabcolsep) * \real{0.5977}}@{}}
+\caption{判定口径}\\
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\centering
+\textbf{测试维度}
+\end{minipage} & \begin{minipage}[b]{\linewidth}\centering
+\textbf{主要指标}
+\end{minipage} & \begin{minipage}[b]{\linewidth}\centering
+\textbf{判定口径}
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+语义保护 & 保护后 WER & WER \textgreater= 50\% 视为语义链路防护生效 \\
+语义保护 & 保护后 CER & CER 越高表示字符级偏差越明显 \\
+身份保护 & 克隆后说话人相似度 & SIM \textless= 0.30
+视为身份链路防护生效 \\
+身份保护 & 相似度下降率 & 下降率越高表示克隆音色偏离越明显 \\
+音频质量 & SNR & 作为保真度观察指标； \\
+鲁棒性 & 变换后 WER / SIM & 常见压缩、重采样、滤波和加噪后仍保持高 WER
+与低 SIM \\
+消融分析 & WER、SIM、SNR、相关性 &
+对比关闭不同损失项后的防护强度与质量变化 \\
+系统性能 & 优化阶段耗时、RTF & 记录实测值，用于评估工程可用性 \\
+\end{longtable}
+}
+
+\section{测试环境与测试配置}\label{ux6d4bux8bd5ux73afux5883ux4e0eux6d4bux8bd5ux914dux7f6e}
+
+实验在项目远程 GPU 服务器上完成。该服务器用于执行批量保护、ASR
+评估、XTTS-v2 克隆生成和 ECAPA 声纹评估。环境配置见表 4-2。
+
+{\def\LTcaptype{table} % do not increment counter
+\begin{longtable}[]{@{}
+  >{\centering\arraybackslash}m{(\linewidth - 4\tabcolsep) * \real{0.1645}}
+  >{\centering\arraybackslash}m{(\linewidth - 4\tabcolsep) * \real{0.1341}}
+  >{\centering\arraybackslash}m{(\linewidth - 4\tabcolsep) * \real{0.7014}}@{}}
+\caption{测试环境配置}\\
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\centering
+\textbf{类别}
+\end{minipage} & \begin{minipage}[b]{\linewidth}\centering
+\textbf{配置项}
+\end{minipage} & \begin{minipage}[b]{\linewidth}\centering
+\textbf{具体配置}
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+硬件环境 & CPU & 2 × AMD EPYC 9V74 80-Core Processor，320 逻辑 CPU \\
+硬件环境 & GPU & 4 × NVIDIA RTX PRO 5000 Blackwell，单卡 48935 MiB；2 ×
+NVIDIA RTX PRO 6000 Blackwell Max-Q，
+
+单卡 97887 MiB \\
+硬件环境 & 内存 & 251 GiB \\
+软件环境 & 操作系统 & Ubuntu 24.04 LTS \\
+软件环境 & Python & Python 3.10.20，项目虚拟环境可见于开源项目 \\
+软件环境 & PyTorch / CUDA & PyTorch 2.12.1+cu130，CUDA 可用 \\
+保护入口 & 主脚本 & protect\_semantic.py、run\_semantic\_batch.py \\
+评估入口 & ASR / TTS &
+evaluate\_asr.py、generate\_tts\_xtts.py、evaluate\_tts.py \\
+\end{longtable}
+}
+
+当前实测采用的保护与评估配置见表 4-3。
+
+{\def\LTcaptype{table} % do not increment counter
+\begin{longtable}[]{@{}
+  >{\centering\arraybackslash}m{(\linewidth - 2\tabcolsep) * \real{0.2052}}
+  >{\centering\arraybackslash}m{(\linewidth - 2\tabcolsep) * \real{0.7948}}@{}}
+\caption{关键测试配置}\\
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\centering
+\textbf{配置项}
+\end{minipage} & \begin{minipage}[b]{\linewidth}\centering
+\textbf{取值}
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+保护模式 & 非定向保护，保护模式=非定向 \\
+批量保护轮数 & 50 epoch，对应结果标签 semantic\_e50 \\
+扰动上界 & epsilon = 8/255，实测 noise\_linf=0.031402587890625 \\
+损失函数 & L = 500 L\_fea + 100 L\_sem + 1e-5 L\_psy + 0.1 L2 \\
+高保真参数组 & 20 epoch，epsilon = 4/255，
+
+心理声学权重 1e-4，对应结果标签 semantic\_e20 \\
+采样规范 & 16 kHz 单声道 wav \\
+ASR 评估模型 & openai-whisper:medium、facebook/wav2vec2-base-960h \\
+克隆后端 & 主实验为 XTTS-v2，跨模型实验补充 XTTS-v1.1 与 YourTTS \\
+鲁棒性变换 & MP3 128 kbps、MP3 64 kbps、8 kHz 重采样、
+
+4 kHz 低通滤波、20 dB 加噪 \\
+克隆目标文本 & This is a controlled downstream text to speech
+evaluation. \\
+声纹评估模型 & ECAPA-TDNN，指标为余弦相似度 \\
+\end{longtable}
+}
+
+\section{测试数据与样本设置}\label{ux6d4bux8bd5ux6570ux636eux4e0eux6837ux672cux8bbeux7f6e}
+
+本阶段采用 LibriTTS dev.clean
+子集构造测试数据。项目脚本从公开数据集中筛选 50
+条具有真实转写文本的英文语音样本，并将每条样本统一处理为可进入保护模型的
+wav 文件。50 条样本总时长为 236.99 秒，平均时长为 4.74 秒，最短 2.07
+秒，最长 7.98 秒。每条样本均生成一条原始记录和一条 semantic\_e50
+保护记录，形成 50 组原始-保护成对样本。
+
+{\def\LTcaptype{table} % do not increment counter
+\begin{longtable}[]{@{}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1926}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1172}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1405}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1202}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1265}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.3029}}@{}}
+\caption{测试样本设置}\\
+\toprule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+样本组 & 样本数量 & 时长范围 & 平均时长 & 语言类型 & 测试目的 \\
+短语音样本组 & 18 & 2.07-3.89 s & 2.94 s & 英文朗读 &
+评估短参考音频保护效果 \\
+中等长度样本组 & 19 & 4.07-5.91 s & 4.95 s & 英文朗读 &
+评估常规短音频发布场景 \\
+较长语音样本组 & 13 & 6.04-7.98 s & 6.93 s & 英文朗读 &
+评估约8秒参考音频效果 \\
+合计 & 50 & 2.07-7.98 s & 4.74 s & 英文朗读 & 覆盖多时长LibriTTS样本 \\
+\end{longtable}
+}
+
+本阶段测试数据具有真实参考文本，因此 ASR 评估使用 LibriTTS 标注文本作为
+reference，而不是使用原始音频的 ASR 输出作为伪参考。这一点可以避免 ASR
+自身误差被误认为防护效果，使 WER/CER 指标更可靠。
+
+\section{功能完整性测试}\label{ux529fux80fdux5b8cux6574ux6027ux6d4bux8bd5}
+
+功能完整性测试主要验证 V-Guard
+的后端算法与评估闭环是否可执行、可复现、可导出。当前已完成的功能测试覆盖数据集构建、批量保护、ASR
+评估、XTTS-v2 克隆生成、克隆后 ASR
+与声纹评估、跨克隆后端迁移、信道变换鲁棒性、损失项消融和结果文件导出等核心流程。
+
+{\def\LTcaptype{table} % do not increment counter
+\begin{longtable}[]{@{}
+  >{\centering\arraybackslash}m{(\linewidth - 6\tabcolsep) * \real{0.2062}}
+  >{\centering\arraybackslash}m{(\linewidth - 6\tabcolsep) * \real{0.3256}}
+  >{\centering\arraybackslash}m{(\linewidth - 6\tabcolsep) * \real{0.3302}}
+  >{\centering\arraybackslash}m{(\linewidth - 6\tabcolsep) * \real{0.1380}}@{}}
+\caption{功能完整性测试结果}\\
+\toprule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+测试项 & 测试内容 & 实际结果 & 是否通过 \\
+数据集构建 & 生成 50 条 LibriTTS 样本及 manifest & protected\_e50.csv 含
+50 条 clean 与 50 条 semantic\_e50 记录 & 通过 \\
+批量保护生成 & 对 50 条样本执行 50 轮非定向保护 & 50 条保护音频和 50
+份日志均已生成 & 通过 \\
+ASR 评估 & 对 clean / semantic\_e50 执行双模型 ASR &
+asr\_manifest\_results.csv 共 200 条评估记录 & 通过 \\
+TTS 克隆生成 & 使用 clean / semantic\_e50 作为 XTTS-v2 参考音频 &
+tts\_manifest.csv 共 100 条克隆音频记录 & 通过 \\
+克隆后评估 & 对克隆结果执行 ASR 与 ECAPA 声纹评估 & tts\_results.csv 共
+100 条评估记录 & 通过 \\
+高保真参数组 & 使用 semantic\_e20 参数重复保护、ASR 与 XTTS-v2 评估 &
+高保真组 ASR、TTS、ECAPA 结果均已生成 & 通过 \\
+跨克隆后端 & 使用 XTTS-v1.1 与 YourTTS 复测克隆链路 & 两个后端均有
+标记与 & 通过 \\
+信道鲁棒性 & 对保护音频执行压缩、重采样、低通、加噪后复测 &
+robust\_manifest.csv、ASR 与声纹结果均已生成 & 通过 \\
+损失项消融 & 分别运行
+no\_identity、no\_semantic、no\_quality\_regularizer、semantic\_only &
+四个变体均有 标记和评估结果 & 通过 \\
+结果导出 & 导出 CSV、JSON、wav、log 证据文件 &
+输出目录中已保存结构化结果和音频文件 & 通过 \\
+前端上传与页面展示 & wav/mp3/mp4 上传、历史记录、PDF/ZIP 导出 &
+见3.5示例 & 通过 \\
+\end{longtable}
+}
+
+从后端闭环看，V-Guard
+已经能够完成``数据输入---保护生成---语义评估---克隆攻击模拟---身份评估---结果导出''的核心流程。当前尚缺少的是面向作品展示的前端逐项验收材料，包括音频/视频上传截图、ASR
+对比页面截图、声纹雷达图截图、历史记录页面截图和导出文件截图。这部分不影响算法实测结论，但会影响作品报告中功能展示的完整性，建议在最终提交前补齐。
+
+\section{语义保护效果测试}\label{ux8bedux4e49ux4fddux62a4ux6548ux679cux6d4bux8bd5}
+
+语义保护效果测试用于验证受保护音频是否能够破坏机器对语音内容的稳定识别。测试中，原始音频和保护音频分别输入
+openai-whisper:medium 与 facebook/wav2vec2-base-960h，并以 LibriTTS
+原始标注文本作为参考计算 WER 和 CER。
+
+\subsection{总体结果}\label{ux603bux4f53ux7ed3ux679c}
+
+{\def\LTcaptype{table} % do not increment counter
+\begin{longtable}[]{@{}
+  >{\centering\arraybackslash}m{(\linewidth - 12\tabcolsep) * \real{0.1428}}
+  >{\centering\arraybackslash}m{(\linewidth - 12\tabcolsep) * \real{0.1835}}
+  >{\centering\arraybackslash}m{(\linewidth - 12\tabcolsep) * \real{0.1125}}
+  >{\centering\arraybackslash}m{(\linewidth - 12\tabcolsep) * \real{0.1322}}
+  >{\centering\arraybackslash}m{(\linewidth - 12\tabcolsep) * \real{0.1262}}
+  >{\centering\arraybackslash}m{(\linewidth - 12\tabcolsep) * \real{0.1804}}
+  >{\centering\arraybackslash}m{(\linewidth - 12\tabcolsep) * \real{0.1224}}@{}}
+\caption{ASR 语义保护总体结果}\\
+\toprule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+ASR 模型 & 条件 & 样本数 & 平均 WER & 中位 WER & WER \textgreater= 50\%
+& 平均 CER \\
+Whisper Medium & 原始音频 & 50 & 4.72\% & 0.00\% & 0/50 & 1.19\% \\
+Whisper Medium & 保护音频 semantic\_e50 & 50 & 127.10\% & 100.00\% &
+50/50 & 107.98\% \\
+wav2vec2-base-960h & 原始音频 & 50 & 5.37\% & 4.08\% & 0/50 & 1.38\% \\
+wav2vec2-base-960h & 保护音频 semantic\_e50 & 50 & 105.18\% & 100.00\% &
+50/50 & 79.57\% \\
+\end{longtable}
+}
+
+结果显示，原始音频在两个 ASR
+模型上的识别错误率均较低，说明测试集标注文本与音频质量可靠。经过 V-Guard
+保护后，两个 ASR 模型的 WER 均显著上升，并且 50 条保护样本全部超过 50\%
+的语义防护阈值。其中，Whisper Medium 的平均 WER 从 4.72\% 上升至
+127.10\%，平均提升 122.38 个百分点；wav2vec2-base-960h 的平均 WER 从
+5.37\% 上升至 105.18\%，平均提升 99.81 个百分点。
+
+WER 超过 100\% 的原因是 ASR
+输出不仅出现替换和删除，还产生大量插入文本。例如部分保护音频被 Whisper
+识别为与原句无关的长句，说明扰动使模型解码阶段产生了明显幻觉式输出，而不是简单丢失个别词。
+
+\subsection{分时长结果}\label{ux5206ux65f6ux957fux7ed3ux679c}
+
+{\def\LTcaptype{table} % do not increment counter
+\begin{longtable}[]{@{}
+  >{\centering\arraybackslash}m{(\linewidth - 8\tabcolsep) * \real{0.2214}}
+  >{\centering\arraybackslash}m{(\linewidth - 8\tabcolsep) * \real{0.1949}}
+  >{\centering\arraybackslash}m{(\linewidth - 8\tabcolsep) * \real{0.1946}}
+  >{\centering\arraybackslash}m{(\linewidth - 8\tabcolsep) * \real{0.1946}}
+  >{\centering\arraybackslash}m{(\linewidth - 8\tabcolsep) * \real{0.1946}}@{}}
+\caption{不同时长样本组的 ASR 结果}\\
+\toprule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+ASR 模型 & 条件 & 短语音 WER & 中等语音 WER & 较长语音 WER \\
+Whisper Medium & 原始音频 & 6.25\% & 4.47\% & 2.96\% \\
+Whisper Medium & 保护音频 semantic\_e50 & 152.34\% & 108.28\% &
+119.63\% \\
+wav2vec2-base-960h & 原始音频 & 8.43\% & 3.99\% & 3.14\% \\
+wav2vec2-base-960h & 保护音频 semantic\_e50 & 105.40\% & 106.83\% &
+102.45\% \\
+\end{longtable}
+}
+
+按时长分组观察，短语音、中等长度语音和较长语音在保护后均达到 100\%
+左右或更高的 WER。Whisper Medium 在短语音组上的 WER 最高，达到
+152.34\%，表明当参考语音较短、上下文冗余较少时，保护扰动更容易使解码结果整体偏移。较长语音组的
+WER 仍达到 119.63\%，说明扰动效果并未因为音频长度接近 8 秒而明显失效。
+
+\subsection{典型样本}\label{ux5178ux578bux6837ux672c}
+
+\begin{table}[htbp]
+\centering
+\caption{保护后 ASR 转写偏移示例}
+\label{tab:asr-shift-examples}
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}
+  >{\centering\arraybackslash}m{0.13\textwidth}
+  >{\centering\arraybackslash}m{0.18\textwidth}
+  >{\centering\arraybackslash}m{0.27\textwidth}
+  >{\centering\arraybackslash}m{0.27\textwidth}
+  >{\centering\arraybackslash}m{0.075\textwidth}@{}
+}
+\toprule
+ASR 模型 & 样本编号 & 参考文本摘录 & \makecell{保护后识别文本\\摘录} & WER \\
+\midrule
+\makecell[c]{Whisper\\Medium} & \makecell[c]{\ttfamily\footnotesize 2902\_9008\_\\\ttfamily\footnotesize 000013\_000003} & Six new pupils in the mathematical school this morning. & of 50 seconds, scan the several chest camera recordings... & 388.9\% \\
+\makecell[c]{Whisper\\Medium} & \makecell[c]{\ttfamily\footnotesize 2902\_9008\_\\\ttfamily\footnotesize 000022\_000000} & Ah, so they say-Your excellent father has vanished. & I'm gonna get off. Do you want to do the X-ray?... & 333.3\% \\
+\makecell[c]{wav2vec2-\\base-960h} & \makecell[c]{\ttfamily\footnotesize 2902\_9008\_\\\ttfamily\footnotesize 000055\_000003} & Does your excellency, or this proud bishop, govern Alexandria? & ER LAR AS SOON AS YO COT HIS THOUGHT... & 160.0\% \\
+\makecell[c]{wav2vec2-\\base-960h} & \makecell[c]{\ttfamily\footnotesize 3536\_23268\_\\\ttfamily\footnotesize 000019\_000000} & Miss Milner, you shall not leave the house this evening. & A FEW MOMEN PREAT YOUM ENOUGH... & 130.0\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+这些示例体现出两类典型错误。Whisper 作为生成式
+ASR，保护后更容易输出完整但语义无关的幻觉句子；wav2vec2-base-960h
+的输出则更多表现为局部音素和词片段错乱。两种不同错误形态共同说明，保护扰动并非只针对单一
+ASR 解码器有效，而是在语音表示层面造成了可迁移的语义偏移。
+
+\subsection{高保真参数组对比}\label{ux9ad8ux4fddux771fux53c2ux6570ux7ec4ux5bf9ux6bd4}
+
+为分析防护强度与音频保真之间的权衡，本阶段补充了高保真参数组
+semantic\_e20。该组将优化轮数从 50 降至 20，将扰动上界从 8/255 降至
+4/255，并将心理声学约束权重提高到 1e-4。其结果见表 4-9。
+
+{\def\LTcaptype{table} % do not increment counter
+\begin{longtable}[]{@{}
+  >{\centering\arraybackslash}m{(\linewidth - 14\tabcolsep) * \real{0.1517}}
+  >{\centering\arraybackslash}m{(\linewidth - 14\tabcolsep) * \real{0.1203}}
+  >{\centering\arraybackslash}m{(\linewidth - 14\tabcolsep) * \real{0.1216}}
+  >{\centering\arraybackslash}m{(\linewidth - 14\tabcolsep) * \real{0.1218}}
+  >{\centering\arraybackslash}m{(\linewidth - 14\tabcolsep) * \real{0.1216}}
+  >{\centering\arraybackslash}m{(\linewidth - 14\tabcolsep) * \real{0.1238}}
+  >{\centering\arraybackslash}m{(\linewidth - 14\tabcolsep) * \real{0.1104}}
+  >{\centering\arraybackslash}m{(\linewidth - 14\tabcolsep) * \real{0.1286}}@{}}
+\caption{强防护组与高保真组 ASR 结果对比}\\
+\toprule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+参数组 & 样本数 & Whisper WER & wav2vec2 WER & WER
+
+\textgreater= 50\% & 平均 SNR & 平均 L∞ & 波形相关性 \\
+semantic\_e50 强防护组 & 50 & 127.10\% & 105.18\% & 50/50 & 11.21 dB &
+0.031 & 0.952 \\
+semantic\_e20 高保真组 & 50 & 112.47\% & 103.89\% & 49/50 & 15.45 dB &
+0.016 & 0.980 \\
+\end{longtable}
+}
+
+高保真组在降低扰动幅度后，平均 SNR 从 11.21 dB 提升至 15.45 dB，L∞
+上界约减半，波形相关性由 0.952 提升至
+0.980，说明其客观信号保真度明显优于强防护组。与此同时，Whisper 与
+wav2vec2 的平均 WER 仍分别达到 112.47\% 和 103.89\%，49 条样本超过 50\%
+防护阈值，表明 V-Guard
+在减小扰动后仍能维持较强语义防护效果。该结果为后续选择``演示强防护模式''或``发布高保真模式''提供了参数依据。
+
+\section{声音身份保护效果测试}\label{ux58f0ux97f3ux8eabux4efdux4fddux62a4ux6548ux679cux6d4bux8bd5}
+
+声音身份保护效果测试用于验证受保护音频是否能够削弱语音克隆系统对原始说话人身份的复刻能力。测试流程如下：首先分别使用原始音频和保护音频作为
+XTTS-v2 的参考音频，生成同一句目标文本；然后使用 ECAPA-TDNN
+提取克隆语音与原始说话人的声纹嵌入，并计算余弦相似度{[}12,44{]}。
+
+\subsection{总体结果}\label{ux603bux4f53ux7ed3ux679c-1}
+
+{\def\LTcaptype{table} % do not increment counter
+\begin{longtable}[]{@{}
+  >{\centering\arraybackslash}m{(\linewidth - 12\tabcolsep) * \real{0.2236}}
+  >{\centering\arraybackslash}m{(\linewidth - 12\tabcolsep) * \real{0.0990}}
+  >{\centering\arraybackslash}m{(\linewidth - 12\tabcolsep) * \real{0.1281}}
+  >{\centering\arraybackslash}m{(\linewidth - 12\tabcolsep) * \real{0.1313}}
+  >{\centering\arraybackslash}m{(\linewidth - 12\tabcolsep) * \real{0.1323}}
+  >{\centering\arraybackslash}m{(\linewidth - 12\tabcolsep) * \real{0.1429}}
+  >{\centering\arraybackslash}m{(\linewidth - 12\tabcolsep) * \real{0.1429}}@{}}
+\caption{XTTS-v2 克隆后声纹相似度结果}\\
+\toprule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+条件 & 样本数 & 平均 SIM & 中位 SIM & SIM min & SIM max & SIM
+\textless=0.30 \\
+原始音频作为参考 & 50 & 0.557 & 0.570 & 0.348 & 0.698 & 0/50 \\
+保护音频作为参考 & 50 & -0.062 & -0.076 & -0.242 & 0.252 & 50/50 \\
+\end{longtable}
+}
+
+在原始音频作为参考时，XTTS-v2 生成语音与原始说话人具有较高相似度，平均
+SIM 为
+0.557，说明克隆后端能够从原始参考音频中提取较稳定的声音身份特征。使用
+V-Guard 保护音频作为参考后，平均 SIM 降至 -0.062，中位数为 -0.076，全部
+50 条样本均低于 0.30 阈值。该结果说明，保护扰动能够显著破坏 XTTS-v2
+从参考音频中提取原说话人音色与身份条件的能力。
+
+进一步计算配对样本的相似度下降率，50 条样本平均下降率为
+109.93\%，中位下降率为 112.83\%，其中 48 条样本下降率超过
+60\%。下降率超过 100\% 是因为部分保护后克隆语音与原始说话人的 ECAPA
+余弦相似度变为负值，表示其在声纹嵌入空间中已经明显偏离原始说话人方向。
+
+\subsection{分时长结果}\label{ux5206ux65f6ux957fux7ed3ux679c-1}
+
+{\def\LTcaptype{table} % do not increment counter
+\begin{longtable}[]{@{}
+  >{\centering\arraybackslash}m{(\linewidth - 6\tabcolsep) * \real{0.2500}}
+  >{\centering\arraybackslash}m{(\linewidth - 6\tabcolsep) * \real{0.2500}}
+  >{\centering\arraybackslash}m{(\linewidth - 6\tabcolsep) * \real{0.2500}}
+  >{\centering\arraybackslash}m{(\linewidth - 6\tabcolsep) * \real{0.2500}}@{}}
+\caption{不同时长样本组的 XTTS-v2 声纹相似度}\\
+\toprule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+样本组 & 原始参考 SIM & 保护参考 SIM & 保护后 SIM \textless= 0.30 \\
+短语音样本组 & 0.546 & -0.059 & 18/18 \\
+中等长度样本组 & 0.549 & -0.061 & 19/19 \\
+较长语音样本组 & 0.586 & -0.068 & 13/13 \\
+\end{longtable}
+}
+
+各时长组的保护后相似度都下降到 0
+以下，且全部样本低于身份防护阈值。较长语音组在原始参考条件下 SIM
+最高，说明更长参考音频确实为克隆模型提供了更充分的说话人线索；但保护后
+SIM 仍降至 -0.068，说明当前扰动能够在 6-8
+秒参考音频上保持身份链路防护效果。
+
+\subsection{克隆语音语义结果}\label{ux514bux9686ux8bedux97f3ux8bedux4e49ux7ed3ux679c}
+
+除声纹相似度外，本章还统计了 XTTS-v2 克隆语音对固定目标文本的 ASR
+识别结果。
+
+{\def\LTcaptype{table} % do not increment counter
+\begin{longtable}[]{@{}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1667}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1667}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1667}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1667}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1667}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1667}}@{}}
+\caption{XTTS-v2 克隆结果的 ASR 指标}\\
+\toprule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+条件 & 样本数 & 平均 WER & 中位 WER & WER \textgreater= 50\% & 平均
+CER \\
+原始音频作为参考 & 50 & 12.67\% & 0.00\% & 5/50 & 8.20\% \\
+保护音频作为参考 & 50 & 19.78\% & 11.11\% & 6/50 & 12.73\% \\
+\end{longtable}
+}
+
+从克隆后 ASR 结果看，保护参考音频使 XTTS-v2
+输出的目标文本可识别性有所下降，但幅度小于直接 ASR 语义链路。平均 WER 从
+12.67\% 增至 19.78\%，提升 7.11
+个百分点。该现象说明，当前实验中声音身份防护强于克隆语义破坏：保护音频可以显著改变克隆音色，但
+XTTS-v2 在固定目标文本条件下仍能较多地保持文本内容。这与 V-Guard
+的防护目标并不矛盾，因为语音克隆攻击中更关键的是攻击者是否能复刻目标说话人的声音身份；从声纹结果看，该目标已被有效破坏。
+
+\subsection{跨克隆后端迁移性}\label{ux8de8ux514bux9686ux540eux7aefux8fc1ux79fbux6027}
+
+为验证保护扰动是否只对单一 XTTS-v2 后端有效，本阶段进一步使用 XTTS-v1.1
+与 YourTTS
+进行跨克隆后端复测。测试仍采用相同参考音频、相同目标文本和同一
+ECAPA-TDNN 声纹评估口径{[}11-12{]}。
+
+{\def\LTcaptype{table} % do not increment counter
+\begin{longtable}[]{@{}
+  >{\centering\arraybackslash}m{(\linewidth - 12\tabcolsep) * \real{0.1429}}
+  >{\centering\arraybackslash}m{(\linewidth - 12\tabcolsep) * \real{0.1429}}
+  >{\centering\arraybackslash}m{(\linewidth - 12\tabcolsep) * \real{0.1429}}
+  >{\centering\arraybackslash}m{(\linewidth - 12\tabcolsep) * \real{0.1429}}
+  >{\centering\arraybackslash}m{(\linewidth - 12\tabcolsep) * \real{0.1429}}
+  >{\centering\arraybackslash}m{(\linewidth - 12\tabcolsep) * \real{0.1429}}
+  >{\centering\arraybackslash}m{(\linewidth - 12\tabcolsep) * \real{0.1429}}@{}}
+\caption{跨克隆后端迁移性结果}\\
+\toprule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+克隆后端 & 参考条件 & 样本数 & 克隆语音 WER & 克隆语音 CER & 平均 SIM &
+SIM \textless= 0.30 \\
+XTTS-v2 & 原始音频 & 50 & 12.67\% & 8.20\% & 0.557 & 0/50 \\
+XTTS-v2 & 保护音频 & 50 & 19.78\% & 12.73\% & -0.062 & 50/50 \\
+XTTS-v1.1 & 原始音频 & 50 & 0.22\% & 0.12\% & 0.443 & 1/50 \\
+XTTS-v1.1 & 保护音频 & 50 & 24.67\% & 18.37\% & 0.006 & 50/50 \\
+YourTTS & 原始音频 & 50 & 6.00\% & 2.65\% & 0.102 & 50/50 \\
+YourTTS & 保护音频 & 50 & 6.89\% & 3.14\% & 0.048 & 50/50 \\
+\end{longtable}
+}
+
+XTTS-v1.1 的 clean 基线平均 SIM 为
+0.443，说明该后端能够利用原始参考音频形成可观的说话人相似度；使用保护音频后，平均
+SIM 降至 0.006，50 条样本全部低于 0.30 阈值，同时克隆语音 WER 从 0.22\%
+上升到 24.67\%。这说明保护扰动对 XTTS 系列的跨版本迁移性较强。
+
+YourTTS 的 clean 基线平均 SIM 仅为 0.102，原始参考条件下也有 50/50
+样本低于 0.30
+阈值，说明该后端在当前样本和评估设置下本身没有形成稳定的目标说话人克隆能力。因此，YourTTS
+结果不能作为强跨模型证明，只能作为辅助证据：保护后 SIM 进一步降至
+0.048，但更关键的跨模型结论应主要由 XTTS-v1.1 结果支撑。
+
+\section{音频质量与听感测试}\label{ux97f3ux9891ux8d28ux91cfux4e0eux542cux611fux6d4bux8bd5}
+
+音频质量与听感测试用于评价保护扰动对正常收听体验的影响。当前已完成的结果文件包含
+SNR、扰动 RMS、L∞ 扰动上界和波形相关性。
+
+{\def\LTcaptype{table} % do not increment counter
+\begin{longtable}[]{@{}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1667}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1280}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1341}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1280}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1248}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.3184}}@{}}
+\caption{保护音频信号质量指标}\\
+\toprule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+指标 & 平均值 & 中位数 & 最小值 & 最大值 & 说明 \\
+SNR & 11.21 dB & 12.02 dB & 2.44 dB & 17.17 dB & 低于 18 dB
+的高保真目标 \\
+noise RMS & 0.0138 & - & - & - & 扰动均方根幅度 \\
+noise L∞ & 0.0314 & 0.0314 & 0.0314 & 0.0314 & 与 epsilon=8/255 一致 \\
+waveform correlation & 0.9517 & - & 0.7728 & 1.0000 &
+波形整体相关性较高 \\
+\end{longtable}
+}
+
+从已有信号指标看，当前 semantic\_e50 参数组合偏向强防护。L∞ 扰动严格受
+epsilon 控制，波形相关性平均为
+0.9517，说明保护音频整体仍与原音频保持较强相关；但平均 SNR 仅为 11.21
+dB，未达到测试方案中建议的 18 dB 高保真阈值，部分样本最低 SNR 为 2.44
+dB，提示个别音频可能存在较明显可听扰动。
+
+补充的 semantic\_e20
+高保真参数组显示，降低扰动上界和优化轮数后，客观信号质量有明显改善。其与强防护组的对比如表
+4-15 所示。
+
+{\def\LTcaptype{table} % do not increment counter
+\begin{longtable}[]{@{}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1667}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1667}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1667}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1667}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1667}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1667}}@{}}
+\caption{强防护组与高保真组信号质量对比}\\
+\toprule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+参数组 & 平均 SNR & 平均 L∞ & 波形相关性 & Whisper WER & XTTS-v2 保护后
+SIM \\
+semantic\_e50 强防护组 & 11.21 dB & 0.031 & 0.952 & 127.10\% & -0.062 \\
+semantic\_e20 高保真组 & 15.45 dB & 0.016 & 0.980 & 112.47\% & -0.045 \\
+\end{longtable}
+}
+
+该结果说明，高保真组在保持较强语义和身份防护的同时，将 SNR 提高约 4.24
+dB，并显著降低扰动上界。也就是说，V-Guard
+的参数空间中已经存在比主实验更适合展示和发布场景的折中点。不过，当前仍只完成
+SNR、L∞ 和波形相关性等客观信号指标，尚未完成 PESQ、STOI 和 MOS
+人工听评。
+
+因此，本章可以支撑``存在强防护模式和高保真折中模式''的结论，但不宜直接把
+SNR
+指标等同于人耳听感可接受性。若报告需要支撑``正常发布场景下听感影响较小''的表述，仍应补充
+PESQ/STOI 以及 10-20 条样本的小规模 MOS 人工听评。
+
+\section{鲁棒性测试}\label{ux9c81ux68d2ux6027ux6d4bux8bd5}
+
+鲁棒性测试用于验证保护音频经过常见传播链路处理后，防护效果是否会明显衰减。本阶段对
+semantic\_e50 保护音频分别执行 MP3 128 kbps、MP3 64 kbps、8 kHz
+重采样、4 kHz 低通滤波和 20 dB 加噪，然后重新计算双 ASR 模型 WER 以及
+ECAPA
+声纹相似度。相关研究也常用去噪、对抗音频防御和扩散式防御评估扰动残留性{[}58-60{]}。
+
+{\def\LTcaptype{table} % do not increment counter
+\begin{longtable}[]{@{}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1897}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1437}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1574}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1760}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1667}}
+  >{\centering\arraybackslash}m{(\linewidth - 10\tabcolsep) * \real{0.1667}}@{}}
+\caption{信道变换后的 ASR 鲁棒性结果}\\
+\toprule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+变换条件 & Whisper WER & wav2vec2 WER & WER \textgreater= 50\% & 平均
+SNR & 波形相关性 \\
+原始保护音频 semantic\_e50 & 121.52\% & 105.18\% & 50/50 & 11.21 dB &
+0.952 \\
+MP3 128 kbps & 120.44\% & 105.60\% & 50/50 & 11.44 dB & 0.953 \\
+MP3 64 kbps & 119.34\% & 105.92\% & 50/50 & 11.41 dB & 0.953 \\
+8 kHz 重采样 & 120.50\% & 100.11\% & 50/50 & 11.53 dB & 0.954 \\
+4 kHz 低通滤波 & 113.26\% & 101.96\% & 50/50 & 11.60 dB & 0.955 \\
+20 dB 加噪 & 119.43\% & 98.32\% & 50/50 & 10.71 dB & 0.949 \\
+\end{longtable}
+}
+
+{\def\LTcaptype{table} % do not increment counter
+\begin{longtable}[]{@{}
+  >{\centering\arraybackslash}m{(\linewidth - 6\tabcolsep) * \real{0.2500}}
+  >{\centering\arraybackslash}m{(\linewidth - 6\tabcolsep) * \real{0.2500}}
+  >{\centering\arraybackslash}m{(\linewidth - 6\tabcolsep) * \real{0.2500}}
+  >{\centering\arraybackslash}m{(\linewidth - 6\tabcolsep) * \real{0.2500}}@{}}
+\caption{信道变换后的声纹相似度结果}\\
+\toprule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+变换条件 & 样本数 & 平均 SIM & SIM \textless= 0.30 \\
+原始保护音频 semantic\_e50 & 50 & 0.003 & 50/50 \\
+MP3 128 kbps & 50 & 0.013 & 50/50 \\
+MP3 64 kbps & 50 & 0.015 & 50/50 \\
+8 kHz 重采样 & 50 & 0.046 & 49/50 \\
+4 kHz 低通滤波 & 50 & 0.041 & 48/50 \\
+20 dB 加噪 & 50 & 0.019 & 49/50 \\
+\end{longtable}
+}
+
+结果表明，常见有损压缩和采样率变换没有显著削弱语义防护效果。所有变换条件下，两个
+ASR 模型的平均 WER 仍接近或超过 100\%，且 50 条样本全部超过 50\% WER
+阈值。声纹相似度方面，MP3 压缩后 50 条样本全部低于
+0.30；重采样、低通和加噪后分别有 49 条、48 条和 49 条样本低于阈值，平均
+SIM 仍保持在 0.05
+以下。说明保护扰动不是简单依赖某个窄带噪声形态，经过常见发布平台可能引入的压缩和滤波后仍具有较好的残留防护能力。
+
+\section{消融实验与机理分析}\label{ux6d88ux878dux5b9eux9a8cux4e0eux673aux7406ux5206ux6790}
+
+消融实验用于分析不同损失项对 V-Guard
+效果的贡献。为节约计算成本，本阶段在 20
+条样本上分别运行四个变体：去除身份相关项 no\_identity、去除语义项
+no\_semantic、去除质量正则项
+no\_quality\_regularizer，以及只保留语义主项的
+semantic\_only。各变体均执行 50 轮优化，并使用相同 ASR、XTTS-v2 和 ECAPA
+评估流程。
+
+{\def\LTcaptype{table} % do not increment counter
+\begin{longtable}[]{@{}
+  >{\centering\arraybackslash}m{(\linewidth - 14\tabcolsep) * \real{0.2413}}
+  >{\centering\arraybackslash}m{(\linewidth - 14\tabcolsep) * \real{0.1103}}
+  >{\centering\arraybackslash}m{(\linewidth - 14\tabcolsep) * \real{0.1204}}
+  >{\centering\arraybackslash}m{(\linewidth - 14\tabcolsep) * \real{0.1184}}
+  >{\centering\arraybackslash}m{(\linewidth - 14\tabcolsep) * \real{0.0973}}
+  >{\centering\arraybackslash}m{(\linewidth - 14\tabcolsep) * \real{0.0944}}
+  >{\centering\arraybackslash}m{(\linewidth - 14\tabcolsep) * \real{0.1066}}
+  >{\centering\arraybackslash}m{(\linewidth - 14\tabcolsep) * \real{0.1113}}@{}}
+\caption{消融实验结果}\\
+\toprule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+变体 & Whisper WER & wav2vec2 WER & 平均 SNR & 波形相关性 & clean SIM &
+保护后 SIM & 保护后 WER \\
+no\_identity & 113.64\% & 99.31\% & 10.78 dB & 0.950 & 0.579 & -0.010 &
+10.56\% \\
+no\_semantic & 86.07\% & 95.22\% & 10.44 dB & 0.942 & 0.569 & -0.079 &
+10.56\% \\
+no\_quality\_regularizer & 129.08\% & 100.94\% & 10.17 dB & 0.938 &
+0.552 & -0.079 & 17.78\% \\
+semantic\_only & 113.92\% & 97.95\% & 10.62 dB & 0.946 & 0.566 & -0.027
+& 4.44\% \\
+\end{longtable}
+}
+
+消融结果体现出三个现象。第一，去除语义损失后 Whisper WER 降至
+86.07\%，是四个变体中最低，说明语义损失是直接破坏 ASR
+语义链路的重要来源。第二，去除质量正则后 Whisper WER 最高，达到
+129.08\%，但 SNR
+与波形相关性也最低，说明质量正则项主要承担限制扰动可感知性、维持波形保真的作用。第三，四个变体的保护后克隆
+SIM 均显著低于 clean
+基线，说明身份链路在当前代理模型组合下具有一定冗余；但 no\_identity 和
+semantic\_only 的保护后 SIM 分别为 -0.010 和 -0.027，弱于 no\_semantic
+与 no\_quality\_regularizer 的
+-0.079，提示身份相关项仍有助于进一步压低克隆相似度和稳定双链路防护。
+
+综合来看，完整 V-Guard 不是单纯追求最高
+WER，而是在语义破坏、身份破坏和信号质量之间取得平衡。语义项决定 ASR
+防护主强度，身份相关项增强对克隆声纹的压制，质量正则项则约束扰动幅度，避免防护效果完全依赖过强噪声。
+
+\section{系统性能与资源占用测试}\label{ux7cfbux7edfux6027ux80fdux4e0eux8d44ux6e90ux5360ux7528ux6d4bux8bd5}
+
+系统性能测试统计了 50 条样本的保护优化日志。当前日志可可靠提取 50
+轮优化循环的耗时，但不包含完整任务墙钟时间、模型加载时间、XTTS-v2
+合成耗时和 GPU 显存峰值。因此，本节将实测范围限定为保护优化阶段。
+
+{\def\LTcaptype{table} % do not increment counter
+\begin{longtable}[]{@{}
+  >{\centering\arraybackslash}m{(\linewidth - 2\tabcolsep) * \real{0.4433}}
+  >{\centering\arraybackslash}m{(\linewidth - 2\tabcolsep) * \real{0.5567}}@{}}
+\caption{保护优化阶段性能统计}\\
+\toprule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+指标 & 实测结果 \\
+样本数 & 50 \\
+优化轮数 & 50 \\
+平均优化耗时 & 12.10 s / 条 \\
+中位优化耗时 & 12.00 s / 条 \\
+最短 / 最长优化耗时 & 12 s / 13 s \\
+平均迭代速度 & 3.95 it/s \\
+平均 RTF & 2.94 \\
+中位 RTF & 2.58 \\
+RTF 范围 & 1.63-5.80 \\
+\end{longtable}
+}
+
+{\def\LTcaptype{table} % do not increment counter
+\begin{longtable}[]{@{}
+  >{\centering\arraybackslash}m{(\linewidth - 8\tabcolsep) * \real{0.2000}}
+  >{\centering\arraybackslash}m{(\linewidth - 8\tabcolsep) * \real{0.2000}}
+  >{\centering\arraybackslash}m{(\linewidth - 8\tabcolsep) * \real{0.2000}}
+  >{\centering\arraybackslash}m{(\linewidth - 8\tabcolsep) * \real{0.2000}}
+  >{\centering\arraybackslash}m{(\linewidth - 8\tabcolsep) * \real{0.2000}}@{}}
+\caption{不同时长样本组的优化耗时}\\
+\toprule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+样本组 & 平均音频时长 & 平均优化耗时 & 平均 RTF & 平均迭代速度 \\
+短语音样本组 & 2.94 s & 12.00 s & 4.28 & 3.98 it/s \\
+中等长度样本组 & 4.95 s & 12.00 s & 2.45 & 3.96 it/s \\
+较长语音样本组 & 6.93 s & 12.38 s & 1.80 & 3.88 it/s \\
+\end{longtable}
+}
+
+从优化日志看，50 轮优化在服务器 GPU
+环境下可以稳定完成，单条样本优化耗时集中在 12-13
+秒。由于当前样本均控制在 8 秒以内，优化耗时随时长增加并不明显，RTF
+主要受音频自身长度影响：短语音由于固定模型前向开销占比更高，平均 RTF 为
+4.28；较长语音平均 RTF 降至 1.80。该结果说明，V-Guard
+当前实现已经满足演示和离线批处理需求，但尚未达到严格实时处理要求。
+
+本阶段缺少显存峰值、端到端墙钟时间和并发任务吞吐量记录。考虑到系统需要加载多个语义与身份代理模型，后续部署前应补充
+nvidia-smi -\/-query-compute-apps 或 PyTorch
+显存统计，并区分模型首次加载耗时、保护优化耗时、TTS 合成耗时和评估耗时。
+
+\section{测试结果分析与小结}\label{ux6d4bux8bd5ux7ed3ux679cux5206ux6790ux4e0eux5c0fux7ed3}
+
+综合当前实测结果，V-Guard
+已经在核心防护效果、参数权衡、跨后端迁移、信道鲁棒性和损失项贡献上形成较完整证据链。语义链路方面，50
+条 LibriTTS 样本在两种 ASR 模型上的保护后 WER 全部超过 50\%，平均 WER
+分别达到 127.10\% 和
+105.18\%，说明受保护音频显著破坏了机器对语音内容的稳定识别。声音身份链路方面，保护音频作为
+XTTS-v2 参考音频时，克隆语音与原始说话人的平均 ECAPA 相似度由 0.557 降至
+-0.062，50 条样本全部低于 0.30
+判定阈值，说明保护扰动能够有效削弱零样本语音克隆系统对目标声音身份的复刻能力。
+
+扩展实验进一步补充了三点证据。第一，高保真参数组在 SNR 提升至 15.45
+dB、L∞ 降至 0.016 的同时，仍保持 Whisper 112.47\% 和 wav2vec2 103.89\%
+的平均 WER，说明系统存在可调的防护-保真折中。第二，XTTS-v1.1
+复测中保护后 SIM 从 0.443 降至 0.006，说明防护效果不只局限于
+XTTS-v2；YourTTS clean 基线较弱，因此仅作为辅助观察。第三，MP3
+压缩、重采样、低通滤波和加噪后，ASR WER 仍接近或超过 100\%，声纹 SIM
+均值保持在 0.05 以下，说明保护扰动经过常见传播变换后仍有较好残留效果。
+
+{\def\LTcaptype{table} % do not increment counter
+\begin{longtable}[]{@{}
+  >{\centering\arraybackslash}m{(\linewidth - 8\tabcolsep) * \real{0.2000}}
+  >{\centering\arraybackslash}m{(\linewidth - 8\tabcolsep) * \real{0.2000}}
+  >{\centering\arraybackslash}m{(\linewidth - 8\tabcolsep) * \real{0.2461}}
+  >{\centering\arraybackslash}m{(\linewidth - 8\tabcolsep) * \real{0.2372}}
+  >{\centering\arraybackslash}m{(\linewidth - 8\tabcolsep) * \real{0.1167}}@{}}
+\caption{当前实测达标情况汇总}\\
+\toprule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+维度 & 指标 & 判定标准 & 当前实测结果 & 结论 \\
+功能闭环 & 后端保护与评估流程 & 能生成保护音频、
+
+评估结果和导出文件 & 50 组样本
+
+全部完成 & 通过 \\
+语义保护 & Whisper Medium 保护后 WER & \textgreater= 50\% & 平均
+127.10\%，
+
+50/50 达标 & 通过 \\
+语义保护 & wav2vec2 保护后 WER & \textgreater= 50\% & 平均 105.18\%，
+
+50/50 达标 & 通过 \\
+身份保护 & XTTS-v2
+
+克隆后 SIM & \textless= 0.30 & 平均 -0.062，
+
+50/50 达标 & 通过 \\
+身份保护 & 相似度下降率 & \textgreater= 60\% & 平均 109.93\%，
+
+48/50 达标 & 通过 \\
+高保真参数组 & semantic\_e20
+
+双 ASR WER & \textgreater= 50\% & Whisper 112.47\%，wav2vec2，103.89\%，
+
+49/50 达标 & 通过 \\
+跨克隆迁移 & XTTS-v1.1
+
+保护后 SIM & \textless= 0.30 & 平均 0.006，
+
+50/50 达标 & 通过 \\
+信道鲁棒性 & 五类变换后 WER / SIM & 保持高 WER
+
+与低 SIM & ASR 全部 50/50 达标，SIM 均值 \textless{} 0.05 & 通过 \\
+消融分析 & 损失项贡献 & 观察相对变化 & 语义项影响 ASR，质量正则影响
+SNR，身份项压低 SIM & 完成 \\
+音频质量 & SNR & 建议 \textgreater= 18 dB & 强防护组 11.21 dB，高保真组
+15.45 dB & 仍需听感验证 \\
+系统性能 & 50 轮优化耗时 & 记录实测值 & 平均 12.10 s / 条 &
+可用于离线与演示 \\
+\end{longtable}
+}
+
+当前实验也暴露出两个重要边界。第一，即使高保真组已经显著改善 SNR
+和波形相关性，仍未达到方案中 18 dB 的建议阈值，且 SNR
+不能直接替代人耳听感结论，因此听感质量仍需要 PESQ/STOI/MOS
+补证。第二，跨克隆后端已经覆盖 XTTS-v2、XTTS-v1.1 和 YourTTS，但 YourTTS
+clean
+基线较弱，尚不足以代表所有异构语音克隆系统；若要形成更强的泛化结论，仍可继续加入
+GPT-SoVITS、OpenVoice、F5-TTS 或商业语音克隆 API。
+
+总体来看，当前已完成实验足以支撑 V-Guard
+的核心技术结论：系统能够在源头主动防护场景中显著干扰机器语义识别和声音身份克隆，使公开语音样本对未授权克隆系统的利用价值下降。后续工作的重点不是证明``是否有效''，而是补齐``听感是否足够自然、前端展示证据是否完整、在更多真实克隆和发布链路下是否仍然有效''的实验边界。
+
+\FloatBarrier
