@@ -1,10 +1,20 @@
+import { useEffect } from 'react'
 import { Outlet } from 'react-router-dom'
 import { Toaster } from '@/components/common/Toaster'
+import { useAppStore } from '@/store/appStore'
 import { TopNav } from './TopNav'
 
 export function AppShell() {
+  const themeMode = useAppStore((state) => state.themeMode)
+
+  useEffect(() => {
+    if (typeof document !== 'undefined') {
+      document.documentElement.dataset.theme = themeMode
+    }
+  }, [themeMode])
+
   return (
-    <div className="min-h-screen overflow-x-hidden bg-[#031221] text-slate-100">
+    <div data-theme={themeMode} className="min-h-screen overflow-x-hidden bg-[#031221] text-slate-100">
       <TopNav />
       <main className="relative mx-auto max-w-[1586px] px-[30px] pb-[26px] pt-[14px] max-lg:px-4">
         <div className="pointer-events-none fixed inset-0 -z-10 bg-[radial-gradient(circle_at_50%_16%,rgba(14,165,233,0.16),transparent_32%),linear-gradient(180deg,#020912_0%,#031221_42%,#02101d_100%)]" />

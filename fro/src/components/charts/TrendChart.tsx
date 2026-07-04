@@ -1,4 +1,5 @@
 import ReactECharts from 'echarts-for-react'
+import { useAppStore } from '@/store/appStore'
 import type { LossTrendPoint } from '@/types/task'
 
 const lossSeries = [
@@ -21,14 +22,34 @@ function formatLossValue(value: unknown) {
 }
 
 export function TrendChart({ data }: { data: LossTrendPoint[] }) {
+  const themeMode = useAppStore((state) => state.themeMode)
+  const chartTheme =
+    themeMode === 'light'
+      ? {
+          axisColor: '#475569',
+          gridColor: 'rgba(100,116,139,0.18)',
+          axisLineColor: 'rgba(100,116,139,0.24)',
+          tooltipBg: '#ffffff',
+          tooltipBorder: 'rgba(14,116,144,0.22)',
+          tooltipText: '#0f172a',
+        }
+      : {
+          axisColor: '#94a3b8',
+          gridColor: 'rgba(148,163,184,0.10)',
+          axisLineColor: 'rgba(148,163,184,0.18)',
+          tooltipBg: 'rgba(7, 16, 31, 0.96)',
+          tooltipBorder: 'rgba(56, 189, 248, 0.22)',
+          tooltipText: '#e2e8f0',
+        }
+
   const option = {
     backgroundColor: 'transparent',
     animation: false,
     tooltip: {
       trigger: 'axis',
-      backgroundColor: 'rgba(7, 16, 31, 0.96)',
-      borderColor: 'rgba(56, 189, 248, 0.22)',
-      textStyle: { color: '#e2e8f0' },
+      backgroundColor: chartTheme.tooltipBg,
+      borderColor: chartTheme.tooltipBorder,
+      textStyle: { color: chartTheme.tooltipText },
       formatter: (params: Array<{ axisValue: number | string; seriesName: string; marker: string; value: unknown }>) => {
         const step = params[0]?.axisValue ?? '-'
         const rows = params
@@ -53,18 +74,18 @@ export function TrendChart({ data }: { data: LossTrendPoint[] }) {
       gridIndex: index,
       data: data.map((item) => item.step),
       axisTick: { show: index === lossSeries.length - 1 },
-      axisLabel: { show: index === lossSeries.length - 1, color: '#94a3b8' },
-      axisLine: { lineStyle: { color: 'rgba(148,163,184,0.18)' } },
+      axisLabel: { show: index === lossSeries.length - 1, color: chartTheme.axisColor },
+      axisLine: { lineStyle: { color: chartTheme.axisLineColor } },
     })),
     yAxis: lossSeries.map((_, index) => ({
       type: 'value',
       gridIndex: index,
       axisLabel: {
-        color: '#94a3b8',
+        color: chartTheme.axisColor,
         formatter: (value: number) => formatLossValue(value),
       },
       splitNumber: 2,
-      splitLine: { lineStyle: { color: 'rgba(148,163,184,0.10)' } },
+      splitLine: { lineStyle: { color: chartTheme.gridColor } },
     })),
     series: lossSeries.map((series, index) => ({
       name: series.tooltipName,

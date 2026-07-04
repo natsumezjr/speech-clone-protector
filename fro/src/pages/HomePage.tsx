@@ -183,11 +183,11 @@ export function HomePage() {
 function HeroScene() {
   return (
     <div className="relative overflow-hidden rounded-[8px] border border-cyan-300/10 scan-panel max-xl:min-h-[460px]">
-      <div className="absolute inset-0 opacity-55 [background-image:linear-gradient(rgba(56,189,248,0.08)_1px,transparent_1px),linear-gradient(90deg,rgba(56,189,248,0.08)_1px,transparent_1px)] [background-size:38px_38px]" />
-      <div className="absolute inset-x-[22px] top-[8px] h-[304px] overflow-hidden max-2xl:inset-x-[8px]">
+      <div className="hero-grid-layer absolute inset-0 opacity-55 [background-image:linear-gradient(rgba(56,189,248,0.08)_1px,transparent_1px),linear-gradient(90deg,rgba(56,189,248,0.08)_1px,transparent_1px)] [background-size:38px_38px]" />
+      <div className="hero-shield-stage absolute inset-x-[22px] top-[8px] h-[304px] overflow-hidden max-2xl:inset-x-[8px]">
         <img src={heroShieldScene} alt="" className="hero-scene-crop hero-scene-layer h-full w-full object-cover object-center" />
       </div>
-      <div className="absolute inset-x-0 bottom-5 rounded-[8px] border border-cyan-300/22 bg-[#061426]/92 p-3">
+      <div className="hero-impact-panel absolute inset-x-0 bottom-5 rounded-[8px] border border-cyan-300/22 bg-[#061426]/92 p-3">
         <div className="mb-2 text-center text-sm font-medium leading-5 text-slate-300">
           下游系统影响（攻击面）
         </div>
@@ -203,7 +203,7 @@ function HeroScene() {
                 ['LLM', '语言模型', '↓ 58.7%'],
                 ['TTS', '克隆系统', '↓ 81.4%'],
               ].map(([name, sub, value]) => (
-                <div key={name} className="h-[96px] rounded-[6px] border border-cyan-300/18 bg-[#07192d] px-1.5 py-2 text-center">
+                <div key={name} className="hero-impact-tile h-[96px] rounded-[6px] border border-cyan-300/18 bg-[#07192d] px-1.5 py-2 text-center">
                   <div className="whitespace-nowrap text-[12px] font-black leading-4 text-white">{name}</div>
                   <div className="mt-0.5 text-[9px] leading-3 text-slate-400">{sub}</div>
                   <TinyWave className="my-1 h-3.5" color="#8fdcff" />
@@ -224,6 +224,7 @@ function StrategyPanel({ item }: { item: (typeof strategies)[number] }) {
     <div
       className={cn(
         'relative h-[156px] overflow-hidden rounded-[8px] border p-3',
+        item.tone === 'green' && 'strategy-card-green',
         item.tone === 'green' && 'border-emerald-400/42 bg-emerald-400/10 shadow-[inset_0_0_36px_rgba(16,185,129,0.12)]',
         item.tone === 'blue' && 'border-sky-400/40 bg-sky-400/10 shadow-[inset_0_0_36px_rgba(14,165,233,0.12)]',
         item.tone === 'purple' && 'border-violet-400/42 bg-violet-400/10 shadow-[inset_0_0_36px_rgba(139,92,246,0.12)]',
@@ -232,7 +233,7 @@ function StrategyPanel({ item }: { item: (typeof strategies)[number] }) {
       <div className="flex items-center gap-3">
         <Icon className={cn('h-6 w-6 shrink-0', item.tone === 'green' ? 'text-emerald-300' : item.tone === 'blue' ? 'text-sky-300' : 'text-violet-300')} />
         <h3 className="whitespace-nowrap text-[22px] font-black leading-5 text-white">{item.title}</h3>
-        {'tag' in item ? <span className="rounded-[5px] bg-emerald-400/18 px-2 py-1 text-sm font-bold text-emerald-200">{item.tag}</span> : null}
+        {'tag' in item ? <span className="strategy-recommend-tag rounded-[5px] bg-emerald-400/18 px-2 py-1 text-sm font-bold text-emerald-200">{item.tag}</span> : null}
       </div>
       <p className="mt-3 whitespace-nowrap text-[15px] leading-4 text-slate-300">{item.desc}</p>
       <div className="mt-2 space-y-1">
@@ -252,7 +253,7 @@ function StrategyPanel({ item }: { item: (typeof strategies)[number] }) {
 
 function WaveCard({ title, subtitle, tone }: { title: string; subtitle: string; tone: 'cyan' | 'green' }) {
   return (
-    <div className="h-[118px] rounded-[7px] border border-cyan-300/14 bg-[#07192d]/95 p-2">
+    <div className="hero-wave-card h-[118px] rounded-[7px] border border-cyan-300/14 bg-[#07192d]/95 p-2">
       <div className="h-[50px] rounded-[6px] bg-slate-950/44 px-2 py-1.5">
         <TinyWave color={tone === 'green' ? '#22c55e' : '#b7e7ff'} />
       </div>

@@ -70,7 +70,7 @@ export function AudioPlayer({
   const progress = playableDuration > 0 ? (currentTime / playableDuration) * 100 : 0
 
   return (
-    <div className="rounded-[8px] border border-cyan-300/12 bg-slate-950/18 p-3">
+    <div className="audio-player rounded-[8px] border border-cyan-300/12 bg-slate-950/18 p-3">
       <div className="flex flex-wrap items-center gap-3">
         <Button
           variant="secondary"

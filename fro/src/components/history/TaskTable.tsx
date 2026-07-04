@@ -3,6 +3,7 @@ import { Download, Eye, SlidersHorizontal, Trash2, X } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { Badge } from '@/components/common/Badge'
 import { Button } from '@/components/common/Button'
+import { cn } from '@/lib/utils'
 import { deleteTask, downloadProtectedAudio } from '@/services/apiClient'
 import { useAppStore } from '@/store/appStore'
 import type { HistoryTask, TaskStatus } from '@/types/task'
@@ -184,6 +185,9 @@ export function TaskTable({ tasks, view, onDeleted }: { tasks: HistoryTask[]; vi
               const progress = progressForView(task, view)
               const elapsed = elapsedForView(task, view)
               const isCustom = task.mode === 'custom'
+              const statusGroup = rowStatus === 'running' ? 'running' : rowStatus === 'completed' || rowStatus === 'success' ? 'completed' : null
+              const historyStatusClass = statusGroup ? `history-status-${view}-${statusGroup}` : undefined
+              const historyProgressClass = statusGroup ? `history-progress-fill-${view}-${statusGroup}` : undefined
               return (
                 <tr key={task.taskId} className="border-b border-cyan-300/8 hover:bg-cyan-400/[0.035]">
                   <td className="max-w-[220px] px-4 py-4 text-white" title={task.filename}>{truncateFilename(task.filename)}</td>
@@ -198,11 +202,22 @@ export function TaskTable({ tasks, view, onDeleted }: { tasks: HistoryTask[]; vi
                     </div>
                   </td>
                   <td className="px-4 py-4">
-                    <Badge tone={statusTone[rowStatus]}>{statusTextForView(task, view)}</Badge>
+                    <Badge
+                      tone={statusTone[rowStatus]}
+                      className={historyStatusClass}
+                    >
+                      {statusTextForView(task, view)}
+                    </Badge>
                   </td>
                   <td className="w-[160px] px-4 py-4">
-                    <div className="mx-auto h-2 max-w-[140px] overflow-hidden rounded-full bg-slate-800">
-                      <div className="h-full rounded-full bg-cyan-400 transition-all duration-300" style={{ width: `${Math.round(progress * 100)}%` }} />
+                    <div className="history-progress-track mx-auto h-2 max-w-[140px] overflow-hidden rounded-full bg-slate-800">
+                      <div
+                        className={cn(
+                          'h-full rounded-full transition-all duration-300',
+                          historyProgressClass ?? 'bg-cyan-400',
+                        )}
+                        style={{ width: `${Math.round(progress * 100)}%` }}
+                      />
                     </div>
                     <p className="mt-1 text-center font-mono text-xs text-slate-500">{Math.round(progress * 100)}%</p>
                   </td>

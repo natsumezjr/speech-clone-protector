@@ -615,7 +615,7 @@ function ProtectTab({
     <div className="space-y-5">
       <div className="grid items-center gap-6 pr-1 lg:grid-cols-[minmax(0,1fr)_58px_minmax(0,1fr)]">
         <AudioCard title="原始音频（未保护）" audio={originalAudio} color="#00aef0" />
-        <div className="mx-auto grid h-12 w-12 place-items-center rounded-full border border-cyan-300/28 bg-slate-950/70 text-[18px] font-black text-white shadow-[0_0_24px_rgba(56,189,248,0.12)]">VS</div>
+        <div className="compare-badge mx-auto grid h-12 w-12 place-items-center rounded-full border border-cyan-300/28 bg-slate-950/70 text-[18px] font-black text-white shadow-[0_0_24px_rgba(56,189,248,0.12)]">VS</div>
         <AudioCard title="保护音频（已防护）" audio={protectedAudio} color="#22c55e" green onPlayRequest={onProtectedPlayRequest} />
       </div>
       <div className="grid grid-cols-[minmax(360px,0.86fr)_minmax(520px,1.14fr)] items-stretch gap-5 max-xl:grid-cols-1">
@@ -698,7 +698,7 @@ function CloneTab({ result, cloneEval, loading, status }: { result: TaskResult; 
     return (
       <div className="grid items-center gap-6 pl-1 lg:grid-cols-[minmax(0,1fr)_58px_minmax(0,1fr)]">
         <LoadingCard title="克隆原语音" progress={status?.stage === 'downstream_tts_eval' ? status.progress : undefined} message={status?.stage === 'downstream_tts_eval' ? status.message : undefined} />
-        <div className="mx-auto grid h-12 w-12 place-items-center rounded-full border border-violet-300/28 bg-slate-950/70 text-[18px] font-black text-white">VS</div>
+        <div className="compare-badge mx-auto grid h-12 w-12 place-items-center rounded-full border border-violet-300/28 bg-slate-950/70 text-[18px] font-black text-white">VS</div>
         <LoadingCard title="克隆保护语音" progress={status?.stage === 'downstream_tts_eval' ? status.progress : undefined} message={status?.stage === 'downstream_tts_eval' ? status.message : undefined} />
       </div>
     )
@@ -720,7 +720,7 @@ function CloneTab({ result, cloneEval, loading, status }: { result: TaskResult; 
       {cloneReason ? <MetricNotice text={`克隆指标未生成原因：${cloneReason}`} /> : null}
       <div className="grid items-center gap-6 pl-1 lg:grid-cols-[minmax(0,1fr)_58px_minmax(0,1fr)]">
         {cloneEval.originalCloneAudio ? <AudioCard title="克隆原语音" audio={cloneEval.originalCloneAudio} color="#a78bfa" /> : <EmptyMetricCard title="克隆原语音" text="后端未返回克隆原语音" />}
-        <div className="mx-auto grid h-12 w-12 place-items-center rounded-full border border-violet-300/28 bg-slate-950/70 text-[18px] font-black text-white">VS</div>
+        <div className="compare-badge mx-auto grid h-12 w-12 place-items-center rounded-full border border-violet-300/28 bg-slate-950/70 text-[18px] font-black text-white">VS</div>
         {cloneEval.protectedCloneAudio ? <AudioCard title="克隆保护语音" audio={cloneEval.protectedCloneAudio} color="#f59e0b" /> : <EmptyMetricCard title="克隆保护语音" text="后端未返回克隆保护语音" />}
       </div>
       <div className="grid items-stretch grid-cols-[minmax(420px,0.95fr)_minmax(520px,1.05fr)] gap-5 max-xl:grid-cols-1">
@@ -1170,7 +1170,7 @@ function AudioCard({
   const duration = getAudioDuration(audio)
 
   return (
-    <div className={cn('flex h-[252px] flex-col rounded-[9px] border p-5', green ? 'border-emerald-400/18 bg-emerald-400/8' : 'border-cyan-300/14 bg-[#07192d]/80')}>
+    <div className={cn('result-audio-card flex h-[252px] flex-col rounded-[9px] border p-5', green ? 'result-audio-card-protected border-emerald-400/18 bg-emerald-400/8' : 'border-cyan-300/14 bg-[#07192d]/80')}>
       <p className="flex items-center gap-2 whitespace-nowrap text-sm font-black text-slate-200">
         {green ? <ShieldCheck className="h-4 w-4 text-emerald-300" /> : <Volume2 className="h-4 w-4 text-sky-300" />}
         {title}

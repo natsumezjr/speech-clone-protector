@@ -482,7 +482,7 @@ function AudioAccessCard({ maxAudioSizeBytes }: { maxAudioSizeBytes?: number }) 
       <div className="mt-9 border-t border-cyan-300/10 pt-3">
         <h3 className="text-[15px] font-bold text-slate-300">已上传文件</h3>
       </div>
-      <div className="mt-2 max-h-[420px] overflow-y-auto rounded-[8px] border border-cyan-300/12 bg-[#07192d]/85 p-4">
+      <div className="uploaded-audio-panel mt-2 max-h-[420px] overflow-y-auto rounded-[8px] border border-cyan-300/12 bg-[#07192d]/85 p-4">
         <div className="mb-4 flex items-center justify-between">
             <div className="flex items-center gap-3">
             <div>
