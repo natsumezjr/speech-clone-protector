@@ -497,7 +497,6 @@ function AudioAccessCard({ maxAudioSizeBytes }: { maxAudioSizeBytes?: number }) 
             ['时长', duration ? `${duration.toFixed(2)}s` : '待解析'],
             ['采样率', uploadedFile?.sampleRate ? `${uploadedFile.sampleRate.toLocaleString()} Hz` : '待后端解析'],
             ['声道', uploadedFile?.channels ? `${uploadedFile.channels}` : '待后端解析'],
-            ['位深', uploadedFile?.bitDepth ? `${uploadedFile.bitDepth} bit` : '待后端解析'],
             ['大小', uploadedFile ? formatBytes(uploadedFile.sizeBytes) : '-'],
             ['格式', displayFile.format],
             ['上传时间', uploadedFile?.uploadedAt ?? '-'],
