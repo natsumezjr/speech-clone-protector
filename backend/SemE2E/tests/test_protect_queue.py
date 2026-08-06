@@ -72,6 +72,9 @@ class ProtectQueueTest(unittest.TestCase):
             api_server.PROTECT_PENDING_TASKS.clear()
             api_server.PROTECT_ACTIVE_TASK_IDS.clear()
 
+    def test_protection_processes_use_spawn_context(self) -> None:
+        self.assertEqual(api_server.PROTECT_PROCESS_CONTEXT.get_start_method(), "spawn")
+
     def test_only_four_processes_start_and_fifth_waits_for_a_slot(self) -> None:
         statuses: dict[str, dict[str, object]] = {}
 
@@ -91,7 +94,7 @@ class ProtectQueueTest(unittest.TestCase):
             }
 
         with (
-            mock.patch.object(api_server.multiprocessing, "Process", FakeProcess),
+            mock.patch.object(api_server.PROTECT_PROCESS_CONTEXT, "Process", FakeProcess),
             mock.patch.object(api_server, "write_task_status", side_effect=write_status),
             mock.patch.object(api_server, "read_task_status", side_effect=lambda task_id: statuses.get(task_id, {"status": "running"})),
             mock.patch.object(api_server, "is_task_deleted", return_value=False),

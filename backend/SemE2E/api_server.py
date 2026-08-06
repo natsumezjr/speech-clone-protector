@@ -59,6 +59,7 @@ logger = logging.getLogger("seme2e_api")
 logging.basicConfig(level=logging.INFO)
 TASK_CANCEL_EVENTS: dict[str, threading.Event] = {}
 TASK_THREADS: dict[str, threading.Thread] = {}
+PROTECT_PROCESS_CONTEXT = multiprocessing.get_context("spawn")
 TASK_PROCESSES: dict[str, multiprocessing.Process] = {}
 DELETED_TASK_IDS: set[str] = set()
 TASK_REGISTRY_LOCK = threading.Lock()
@@ -1234,7 +1235,7 @@ def _start_protect_job_locked(job: dict[str, Any]) -> bool:
         cleanup_task_runtime(task_id)
         return False
 
-    process = multiprocessing.Process(
+    process = PROTECT_PROCESS_CONTEXT.Process(
         target=run_protect_task_process,
         args=(
             task_id,
@@ -1373,7 +1374,7 @@ def recover_protection_queue() -> None:
                 "uploaded_filename": uploaded.get("filename"),
                 "file_id": file_id,
                 "payload": payload,
-                "cancel_event": multiprocessing.Event(),
+                "cancel_event": PROTECT_PROCESS_CONTEXT.Event(),
             }
         )
 
@@ -1408,7 +1409,7 @@ def protect_task(payload: ProtectTaskRequest) -> dict[str, Any]:
         maxConcurrency=PROTECT_MAX_CONCURRENCY,
         error=None,
     )
-    cancel_event = multiprocessing.Event()
+    cancel_event = PROTECT_PROCESS_CONTEXT.Event()
     enqueue_protect_job(
         {
             "task_id": task_id,
