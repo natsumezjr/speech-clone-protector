@@ -29,7 +29,7 @@ const strategies = [
     tone: 'green',
   },
   {
-    title: 'Identity 身份防护',
+    title: '声音身份防护',
     desc: '削弱声学特征，降低相似度与克隆质量',
     points: ['声学特征干扰', '抑制特征建模', '克隆攻击抵御'],
     icon: Fingerprint,
@@ -47,14 +47,14 @@ const strategies = [
 const metrics = [
   { title: 'ASR 干扰（平均）', value: '↓ 62.3%', sub: '识别准确率下降', tone: 'red', data: [40, 72, 52, 69, 50, 80, 61, 34] },
   { title: '声纹相似度下降', value: '↓ 81.4%', sub: '克隆相似度降低', tone: 'red', data: [28, 46, 66, 50, 74, 42, 56, 38] },
-  { title: '听感保真（PESQ）', value: '4.38 / 5', sub: '高保真听感', tone: 'green', data: [35, 45, 38, 62, 54, 77, 69, 82] },
+  { title: 'SNR 信噪比', value: '25.1', sub: '高保真听感', tone: 'green', data: [35, 45, 38, 62, 54, 77, 69, 82] },
   { title: '对抗评估（攻击成功率）', value: '↓ 85.6%', sub: '多攻击平均下降', tone: 'red', data: [22, 38, 55, 31, 76, 42, 37, 25] },
   { title: '任务通过率', value: '98.7%', sub: '通过率（内部基准）', tone: 'cyan', data: [16, 22, 28, 45, 39, 56, 73, 88] },
   { title: '单步平均时长', value: '9.2s', sub: '平均耗时', tone: 'blue', data: [18, 47, 26, 62, 38, 70, 54, 76] },
 ]
 
 const capabilities = [
-  { title: '双重防护机制', icon: ShieldCheck, desc: '语义及 Identity 身份双通路协同，全面降低被克隆与滥用风险。', tone: 'green' },
+  { title: '双重防护机制', icon: ShieldCheck, desc: '语义及声音身份双通路协同，全面降低被克隆与滥用风险。', tone: 'green' },
   { title: '多模型泛化', icon: Puzzle, desc: '覆盖主流 ASR / Tokenizer / LLM / TTS 模型，具备强迁移能力。', tone: 'blue' },
   { title: '听感无感知', icon: Ear, desc: '基于心理声学约束，保障人耳听感质量与发布可用性。', tone: 'purple' },
   { title: '可解释可评估', icon: Gauge, desc: '全流程评估与可视化，风险可控、结果可追踪、报告可导出。', tone: 'amber' },
@@ -69,8 +69,16 @@ export function HomePage() {
             发布前保护你的声音，
             <span className="block bg-gradient-to-r from-emerald-300 via-cyan-300 to-sky-400 bg-clip-text text-transparent">降低语音克隆风险</span>
           </h1>
+          <div className="mt-2 w-full max-w-[390px] overflow-hidden" aria-label="VoiceSheild">
+            <span
+              aria-hidden="true"
+              className="block whitespace-nowrap bg-gradient-to-r from-sky-200 via-cyan-300 to-blue-500 bg-clip-text text-[55px] font-black italic leading-none tracking-[0.055em] text-transparent drop-shadow-[0_5px_20px_rgba(34,211,238,0.28)] [-webkit-text-stroke:1px_rgba(125,211,252,0.28)] [font-family:'Arial_Black','Trebuchet_MS',sans-serif] max-md:text-[48px]"
+            >
+              VoiceSheild
+            </span>
+          </div>
           <p className="mt-5 max-w-[390px] text-[16px] leading-8 text-slate-300">
-            融合语义防护与 Identity 身份防护的双重机制，在保证听感质量的同时干扰语音理解与声音身份建模，有效抵御非授权的语音克隆与滥用。
+            融合语义防护与声音身份防护的双重机制，在保证听感质量的同时干扰语音理解与声音身份建模，有效抵御非授权的语音克隆与滥用。
           </p>
           <div className="mt-7 flex gap-4">
             <Link to="/workspace" className="cyan-button inline-flex h-11 min-w-[168px] items-center justify-center gap-2 rounded-[7px] text-[16px] font-black">
@@ -147,10 +155,10 @@ export function HomePage() {
           </div>
           <div className="space-y-2 text-[13px] leading-5 text-slate-300">
             {[
-              '提出语义与 Identity 身份双重防护框架，兼顾安全与可用',
+              '面向新兴语音克隆技术的主动防护',
+              '提出语义与声音身份双重防护框架，兼顾安全与可用',
               '引入心理声学约束，扰动不可感知，听感友好',
               '在多种下游系统上实现显著性能劣化与迁移鲁棒',
-              '高效优化与工程实现，支持快速接入与大规模应用',
             ].map((item) => (
               <p key={item} className="flex gap-3">
                 <span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-amber-300" />

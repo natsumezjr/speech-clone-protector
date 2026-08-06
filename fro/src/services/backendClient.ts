@@ -401,6 +401,9 @@ function normalizeTaskResult(payload: unknown): TaskResult {
       lossWeights: normalizeLossWeights(data.lossWeights ?? generation.lossWeights),
       optimizationTrace: optimizationTrend,
       averageStepSec: firstNumber(data, ['averageStepSec', 'average_step_sec']) ?? firstNumber(generation, ['averageStepSec', 'average_step_sec']),
+      selectedStep: firstNumber(data, ['selectedStep', 'selected_step']) ?? firstNumber(generation, ['selectedStep', 'selected_step']),
+      effectiveConfig: asRecord(data.effectiveConfig ?? data.effective_config ?? generation.effectiveConfig ?? generation.effective_config),
+      presetName: stringOr(data.presetName ?? data.preset_name ?? generation.presetName ?? generation.preset_name, '') || null,
       asrEval,
       cloneEval: latestCloneEval,
       speakerFeatureMap: {
@@ -411,6 +414,11 @@ function normalizeTaskResult(payload: unknown): TaskResult {
         lossFinal: normalizeLossFinal(generation.lossFinal),
         optimizationTrace: normalizeLossTrend(generation.optimizationTrace),
         steps: numberOrNull(generation.steps),
+        maxSteps: firstNumber(generation, ['maxSteps', 'max_steps']),
+        selectedStep: firstNumber(generation, ['selectedStep', 'selected_step']),
+        snrDb: firstNumber(generation, ['snrDb', 'snr_db', 'snr']),
+        presetName: stringOr(generation.presetName ?? generation.preset_name, '') || null,
+        effectiveConfig: asRecord(generation.effectiveConfig ?? generation.effective_config),
         realProtect: typeof generation.realProtect === 'boolean' ? generation.realProtect : null,
         source: typeof generation.source === 'string' ? generation.source : undefined,
         status: typeof generation.status === 'string' ? generation.status : undefined,
@@ -549,10 +557,18 @@ function normalizeTaskResult(payload: unknown): TaskResult {
       status: typeof asRecord(details.perception).status === 'string' ? asRecord(details.perception).status as string : undefined,
     },
     metricSources: metricSources as TaskResult['metricSources'],
+    selectedStep: firstNumber(data, ['selectedStep', 'selected_step']) ?? firstNumber(detailGeneration, ['selectedStep', 'selected_step']),
+    effectiveConfig: asRecord(data.effectiveConfig ?? data.effective_config ?? detailGeneration.effectiveConfig ?? detailGeneration.effective_config),
+    presetName: stringOr(data.presetName ?? data.preset_name ?? detailGeneration.presetName ?? detailGeneration.preset_name, '') || null,
     generation: {
       lossFinal,
       optimizationTrace: normalizeLossTrend(detailGeneration.optimizationTrace),
       steps: numberOrNull(detailGeneration.steps),
+      maxSteps: firstNumber(detailGeneration, ['maxSteps', 'max_steps']),
+      selectedStep: firstNumber(detailGeneration, ['selectedStep', 'selected_step']),
+      snrDb: firstNumber(detailGeneration, ['snrDb', 'snr_db', 'snr']),
+      presetName: stringOr(detailGeneration.presetName ?? detailGeneration.preset_name, '') || null,
+      effectiveConfig: asRecord(detailGeneration.effectiveConfig ?? detailGeneration.effective_config),
       realProtect: typeof detailGeneration.realProtect === 'boolean' ? detailGeneration.realProtect : null,
       source: typeof detailGeneration.source === 'string' ? detailGeneration.source : undefined,
       status: typeof detailGeneration.status === 'string' ? detailGeneration.status : undefined,
@@ -612,6 +628,20 @@ export const backendClient: ApiClient = {
   async createProtectionTask(payload: ProtectionTaskRequest) {
     const response = await http.post('/api/tasks/protect', payload)
     return response.data
+  },
+  async retryProtectionTask(taskId: string) {
+    const response = await http.post(`/api/tasks/${taskId}/retry`, undefined, {
+      validateStatus: (status) => (status >= 200 && status < 300) || status === 404,
+    })
+    if (response.status !== 404) return response.data
+
+    const statusResponse = await http.get(`/api/tasks/${taskId}/status`)
+    const originalPayload = asRecord(statusResponse.data).payload
+    if (typeof originalPayload !== 'object' || originalPayload === null || Array.isArray(originalPayload)) {
+      throw new Error('原任务缺少保护参数，无法重试。')
+    }
+    const fallbackResponse = await http.post('/api/tasks/protect', originalPayload)
+    return fallbackResponse.data
   },
   async getTaskStatus(taskId: string): Promise<TaskStatusResponse> {
     const response = await http.get(`/api/tasks/${taskId}/status`)

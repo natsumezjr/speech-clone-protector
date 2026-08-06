@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 import zipfile
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ from pydantic import BaseModel
 from result_adapter import (
     TASK_DIR,
     UPLOAD_DIR,
+    AudioPreprocessError,
     CloneBackendUnavailableError,
     ProtectGenerationError,
     create_asr_eval,
@@ -60,6 +62,10 @@ TASK_THREADS: dict[str, threading.Thread] = {}
 TASK_PROCESSES: dict[str, multiprocessing.Process] = {}
 DELETED_TASK_IDS: set[str] = set()
 TASK_REGISTRY_LOCK = threading.Lock()
+PROTECT_MAX_CONCURRENCY = 4
+PROTECT_PENDING_TASKS: deque[dict[str, Any]] = deque()
+PROTECT_ACTIVE_TASK_IDS: set[str] = set()
+PROTECT_QUEUE_LOCK = threading.RLock()
 DELETED_TASK_DIR = TASK_DIR.parent / "deleted_tasks"
 DELETED_TASK_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -82,6 +88,15 @@ def cleanup_task_runtime(task_id: str) -> None:
         TASK_CANCEL_EVENTS.pop(task_id, None)
         TASK_THREADS.pop(task_id, None)
         TASK_PROCESSES.pop(task_id, None)
+
+
+def cleanup_protect_process_runtime(task_id: str, process: multiprocessing.Process, cancel_event: Any) -> None:
+    """Remove only the runtime entries owned by this protection process."""
+    with TASK_REGISTRY_LOCK:
+        if TASK_PROCESSES.get(task_id) is process:
+            TASK_PROCESSES.pop(task_id, None)
+        if TASK_CANCEL_EVENTS.get(task_id) is cancel_event:
+            TASK_CANCEL_EVENTS.pop(task_id, None)
 
 
 def request_task_cancel(task_id: str) -> tuple[threading.Event | None, threading.Thread | None, multiprocessing.Process | None]:
@@ -110,6 +125,64 @@ def is_task_deleted(task_id: str) -> bool:
 def ensure_task_not_cancelled(task_id: str, cancel_event: threading.Event) -> None:
     if cancel_event.is_set() or is_task_deleted(task_id):
         raise TaskCancelledError(f"task cancelled: {task_id}")
+
+
+def protection_progress_status(event: dict[str, Any]) -> dict[str, Any]:
+    step = event.get("step")
+    if step is None and event.get("stage"):
+        try:
+            stage_progress = float(event.get("progress"))
+        except (TypeError, ValueError):
+            stage_progress = 0.18
+        return {
+            "status": "running",
+            "progress": round(min(0.99, max(0.0, stage_progress)), 3),
+            "stage": str(event["stage"]),
+            "message": str(event.get("message") or "Backend is processing the task"),
+            "error": None,
+            "progressSource": "backend_stage",
+        }
+    total = event.get("total_steps") or event.get("total") or 1
+    try:
+        step_value = max(0, int(step))
+    except (TypeError, ValueError):
+        step_value = 0
+    try:
+        total_value = max(1, int(total))
+    except (TypeError, ValueError):
+        total_value = 1
+    try:
+        algorithm_progress = float(event.get("progress"))
+    except (TypeError, ValueError):
+        algorithm_progress = step_value / total_value
+    algorithm_progress = min(1.0, max(0.0, algorithm_progress))
+    optimization_metrics = {
+        key: event.get(key)
+        for key in (
+            "current_lr",
+            "total_loss",
+            "feature_loss",
+            "semantic_loss",
+            "psychoacoustic_loss",
+            "l2_loss",
+            "stft_loss",
+            "snr_loss",
+            "current_snr_db",
+        )
+        if event.get(key) is not None
+    }
+    return {
+        "status": "running",
+        "progress": round(0.18 + algorithm_progress * 0.77, 3),
+        "stage": "protect_generation",
+        "message": f"Protect optimization step {step_value}/{total_value}" if step_value else "Backend is generating protected audio",
+        "error": None,
+        "currentStep": step_value or None,
+        "totalSteps": total_value,
+        "stageProgress": round(algorithm_progress, 3),
+        "progressSource": "core.guard.VoiceSheild",
+        "optimizationMetrics": optimization_metrics,
+    }
 
 
 class ProtectTaskRequest(BaseModel):
@@ -364,7 +437,7 @@ def validate_protection_config(payload: ProtectTaskRequest, req_id: str) -> JSON
     if unsupported_features:
         return structured_error(
             code="UNSUPPORTED_FEATURE_MODEL",
-            message="Identity 编码器不在后端支持配置中。",
+            message="身份编码器不在后端支持配置中。",
             status_code=400,
             request_id_value=req_id,
             stage="file_preprocess",
@@ -731,6 +804,9 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
         },
         "optimizationTrace": generation.get("optimizationTrace") or [],
         "averageStepSec": generation.get("averageStepSec"),
+        "selectedStep": generation.get("selectedStep"),
+        "effectiveConfig": generation.get("effectiveConfig"),
+        "presetName": generation.get("presetName"),
         "asrEval": asr_eval,
         "cloneEval": clone_eval,
         "cloneResults": clone_results,
@@ -774,6 +850,11 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
             "lossFinal": generation.get("lossFinal"),
             "optimizationTrace": generation.get("optimizationTrace") or [],
             "steps": generation.get("steps"),
+            "maxSteps": generation.get("maxSteps"),
+            "selectedStep": generation.get("selectedStep"),
+            "snrDb": generation.get("snrDb"),
+            "presetName": generation.get("presetName"),
+            "effectiveConfig": generation.get("effectiveConfig"),
             "averageStepSec": generation.get("averageStepSec"),
             "realProtect": generation.get("realProtect"),
             "source": generation.get("source"),
@@ -818,6 +899,15 @@ def tiny_pdf_bytes(title: str, body: str) -> bytes:
     return output.getvalue()
 
 
+def protect_queue_snapshot() -> dict[str, int]:
+    with PROTECT_QUEUE_LOCK:
+        return {
+            "maxConcurrency": PROTECT_MAX_CONCURRENCY,
+            "activeCount": len(PROTECT_ACTIVE_TASK_IDS),
+            "queuedCount": len(PROTECT_PENDING_TASKS),
+        }
+
+
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     capabilities_payload = diagnose_capabilities()
@@ -831,6 +921,7 @@ def health() -> dict[str, Any]:
             "tts": "unavailable: downstream TTS is not enabled by default",
             "pesq": "unavailable: PESQ is only returned when a real evaluator is installed",
         },
+        "protectQueue": protect_queue_snapshot(),
         "chains": capabilities_payload["chains"],
     }
 
@@ -849,6 +940,7 @@ def config() -> dict[str, Any]:
         "ok": True,
         "time": utc_now_iso(),
         "config": runtime_config(),
+        "protectQueue": protect_queue_snapshot(),
     }
 
 
@@ -884,7 +976,15 @@ def get_uploaded_file(file_id: str, filename: str) -> FileResponse:
     return FileResponse(path, filename=data["filename"])
 
 
-def run_protect_task_process(task_id: str, req_id: str, uploaded_path: str, uploaded_filename: str | None, file_id: str, payload_dict: dict[str, Any]) -> None:
+def run_protect_task_process(
+    task_id: str,
+    req_id: str,
+    uploaded_path: str,
+    uploaded_filename: str | None,
+    file_id: str,
+    payload_dict: dict[str, Any],
+    cancel_event: Any,
+) -> None:
     uploaded = {"path": uploaded_path, "filename": uploaded_filename}
 
     def ensure_process_task_not_deleted() -> None:
@@ -896,49 +996,17 @@ def run_protect_task_process(task_id: str, req_id: str, uploaded_path: str, uplo
         write_task_status(
             task_id,
             status="running",
-            progress=0.18,
-            stage="protect_generation",
-            message="后端正在生成保护音频",
+            progress=0.08,
+            stage="file_preprocess",
+            message="后端正在预处理录音/音频",
+            queuePosition=None,
+            maxConcurrency=PROTECT_MAX_CONCURRENCY,
             error=None,
         )
 
         def on_protect_progress(**event: Any) -> None:
             ensure_process_task_not_deleted()
-            explicit_progress = event.get("progress")
-            if explicit_progress is not None:
-                try:
-                    progress_value = float(explicit_progress)
-                except (TypeError, ValueError):
-                    progress_value = 0.18
-                write_task_status(
-                    task_id,
-                    status="running",
-                    progress=round(min(0.99, max(0.0, progress_value)), 3),
-                    stage=str(event.get("stage") or "protect_generation"),
-                    message=str(event.get("message") or "后端正在处理保护任务"),
-                    error=None,
-                    progressSource="backend_stage",
-                )
-                return
-            step = event.get("step")
-            total = event.get("total") or 1
-            try:
-                ratio = (float(step) + 1.0) / max(float(total), 1.0)
-            except (TypeError, ValueError):
-                ratio = 0.0
-            progress = 0.18 + min(1.0, max(0.0, ratio)) * 0.77
-            write_task_status(
-                task_id,
-                status="running",
-                progress=round(progress, 3),
-                stage="protect_generation",
-                message=f"Protect optimization step {int(step) + 1}/{int(total)}" if step is not None else "Backend is generating protected audio",
-                error=None,
-                currentStep=int(step) + 1 if step is not None else None,
-                totalSteps=int(total),
-                stageProgress=round(min(1.0, max(0.0, ratio)), 3),
-                progressSource="semantic_vguard_step",
-            )
+            write_task_status(task_id, **protection_progress_status(event))
 
         result = create_task(
             Path(uploaded_path),
@@ -947,6 +1015,7 @@ def run_protect_task_process(task_id: str, req_id: str, uploaded_path: str, uplo
             request_id=req_id,
             task_id=task_id,
             progress_callback=on_protect_progress,
+            cancel_event=cancel_event,
         )
         ensure_process_task_not_deleted()
         write_task_status(
@@ -960,6 +1029,48 @@ def run_protect_task_process(task_id: str, req_id: str, uploaded_path: str, uplo
         )
     except TaskCancelledError:
         return
+    except AudioPreprocessError as exc:
+        diagnostics = exc.diagnostics
+        write_task_log(
+            task_id,
+            {
+                "requestId": req_id,
+                "taskId": task_id,
+                "fileId": file_id,
+                "inputAudioPath": uploaded_path,
+                "inputAudioExists": Path(uploaded_path).exists(),
+                "currentStage": "file_preprocess",
+                "reason": exc.reason,
+                "diagnostics": diagnostics,
+                "exceptionType": type(exc).__name__,
+                "exceptionMessage": str(exc),
+                "stackTrace": traceback.format_exc(),
+            },
+        )
+        suggestion = (
+            "请使用 Python 3.11 安装 backend/SemE2E/requirements.txt，或通过 SEME2E_FFMPEG_PATH 指定 FFmpeg。"
+            if exc.code == "AUDIO_DECODER_UNAVAILABLE"
+            else "请重新录音，或上传可正常播放的 WAV、FLAC、MP3、M4A、OGG、WebM/Opus 音频。"
+        )
+        write_task_status(
+            task_id,
+            status="failed",
+            stage="file_preprocess",
+            message=str(exc),
+            error={
+                "code": exc.code,
+                "message": str(exc),
+                "requestId": req_id,
+                "taskId": task_id,
+                "stage": "file_preprocess",
+                "details": {
+                    "fileId": file_id,
+                    "reason": exc.reason,
+                    "suggestion": suggestion,
+                    **diagnostics,
+                },
+            },
+        )
     except ProtectGenerationError as exc:
         diagnostics = exc.diagnostics
         write_task_log(
@@ -1003,17 +1114,30 @@ def run_protect_task_process(task_id: str, req_id: str, uploaded_path: str, uplo
             "allowFallback": diagnostics.get("allowFallback"),
             "expectedOutputPath": diagnostics.get("outputPath"),
             "reason": exc.reason,
+            "exceptionType": diagnostics.get("exceptionType"),
+            "exceptionMessage": diagnostics.get("exceptionMessage"),
             "capabilities": diagnostics.get("capabilities", {}).get("chains"),
-            "suggestion": "Install/check backend dependencies and model checkpoints.",
+            "suggestion": (
+                "请缩短并发任务数量或释放内存后重试。"
+                if exc.reason == "resource_exhausted"
+                else "请查看任务日志中的 exceptionType、exceptionMessage 和 stackTrace。"
+                if exc.reason == "algorithm_runtime_error"
+                else "请检查后端依赖和模型 checkpoint。"
+            ),
         }
+        failure_message = (
+            f"保护算法执行失败：{diagnostics.get('exceptionMessage')}"
+            if diagnostics.get("exceptionMessage")
+            else "保护音频生成失败：后端算法未生成保护音频。"
+        )
         write_task_status(
             task_id,
             status="failed",
             stage="protect_generation",
-            message="保护音频生成失败：后端算法未生成保护音频。",
+            message=failure_message,
             error={
                 "code": "PROTECT_GENERATION_FAILED",
-                "message": "保护音频生成失败：后端算法未生成保护音频。",
+                "message": failure_message,
                 "requestId": req_id,
                 "taskId": exc.task_id,
                 "stage": "protect_generation",
@@ -1051,8 +1175,211 @@ def run_protect_task_process(task_id: str, req_id: str, uploaded_path: str, uplo
         )
 
 
+def _refresh_protect_queue_statuses_locked() -> None:
+    for position, job in enumerate(PROTECT_PENDING_TASKS, start=1):
+        task_id = str(job["task_id"])
+        cancel_event = job["cancel_event"]
+        if cancel_event.is_set() or is_task_deleted(task_id):
+            continue
+        try:
+            write_task_status(
+                task_id,
+                status="queued",
+                progress=0.05,
+                stage="file_preprocess",
+                message=f"任务正在排队，前方还有 {position - 1} 个任务",
+                queuePosition=position,
+                maxConcurrency=PROTECT_MAX_CONCURRENCY,
+                error=None,
+            )
+        except TaskCancelledError:
+            continue
+
+
+def _watch_protect_process(task_id: str, process: multiprocessing.Process, cancel_event: Any) -> None:
+    process.join()
+    try:
+        if not is_task_deleted(task_id):
+            try:
+                status = read_task_status(task_id)
+            except Exception:
+                status = {}
+            if status.get("status") in {"queued", "running"}:
+                exit_code = process.exitcode
+                message = f"保护任务进程意外退出（exit code: {exit_code}）"
+                write_task_status(
+                    task_id,
+                    status="failed",
+                    stage=str(status.get("stage") or "protect_generation"),
+                    message=message,
+                    error={
+                        "code": "PROTECT_PROCESS_EXITED",
+                        "message": message,
+                        "taskId": task_id,
+                        "stage": str(status.get("stage") or "protect_generation"),
+                        "details": {"exitCode": exit_code},
+                    },
+                )
+    finally:
+        with PROTECT_QUEUE_LOCK:
+            PROTECT_ACTIVE_TASK_IDS.discard(task_id)
+            cleanup_protect_process_runtime(task_id, process, cancel_event)
+            _dispatch_protect_tasks_locked()
+
+
+def _start_protect_job_locked(job: dict[str, Any]) -> bool:
+    task_id = str(job["task_id"])
+    cancel_event = job["cancel_event"]
+    if cancel_event.is_set() or is_task_deleted(task_id):
+        cleanup_task_runtime(task_id)
+        return False
+
+    process = multiprocessing.Process(
+        target=run_protect_task_process,
+        args=(
+            task_id,
+            job["request_id"],
+            job["uploaded_path"],
+            job.get("uploaded_filename"),
+            job["file_id"],
+            job["payload"],
+            cancel_event,
+        ),
+        daemon=True,
+    )
+    PROTECT_ACTIVE_TASK_IDS.add(task_id)
+    register_task_runtime(task_id, cancel_event, process=process)
+    try:
+        process.start()
+    except Exception as exc:
+        PROTECT_ACTIVE_TASK_IDS.discard(task_id)
+        cleanup_protect_process_runtime(task_id, process, cancel_event)
+        write_task_status(
+            task_id,
+            status="failed",
+            stage="file_preprocess",
+            message=f"无法启动保护任务进程：{exc}",
+            error={
+                "code": "PROTECT_PROCESS_START_FAILED",
+                "message": str(exc),
+                "taskId": task_id,
+                "stage": "file_preprocess",
+                "details": {"exceptionType": type(exc).__name__},
+            },
+        )
+        return False
+
+    watcher = threading.Thread(
+        target=_watch_protect_process,
+        args=(task_id, process, cancel_event),
+        name=f"protect-watch-{task_id}",
+        daemon=True,
+    )
+    watcher.start()
+    return True
+
+
+def _dispatch_protect_tasks_locked() -> None:
+    while len(PROTECT_ACTIVE_TASK_IDS) < PROTECT_MAX_CONCURRENCY and PROTECT_PENDING_TASKS:
+        job = PROTECT_PENDING_TASKS.popleft()
+        _start_protect_job_locked(job)
+    _refresh_protect_queue_statuses_locked()
+
+
+def enqueue_protect_job(job: dict[str, Any]) -> None:
+    task_id = str(job["task_id"])
+    register_task_runtime(task_id, job["cancel_event"])
+    with PROTECT_QUEUE_LOCK:
+        PROTECT_PENDING_TASKS.append(job)
+        _dispatch_protect_tasks_locked()
+
+
+def remove_pending_protect_job(task_id: str) -> bool:
+    with PROTECT_QUEUE_LOCK:
+        for job in tuple(PROTECT_PENDING_TASKS):
+            if job.get("task_id") == task_id:
+                PROTECT_PENDING_TASKS.remove(job)
+                _refresh_protect_queue_statuses_locked()
+                return True
+    return False
+
+
+@app.on_event("startup")
+def recover_protection_queue() -> None:
+    """Recover queued work and make interrupted protection tasks terminal after a restart."""
+    with PROTECT_QUEUE_LOCK:
+        if PROTECT_PENDING_TASKS or PROTECT_ACTIVE_TASK_IDS:
+            return
+
+    for task_dir in sorted(
+        (path for path in TASK_DIR.iterdir() if path.is_dir()),
+        key=lambda item: item.stat().st_mtime,
+    ):
+        task_id = task_dir.name
+        try:
+            status = read_task_status(task_id)
+        except Exception:
+            continue
+        if status.get("stage") not in {"file_preprocess", "protect_generation"}:
+            continue
+        payload = status.get("payload")
+        file_id = status.get("fileId")
+        if not isinstance(payload, dict) or not isinstance(file_id, str) or not file_id:
+            continue
+
+        if status.get("status") == "running":
+            message = "后端服务曾重启，原保护任务进程已中断，请重试"
+            write_task_status(
+                task_id,
+                status="failed",
+                stage=str(status.get("stage") or "protect_generation"),
+                message=message,
+                error={
+                    "code": "PROTECT_SERVER_RESTARTED",
+                    "message": message,
+                    "taskId": task_id,
+                    "stage": str(status.get("stage") or "protect_generation"),
+                    "details": {"previousStatus": "running"},
+                },
+            )
+            continue
+        if status.get("status") != "queued":
+            continue
+
+        try:
+            uploaded = find_uploaded_file(file_id)
+        except HTTPException as exc:
+            message = f"排队任务恢复失败：{exc.detail}"
+            write_task_status(
+                task_id,
+                status="failed",
+                stage="file_preprocess",
+                message=message,
+                error={
+                    "code": "PROTECT_QUEUE_RECOVERY_FAILED",
+                    "message": message,
+                    "taskId": task_id,
+                    "stage": "file_preprocess",
+                    "details": {"fileId": file_id},
+                },
+            )
+            continue
+
+        enqueue_protect_job(
+            {
+                "task_id": task_id,
+                "request_id": request_id(),
+                "uploaded_path": str(uploaded["path"]),
+                "uploaded_filename": uploaded.get("filename"),
+                "file_id": file_id,
+                "payload": payload,
+                "cancel_event": multiprocessing.Event(),
+            }
+        )
+
+
 @app.post("/api/tasks/protect")
-def protect_task(payload: ProtectTaskRequest) -> dict[str, str]:
+def protect_task(payload: ProtectTaskRequest) -> dict[str, Any]:
     req_id = request_id()
     if not payload.fileId:
         return structured_error(
@@ -1078,17 +1405,22 @@ def protect_task(payload: ProtectTaskRequest) -> dict[str, str]:
         filename=uploaded.get("filename"),
         mode=payload.mode,
         payload=payload.model_dump(),
+        maxConcurrency=PROTECT_MAX_CONCURRENCY,
         error=None,
     )
-    cancel_event = threading.Event()
-    process = multiprocessing.Process(
-        target=run_protect_task_process,
-        args=(task_id, req_id, str(uploaded["path"]), uploaded.get("filename"), payload.fileId, payload.model_dump()),
-        daemon=True,
+    cancel_event = multiprocessing.Event()
+    enqueue_protect_job(
+        {
+            "task_id": task_id,
+            "request_id": req_id,
+            "uploaded_path": str(uploaded["path"]),
+            "uploaded_filename": uploaded.get("filename"),
+            "file_id": payload.fileId,
+            "payload": payload.model_dump(),
+            "cancel_event": cancel_event,
+        }
     )
-    register_task_runtime(task_id, cancel_event, process=process)
-    process.start()
-    return {"taskId": task_id, "status": "queued"}
+    return {"taskId": task_id, "status": "queued", "maxConcurrency": PROTECT_MAX_CONCURRENCY}
 
     cancel_event = threading.Event()
     register_task_runtime(task_id, cancel_event)
@@ -1107,41 +1439,7 @@ def protect_task(payload: ProtectTaskRequest) -> dict[str, str]:
 
             def on_protect_progress(**event: Any) -> None:
                 ensure_task_not_cancelled(task_id, cancel_event)
-                explicit_progress = event.get("progress")
-                if explicit_progress is not None:
-                    try:
-                        progress_value = float(explicit_progress)
-                    except (TypeError, ValueError):
-                        progress_value = 0.18
-                    write_task_status(
-                        task_id,
-                        status="running",
-                        progress=round(min(0.99, max(0.0, progress_value)), 3),
-                        stage=str(event.get("stage") or "protect_generation"),
-                        message=str(event.get("message") or "后端正在处理保护任务"),
-                        error=None,
-                        progressSource="backend_stage",
-                    )
-                    return
-                step = event.get("step")
-                total = event.get("total") or 1
-                try:
-                    ratio = (float(step) + 1.0) / max(float(total), 1.0)
-                except (TypeError, ValueError):
-                    ratio = 0.0
-                progress = 0.18 + min(1.0, max(0.0, ratio)) * 0.77
-                write_task_status(
-                    task_id,
-                    status="running",
-                    progress=round(progress, 3),
-                    stage="protect_generation",
-                    message=f"Protect optimization step {int(step) + 1}/{int(total)}" if step is not None else "Backend is generating protected audio",
-                    error=None,
-                    currentStep=int(step) + 1 if step is not None else None,
-                    totalSteps=int(total),
-                    stageProgress=round(min(1.0, max(0.0, ratio)), 3),
-                    progressSource="semantic_vguard_step",
-                )
+                write_task_status(task_id, **protection_progress_status(event))
 
             result = create_task(
                 Path(uploaded["path"]),
@@ -1302,6 +1600,53 @@ def protect_task(payload: ProtectTaskRequest) -> dict[str, str]:
     register_task_runtime(task_id, cancel_event, thread)
     thread.start()
     return {"taskId": task_id, "status": "queued"}
+
+
+@app.post("/api/tasks/{task_id}/retry")
+def retry_protection_task(task_id: str) -> JSONResponse:
+    req_id = request_id()
+    status = read_task_status(task_id)
+    current_status = status.get("status")
+    if current_status not in {"failed", "error"}:
+        return structured_error(
+            code="TASK_NOT_RETRYABLE",
+            message="仅保护失败的任务可以重试。",
+            status_code=409,
+            request_id_value=req_id,
+            task_id=task_id,
+            stage=str(status.get("stage") or "protect_generation"),
+            details={"status": current_status},
+        )
+
+    original_payload = status.get("payload")
+    if not isinstance(original_payload, dict):
+        return structured_error(
+            code="TASK_RETRY_PAYLOAD_MISSING",
+            message="原任务缺少保护参数，无法重试。",
+            status_code=409,
+            request_id_value=req_id,
+            task_id=task_id,
+            stage="protect_generation",
+            details={"status": current_status},
+        )
+
+    try:
+        retry_payload = ProtectTaskRequest.model_validate(original_payload)
+    except Exception as exc:
+        return structured_error(
+            code="TASK_RETRY_PAYLOAD_INVALID",
+            message="原任务保护参数无效，无法重试。",
+            status_code=409,
+            request_id_value=req_id,
+            task_id=task_id,
+            stage="protect_generation",
+            details={"exceptionType": type(exc).__name__, "exceptionMessage": str(exc)},
+        )
+
+    created = protect_task(retry_payload)
+    if isinstance(created, dict):
+        return JSONResponse({**created, "retryOfTaskId": task_id})
+    return created
 
 
 @app.get("/api/tasks")
@@ -1718,6 +2063,7 @@ def delete_task(task_id: str) -> dict[str, Any]:
         status = {}
     cancel_event, thread, process = request_task_cancel(task_id)
     mark_task_deleted(task_id)
+    removed_from_queue = remove_pending_protect_job(task_id)
     cancelled = cancel_event is not None or process is not None or status.get("status") in {"queued", "running"}
     process_pid = process.pid if process is not None else None
     if process is not None and process.is_alive():
@@ -1738,6 +2084,7 @@ def delete_task(task_id: str) -> dict[str, Any]:
                 "taskId": task_id,
                 "status": "deleted",
                 "cancelled": cancelled,
+                "removedFromQueue": removed_from_queue,
                 "threadStopped": thread is None or not thread.is_alive(),
                 "processPid": process_pid,
                 "processStopped": process is None or not process.is_alive(),
@@ -1957,7 +2304,7 @@ def artifact_result_json(task_id: str) -> FileResponse:
 
 @app.get("/api/artifacts/{task_id}/{kind}/{filename}")
 def artifact_file(task_id: str, kind: str, filename: str) -> FileResponse:
-    if kind not in {"original", "protected"}:
+    if kind not in {"source", "original", "protected"}:
         raise HTTPException(status_code=404, detail="unknown artifact kind")
     path = TASK_DIR / task_id / kind / filename
     if not path.exists():

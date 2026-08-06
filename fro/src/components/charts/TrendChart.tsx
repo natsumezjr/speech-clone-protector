@@ -7,6 +7,7 @@ const lossSeries = [
   { key: 'Lsem', tooltipName: 'L<sub>sem</sub>', color: '#22c55e' },
   { key: 'Lpsy', tooltipName: 'L<sub>psy</sub>', color: '#f59e0b' },
   { key: 'L2', tooltipName: 'L<sub>2</sub>', color: '#a78bfa' },
+  { key: 'total', tooltipName: 'L<sub>total</sub>', color: '#fb7185' },
 ] as const
 
 function lossValue(point: LossTrendPoint, series: (typeof lossSeries)[number]) {
@@ -42,6 +43,9 @@ export function TrendChart({ data }: { data: LossTrendPoint[] }) {
           tooltipText: '#e2e8f0',
         }
 
+  const gridHeight = 12
+  const gridGap = (100 - gridHeight * lossSeries.length) / (lossSeries.length + 1)
+
   const option = {
     backgroundColor: 'transparent',
     animation: false,
@@ -55,18 +59,16 @@ export function TrendChart({ data }: { data: LossTrendPoint[] }) {
         const rows = params
           .map((item) => `${item.marker}${item.seriesName}: ${formatLossValue(item.value)}`)
           .join('<br/>')
-        const point = data.find((item) => String(item.step) === String(step))
-        const total = point?.total === null || point?.total === undefined ? '' : `<br/>total loss: ${formatLossValue(point.total)}`
-        return `step: ${step}<br/>${rows}${total}`
+        return `step: ${step}<br/>${rows}`
       },
     },
-    axisPointer: { link: [{ xAxisIndex: [0, 1, 2, 3] }] },
+    axisPointer: { link: [{ xAxisIndex: lossSeries.map((_, index) => index) }] },
     legend: { show: false },
     grid: lossSeries.map((_, index) => ({
       left: 48,
       right: 16,
-      top: `${5 + index * 24}%`,
-      height: '16%',
+      top: `${gridGap + index * (gridHeight + gridGap)}%`,
+      height: `${gridHeight}%`,
       containLabel: false,
     })),
     xAxis: lossSeries.map((_, index) => ({
@@ -102,5 +104,5 @@ export function TrendChart({ data }: { data: LossTrendPoint[] }) {
     })),
   }
 
-  return <ReactECharts option={option} className="h-full w-full" />
+  return <ReactECharts option={option} className="h-full w-full" style={{ height: '100%', width: '100%' }} />
 }

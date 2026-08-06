@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import librosa
 import numpy as np
 import soundfile as sf
+import torch
+import torchaudio.functional as ta_functional
 
 
 def load_mono(path: str | Path, sr: int | None = None) -> tuple[np.ndarray, int]:
@@ -12,9 +13,10 @@ def load_mono(path: str | Path, sr: int | None = None) -> tuple[np.ndarray, int]
     if y.ndim > 1:
         y = y.mean(axis=1)
     if sr is not None and in_sr != sr:
-        y = librosa.resample(y, orig_sr=in_sr, target_sr=sr)
+        waveform = torch.from_numpy(np.ascontiguousarray(y)).float().unsqueeze(0)
+        y = ta_functional.resample(waveform, in_sr, sr).squeeze(0).cpu().numpy()
         in_sr = sr
-    return y, in_sr
+    return np.asarray(y, dtype=np.float32), in_sr
 
 
 def audio_metrics(clean_path: str | Path, audio_path: str | Path) -> dict[str, float]:

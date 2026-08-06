@@ -51,11 +51,36 @@ function Resolve-CommandPath {
   throw $HelpText
 }
 
-Stop-PortProcess -Port $BackendPort
-Stop-PortProcess -Port $FrontendPort
-
 $python = Resolve-CommandPath -Candidates @("python", "python3", "py") -HelpText "Python is required to start the backend."
 $pnpm = Resolve-CommandPath -Candidates @("pnpm.cmd", "pnpm") -HelpText "pnpm is required to start the frontend."
+
+$pythonLauncherArgs = @()
+if ((Split-Path -Leaf $python) -eq "py.exe") {
+  $pythonLauncherArgs = @("-3.11")
+}
+$pythonVersion = & $python @pythonLauncherArgs -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+if ($LASTEXITCODE -ne 0 -or $pythonVersion.Trim() -ne "3.11") {
+  $pyLauncher = Get-Command "py" -ErrorAction SilentlyContinue
+  if (-not $pyLauncher) {
+    throw "Python 3.11 is required by Coqui TTS 0.22.0. Install Python 3.11 or make it the active python command."
+  }
+  $python = $pyLauncher.Source
+  $pythonLauncherArgs = @("-3.11")
+  $pythonVersion = & $python @pythonLauncherArgs -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+  if ($LASTEXITCODE -ne 0 -or $pythonVersion.Trim() -ne "3.11") {
+    throw "Python 3.11 is required by Coqui TTS 0.22.0, but the 3.11 launcher is unavailable."
+  }
+}
+
+$audioRuntimeJson = & $python @pythonLauncherArgs -c "import json, sys; sys.path.insert(0, sys.argv[1]); from audio_preprocess import audio_preprocess_capabilities; capabilities = audio_preprocess_capabilities(); print(json.dumps(capabilities)); raise SystemExit(0 if capabilities['recordingSupported'] else 2)" $BackendDir
+if ($LASTEXITCODE -ne 0) {
+  throw "Browser recording requires an FFmpeg decoder. Install Python 3.11 dependencies with: python -m pip install -r backend/SemE2E/requirements.txt, or set SEME2E_FFMPEG_PATH. Diagnostics: $audioRuntimeJson"
+}
+$audioRuntime = $audioRuntimeJson | ConvertFrom-Json
+Write-Host "Recording decoder: $($audioRuntime.decoder.path) ($($audioRuntime.decoder.source))"
+
+Stop-PortProcess -Port $BackendPort
+Stop-PortProcess -Port $FrontendPort
 
 $backendOut = Join-Path $LogDir "backend.out.log"
 $backendErr = Join-Path $LogDir "backend.err.log"
@@ -63,7 +88,7 @@ $frontendOut = Join-Path $LogDir "frontend.out.log"
 $frontendErr = Join-Path $LogDir "frontend.err.log"
 
 Write-Host "Starting backend: http://localhost:$BackendPort"
-$backendArgs = if ((Split-Path -Leaf $python) -eq "py.exe") { @("-3", "api_server.py") } else { @("api_server.py") }
+$backendArgs = @($pythonLauncherArgs) + @("api_server.py")
 $previousBackendPort = $env:SEME2E_API_PORT
 $previousRealGuard = $env:SEME2E_API_REAL_GUARD
 $previousEnableAsr = $env:SEME2E_ENABLE_ASR

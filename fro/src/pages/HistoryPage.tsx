@@ -84,7 +84,7 @@ export function HistoryPage() {
       ) : error ? (
         <Panel className="border-red-400/25 bg-red-950/20 text-red-100">后端模式下获取历史任务失败：{error instanceof Error ? error.message : '未知错误'}</Panel>
       ) : (
-        <TaskTable tasks={filtered} view={view} onDeleted={() => void queryClient.invalidateQueries({ queryKey: ['tasks'] })} />
+        <TaskTable tasks={filtered} view={view} onChanged={() => void queryClient.invalidateQueries({ queryKey: ['tasks'] })} />
       )}
     </div>
   )

@@ -297,6 +297,20 @@ html[data-theme='light'] [class*='bg-cyan-300'].text-slate-950 {
   background-color: #0284c7;
 }
 
+html[data-theme='light'] .config-slider-track {
+  background-color: rgba(100, 116, 139, 0.32);
+}
+
+html[data-theme='light'] .config-slider-fill {
+  background-color: #38bdf8;
+}
+
+html[data-theme='light'] .config-slider-thumb {
+  border: 1px solid rgba(3, 105, 161, 0.28);
+  background-color: #0ea5e9;
+  box-shadow: 0 0 12px rgba(2, 132, 199, 0.3);
+}
+
 html[data-theme='light'] .hero-impact-panel,
 html[data-theme='light'] .uploaded-audio-panel,
 html[data-theme='light'] .result-audio-card,

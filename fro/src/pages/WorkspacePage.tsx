@@ -632,8 +632,8 @@ function StrategyConfigCard({
   ]
   const targetOptions = runtimeConfig.targets ?? [
     { value: 'semantic', label: '语义防护', description: '降低 ASR/LLM 理解概率' },
-    { value: 'timbre', label: '语音特征防护', description: '阻断声学特征重建' },
-    { value: 'joint', label: '联合防护', description: '语义 + 语音特征联合防护' },
+    { value: 'timbre', label: '声音身份防护', description: '阻断声学特征重建' },
+    { value: 'joint', label: '联合防护', description: '语义 + 声音身份联合防护' },
   ]
   const targetIconMap = {
     semantic: { Icon: ShieldCheck, tone: 'green' },
@@ -783,13 +783,15 @@ function StrategyConfigCard({
           onClick={() => setLambdaModalOpen(true)}
           className="mt-6 flex w-full items-center justify-between border-t border-cyan-300/10 pt-3 text-left text-sm font-bold text-slate-300"
         >
-          <span>高级选项（lamda）</span>
+          <span className="inline-flex items-center gap-1">
+            高级选项（<MathText formula="\lambda" className="text-cyan-100" />）
+          </span>
           <ChevronDown className="h-4 w-4 text-cyan-300" />
         </button>
         <div className="mt-5 rounded-[7px] border border-cyan-300/16 bg-sky-400/10 p-3 text-[12px] leading-5 text-slate-300">
           <p className="font-bold text-cyan-200">参数说明</p>
           <p>
-            <MathTerm>ε</MathTerm> 控制保护扰动的最大幅度，Steps 控制优化迭代次数；lamda 权重在高级选项弹窗中调节。建议先保持默认权重，再根据语义扰动、身份相似度与听感质量进行微调。
+            <MathTerm>ε</MathTerm> 控制保护扰动的最大幅度，Steps 控制优化迭代次数；<MathText formula="\lambda" className="mx-0.5 text-cyan-100" /> 权重在高级选项弹窗中调节。建议先保持默认权重，再根据语义扰动、身份相似度与听感质量进行微调。
           </p>
         </div>
       </ConfigBlock>
@@ -815,14 +817,16 @@ function StrategyConfigCard({
       ) : null}
 
       {lambdaModalOpen ? (
-        <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/68 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="lamda 高级参数">
+        <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/68 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="lambda 高级参数">
           <div className="ui-card w-full max-w-[620px] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.46)]">
             <div className="mb-4 flex items-center justify-between">
               <div>
-                <h3 className="text-[20px] font-black text-white">高级选项（lamda）</h3>
-                <p className="mt-1 text-xs text-slate-500">配置联合优化目标中的四个 λ 权重项</p>
+                <h3 className="inline-flex items-center gap-1 text-[20px] font-black text-white">
+                  高级选项（<MathText formula="\lambda" className="text-cyan-100" />）
+                </h3>
+                <p className="mt-1 text-xs text-slate-500">配置联合优化目标中的四个 <MathText formula="\lambda" className="mx-0.5 text-cyan-100" /> 权重项</p>
               </div>
-              <button type="button" onClick={() => setLambdaModalOpen(false)} className="grid h-9 w-9 place-items-center rounded-full border border-cyan-300/14 bg-white/[0.035] text-slate-300 hover:text-white" aria-label="关闭 lamda 参数">
+              <button type="button" onClick={() => setLambdaModalOpen(false)} className="grid h-9 w-9 place-items-center rounded-full border border-cyan-300/14 bg-white/[0.035] text-slate-300 hover:text-white" aria-label="关闭 lambda 参数">
                 <X className="h-4 w-4" />
               </button>
             </div>
@@ -867,7 +871,7 @@ function ArchitectureCard() {
         <div className="mb-6 flex items-center justify-between">
           <div>
             <h2 className="text-[21px] font-black text-white">系统架构概览</h2>
-            <p className="mt-2 text-sm text-slate-400">端到端语音克隆防护流程（E2E-VGuard）</p>
+            <p className="mt-2 text-sm text-slate-400">克隆防护VoiceSheild</p>
           </div>
           <button type="button" onClick={() => pushToast({ kind: 'info', title: '系统架构', description: '左侧上传音频，中间生成保护音频，右侧结果页可执行克隆测试与评估导出。' })} className="text-sm font-bold text-cyan-300">查看详情 ›</button>
         </div>
@@ -880,7 +884,7 @@ function ArchitectureCard() {
         </div>
         <div className="mt-8 grid grid-cols-3 gap-3">
           <Branch title="语义分支" color="green" items={['语义理解模型', '多模型语义编码', '表示空间约束', '...']} />
-          <Branch title="Identity 分支" color="blue" items={['Identity Encoder', '声音身份约束', '说话人不可恢复', '...']} />
+          <Branch title="身份分支" color="blue" items={['身份编码器', '声音身份约束', '说话人不可恢复', '...']} />
           <Branch title="听感约束" color="purple" items={['心理声学模型', '掩蔽阈值建模', '听感优化', '...']} />
         </div>
         <div className="mt-6 rounded-[7px] border border-cyan-300/20 bg-sky-400/10 p-4 text-center text-sm text-slate-300">
@@ -1046,9 +1050,9 @@ function SliderRow({
           className="absolute inset-0 z-10 h-5 w-full cursor-pointer opacity-0"
           aria-label={labelText ?? (typeof label === 'string' ? label : '参数滑块')}
         />
-        <div className="absolute left-0 right-0 top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-slate-700">
-        <div className="relative h-full rounded-full bg-cyan-400" style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}>
-          <span className="absolute right-0 top-1/2 h-4 w-4 -translate-y-1/2 translate-x-1/2 rounded-full bg-cyan-300 shadow-[0_0_14px_rgba(34,211,238,0.8)]" />
+        <div className="config-slider-track absolute left-0 right-0 top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-slate-700">
+        <div className="config-slider-fill relative h-full rounded-full bg-cyan-400" style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}>
+          <span className="config-slider-thumb absolute right-0 top-1/2 h-4 w-4 -translate-y-1/2 translate-x-1/2 rounded-full bg-cyan-300 shadow-[0_0_14px_rgba(34,211,238,0.8)]" />
         </div>
       </div>
       </div>
@@ -1081,11 +1085,10 @@ function MathTerm({ children }: { children: ReactNode }) {
 }
 
 function LambdaLabel({ name, text }: { name: string; text: string }) {
+  const formula = name === '2' ? '\\lambda_2' : `\\lambda_{\\mathrm{${name}}}`
   return (
-    <span>
-      <span className="font-serif italic tracking-normal text-cyan-100">
-        λ<sub>{name}</sub>
-      </span>
+    <span className="inline-flex items-center">
+      <MathText formula={formula} className="text-cyan-100" />
       <span className="ml-1">（{text}）</span>
     </span>
   )
@@ -1094,7 +1097,7 @@ function LambdaLabel({ name, text }: { name: string; text: string }) {
 function OptimizationFormula({ className }: { className?: string }) {
   return (
     <MathText
-      formula="L = \lambda_{\mathrm{id}} L_{\mathrm{id}} + \lambda_{\mathrm{sem}} L_{\mathrm{sem}} + \lambda_{\mathrm{psy}} L_{\mathrm{psy}} + \lambda_{2}\lVert \delta \rVert_{2}"
+      formula="L = \lambda_{\mathrm{id}} L_{\mathrm{id}} + \lambda_{\mathrm{sem}} L_{\mathrm{sem}} + \lambda_{\mathrm{psy}} L_{\mathrm{psy}} + \lambda_2 \lVert \delta \rVert_2"
       className={cn('text-slate-100', className)}
     />
   )

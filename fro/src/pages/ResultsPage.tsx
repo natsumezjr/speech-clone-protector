@@ -32,6 +32,7 @@ import { formatDurationSeconds, getAudioDuration, getAudioSource } from '@/utils
 import { TrendChart } from '@/components/charts/TrendChart'
 import { MathText } from '@/components/common/MathText'
 import { cloneMetricDisplay, computeAbsoluteDrop, formatCloneMetricNumber, generateCloneMetricInsights } from '@/utils/cloneMetricDisplay'
+import { analyzeLossTrend, type TrendDirection } from '@/utils/resultMetrics'
 
 const statusText: Record<TaskResult['status'], string> = {
   queued: '排队中',
@@ -93,6 +94,11 @@ function backendOptionItems(options?: ProtectionRuntimeConfig['models'][string])
 
 const defaultCloneText =
   '今天的语音克隆测试包含自然停顿、连续短句和较长上下文。我们希望模型在保持语速稳定的同时复现说话人的音色、韵律和情绪变化，用来比较原始音频与保护音频在下游合成系统中的差异。'
+
+const asrWeakDisruptionThreshold = 0.2
+const asrStrongDisruptionThreshold = 0.5
+const speakerSameIdentityThreshold = 0.25
+const speakerHighSimilarityThreshold = 0.5
 
 const delay = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))
 
@@ -279,7 +285,7 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
   const [cloneModalOpen, setCloneModalOpen] = useState(false)
   const [cloneLoading, setCloneLoading] = useState(false)
   const [cloneError, setCloneError] = useState<string>()
-  const [cloneResult, setCloneResult] = useState<CloneVoiceResult | undefined>(() => result.cloneResults?.at(-1))
+  const [cloneResult, setCloneResult] = useState<CloneVoiceResult | undefined>()
   const [cloneTaskStatus, setCloneTaskStatus] = useState<TaskStatusResponse | null>(null)
   const [asrModalOpen, setAsrModalOpen] = useState(false)
   const [asrLoading, setAsrLoading] = useState(false)
@@ -296,6 +302,17 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
     queryKey: ['capabilities'],
     queryFn: getCapabilities,
     staleTime: 60_000,
+  })
+  const { data: linkedTaskStatus, refetch: refetchLinkedTaskStatus } = useQuery({
+    queryKey: ['task-linked-evaluations', result.taskId],
+    queryFn: () => getTaskStatus(result.taskId),
+    retry: false,
+    refetchInterval: (query) => {
+      const status = query.state.data
+      const asrStatus = status?.asrTask?.status
+      const cloneStatus = status?.cloneTask?.status
+      return [asrStatus, cloneStatus].some((value) => value === 'queued' || value === 'running') ? 1500 : false
+    },
   })
   const runtimeConfig = configFromCapabilities(capabilities)
   const configuredAsrOptions = useMemo(() => optionValues(runtimeConfig?.models.asr), [runtimeConfig?.models.asr])
@@ -328,13 +345,16 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
     audioUrl: result.originalAudio.audioUrl ?? uploadedFile?.audioUrl,
   }
   const protectedAudio = { ...result.protectedAudio, objectUrl: result.protectedAudio.objectUrl ?? protectedObjectUrl }
-  const activeAsrEval = result.asrEval
+  const linkedAsrResult = linkedTaskStatus?.asrTask?.asrResult ?? linkedTaskStatus?.asrResult
+  const linkedCloneResult = linkedTaskStatus?.cloneTask?.cloneResult ?? linkedTaskStatus?.cloneResult
+  const activeAsrEval = result.asrEval ?? linkedAsrResult?.asr ?? null
   const originalText = activeAsrEval?.originalText ?? ''
   const referenceText = activeAsrEval?.referenceText ?? originalText
   const protectedText = activeAsrEval?.protectedText ?? ''
   const asrLevel = activeAsrEval?.metricLevel === 'word' || activeAsrEval?.metricLevel === 'char' ? activeAsrEval.metricLevel : chooseEditLevel(referenceText, protectedText)
   const asrEditStats = activeAsrEval && referenceText && protectedText ? computeEditMetrics(referenceText, protectedText, asrLevel) : null
-  const activeCloneEval = cloneResult?.cloneEval ?? cloneResultToEval(cloneResult) ?? result.cloneEval ?? null
+  const activeCloneResult = cloneResult ?? linkedCloneResult ?? result.cloneResults?.at(-1)
+  const activeCloneEval = activeCloneResult?.cloneEval ?? cloneResultToEval(activeCloneResult) ?? result.cloneEval ?? null
   const cloneModel = activeCloneEval?.cloneModel ?? '未生成'
   const speakerEvalModel = formatSpeakerEvalModel(
     activeCloneEval?.speakerEvalModel
@@ -371,15 +391,15 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
   useEffect(() => {
     const originalUrl = result.originalAudio.objectUrl
     const protectedUrl = result.protectedAudio.objectUrl
-    const originalCloneUrl = cloneResult?.originalCloneAudio.objectUrl
-    const protectedCloneUrl = cloneResult?.protectedCloneAudio.objectUrl
+    const originalCloneUrl = activeCloneResult?.originalCloneAudio.objectUrl
+    const protectedCloneUrl = activeCloneResult?.protectedCloneAudio.objectUrl
     return () => {
       if (originalUrl?.startsWith('blob:')) URL.revokeObjectURL(originalUrl)
       if (protectedUrl?.startsWith('blob:')) URL.revokeObjectURL(protectedUrl)
       if (originalCloneUrl?.startsWith('blob:')) URL.revokeObjectURL(originalCloneUrl)
       if (protectedCloneUrl?.startsWith('blob:')) URL.revokeObjectURL(protectedCloneUrl)
     }
-  }, [cloneResult?.originalCloneAudio.objectUrl, cloneResult?.protectedCloneAudio.objectUrl, result.originalAudio.objectUrl, result.protectedAudio.objectUrl])
+  }, [activeCloneResult?.originalCloneAudio.objectUrl, activeCloneResult?.protectedCloneAudio.objectUrl, result.originalAudio.objectUrl, result.protectedAudio.objectUrl])
 
   useEffect(() => {
     if (!runtimeConfig) return
@@ -422,6 +442,7 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
       setActivePanel('asr')
       const response = await runAsrEval(result.taskId, { model: asrModel, referenceText: referenceText || originalText || result.asr.referenceText || result.asr.originalText || undefined })
       const asr = response.asr ?? (await waitForAsrEvalResult(result.taskId))
+      await refetchLinkedTaskStatus()
       onAsrUpdated(asr)
       pushToast({ kind: 'success', title: 'ASR 测试完成', description: asr.model ?? asrModel })
     } catch (error) {
@@ -437,17 +458,21 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
   const waitForAsrEvalResult = async (taskId: string) => {
     for (let attempt = 0; attempt < 180; attempt += 1) {
       const status = await getTaskStatus(taskId)
-      if (status.asrResult?.asr) {
-        const asrStatus = status.asrResult.asr.status
+      const asrTask = status.asrTask
+      const asrResult = asrTask?.asrResult ?? status.asrResult
+      const asrTaskStatus = asrTask?.status ?? (status.stage === 'asr_eval' ? status.status : undefined)
+      if (asrResult?.asr) {
+        const asrStatus = asrResult.asr.status
         if (asrStatus === 'unavailable' || asrStatus === 'failed' || asrStatus === 'error') {
-          throw new Error(status.asrResult.asr.error || 'ASR 测试失败，请检查后端模型或依赖。')
+          throw new Error(asrResult.asr.error || 'ASR 测试失败，请检查后端模型或依赖。')
         }
-        return status.asrResult.asr
+        return asrResult.asr
       }
-      if ((status.status === 'failed' || status.status === 'error') && status.stage === 'asr_eval') {
-        throw new Error(typeof status.error === 'string' ? status.error : status.message || 'ASR 测试失败，请检查后端服务。')
+      if (asrTaskStatus === 'failed' || asrTaskStatus === 'error') {
+        const taskError = asrTask?.error ?? status.error
+        throw new Error(typeof taskError === 'string' ? taskError : asrTask?.message || status.message || 'ASR 测试失败，请检查后端服务。')
       }
-      if ((status.status === 'completed' || status.status === 'success') && status.stage === 'asr_eval') {
+      if (asrTaskStatus === 'completed' || asrTaskStatus === 'success') {
         const latest = await getTaskResult(taskId)
         return latest.asr
       }
@@ -495,6 +520,7 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
           ? response
           : await waitForCloneResult(result.taskId)
       setCloneResult(nextResult)
+      await refetchLinkedTaskStatus()
       pushToast({ kind: 'success', title: '语音克隆测试完成', description: nextResult.message ?? nextResult.cloneId })
     } catch (error) {
       const message = error instanceof Error ? error.message : '语音克隆测试失败，请检查表单或后端服务。'
@@ -509,17 +535,25 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
   const waitForCloneResult = async (taskId: string) => {
     for (let attempt = 0; attempt < 180; attempt += 1) {
       const status = await getTaskStatus(taskId)
-      if (status.stage === 'downstream_tts_eval') setCloneTaskStatus(status)
-      if (status.cloneResult) {
+      const cloneTask = status.cloneTask
+      const cloneResult = cloneTask?.cloneResult ?? status.cloneResult
+      const cloneTaskState = cloneTask?.status ?? (status.stage === 'downstream_tts_eval' ? status.status : undefined)
+      if (cloneTask) {
+        setCloneTaskStatus({ ...status, ...cloneTask, taskId: status.taskId } as TaskStatusResponse)
+      } else if (status.stage === 'downstream_tts_eval') {
+        setCloneTaskStatus(status)
+      }
+      if (cloneResult) {
         const latest = await getTaskResult(taskId)
         const latestClone = latest.cloneResults?.at(-1)
         if (latestClone) return latestClone
-        return status.cloneResult
+        return cloneResult
       }
-      if ((status.status === 'failed' || status.status === 'error') && status.stage === 'downstream_tts_eval') {
-        throw new Error(typeof status.error === 'string' ? status.error : status.message || '语音克隆测试失败，请检查后端服务。')
+      if (cloneTaskState === 'failed' || cloneTaskState === 'error') {
+        const taskError = cloneTask?.error ?? status.error
+        throw new Error(typeof taskError === 'string' ? taskError : cloneTask?.message || status.message || '语音克隆测试失败，请检查后端服务。')
       }
-      if ((status.status === 'completed' || status.status === 'success') && status.stage === 'downstream_tts_eval') {
+      if (cloneTaskState === 'completed' || cloneTaskState === 'success') {
         const latest = await getTaskResult(taskId)
         const latestClone = latest.cloneResults?.at(-1)
         if (latestClone) return latestClone
@@ -558,7 +592,15 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
       </div>
       <div className="mt-5">
         {activePanel === 'protect' ? (
-          <ProtectTab result={result} originalAudio={originalAudio} protectedAudio={protectedAudio} onProtectedPlayRequest={loadProtectedAudio} />
+          <ProtectTab
+            result={result}
+            originalAudio={originalAudio}
+            protectedAudio={protectedAudio}
+            linkedTaskStatus={linkedTaskStatus}
+            asrEval={activeAsrEval}
+            cloneEval={activeCloneEval}
+            onProtectedPlayRequest={loadProtectedAudio}
+          />
         ) : null}
         {activePanel === 'asr' ? (
           <AsrTab result={result} asrEval={activeAsrEval} editStats={asrEditStats} />
@@ -599,11 +641,17 @@ function ProtectTab({
   result,
   originalAudio,
   protectedAudio,
+  linkedTaskStatus,
+  asrEval,
+  cloneEval,
   onProtectedPlayRequest,
 }: {
   result: TaskResult
   originalAudio: AudioFileMeta
   protectedAudio: AudioFileMeta
+  linkedTaskStatus?: TaskStatusResponse
+  asrEval?: AsrEval | null
+  cloneEval?: CloneEval | null
   onProtectedPlayRequest: () => Promise<string | undefined>
 }) {
   const perturbation = result.perturbation
@@ -619,20 +667,31 @@ function ProtectTab({
         <AudioCard title="保护音频（已防护）" audio={protectedAudio} color="#22c55e" green onPlayRequest={onProtectedPlayRequest} />
       </div>
       <div className="grid grid-cols-[minmax(360px,0.86fr)_minmax(520px,1.14fr)] items-stretch gap-5 max-xl:grid-cols-1">
-        <section className="rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
-          <SectionTitle>扰动与可听性分析</SectionTitle>
-          <div className="mt-5 grid grid-cols-[repeat(auto-fit,minmax(170px,1fr))] gap-3">
-            <ScoreBox label="扰动强度（L2 / 能量）" value={formatMetricValue(perturbation?.l2Norm ?? result.quality.l2Norm, 'loss')} />
-            <ScoreBox label="扰动上限利用率" value={formatMetricValue(epsilonUsageRate, 'percent')} />
-            <ScoreBox label="频谱差异 / SNR" value={formatMetricValue(snr, 'db')} />
-          </div>
-          <QualityPanel result={result} embedded />
-        </section>
+        <div className="relative min-h-0 max-xl:static">
+          <section className="absolute inset-0 flex min-h-0 flex-col overflow-hidden rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4 max-xl:static max-xl:h-auto">
+            <SectionTitle>扰动与可听性分析</SectionTitle>
+            <div className="mt-5 grid grid-cols-[repeat(auto-fit,minmax(170px,1fr))] gap-3">
+              <ScoreBox label={<span className="inline-flex items-center justify-center gap-0.5">扰动强度（<MathText formula="L_2" /> 范数）</span>} value={formatMetricValue(perturbation?.l2Norm ?? result.quality.l2Norm, 'loss')} />
+              <ScoreBox label="扰动上限利用率" value={formatMetricValue(epsilonUsageRate, 'percent')} />
+              <ScoreBox label="信噪比（SNR）" value={formatMetricValue(snr, 'db')} />
+            </div>
+            <QualityPanel result={result} embedded />
+            <MetricGuide />
+          </section>
+        </div>
         <PsychoacousticPanel result={result} />
       </div>
-      <div className="grid min-h-[380px] grid-cols-[minmax(0,1fr)_minmax(360px,0.72fr)] items-stretch gap-5 max-xl:grid-cols-1">
+      <div className="grid grid-cols-[minmax(0,1fr)_minmax(360px,0.72fr)] items-stretch gap-5 max-xl:grid-cols-1">
         <TrendPanel result={result} embedded />
-        <InsightPanel title="保护结果解读" items={generateProtectionInsights(result)} />
+        <div className="relative min-h-0 max-xl:static">
+          <div className="absolute inset-0 min-h-0 max-xl:static">
+            <InsightPanel
+              title="保护结果解读"
+              items={generateProtectionInsights(result, { linkedTaskStatus, asrEval, cloneEval })}
+              fillHeight
+            />
+          </div>
+        </div>
       </div>
     </div>
   )
@@ -688,7 +747,7 @@ function AsrTab({ result, asrEval, editStats }: { result: TaskResult; asrEval?: 
         </MetricPanel>
         <RateBreakdown substituteShare={errorShares?.substituteShare} insertShare={errorShares?.insertShare} />
       </div>
-      <InsightPanel title="ASR 结果解读" items={generateAsrInsights(asrEval, editStats, result)} />
+      <InsightPanel title="ASR 结果解读" items={generateAsrInsights(asrEval, editStats, result)} naturalHeight />
     </div>
   )
 }
@@ -840,7 +899,7 @@ function CloneIdentityPanel({ cloneEval }: { cloneEval: CloneEval }) {
       <SectionTitle>声音身份特征链路分析</SectionTitle>
       <div className="mt-5 grid grid-cols-[repeat(auto-fit,minmax(210px,1fr))] gap-3">
         <DeltaStatCard
-          title="Speaker Similarity（越低越好）"
+          title="Speaker Similarity（范围 [-1, 1]，越低越好）"
           before={cloneMetrics.similarityBefore}
           after={cloneMetrics.similarityAfter}
           delta={cloneMetrics.similarityDeltaText}
@@ -848,7 +907,7 @@ function CloneIdentityPanel({ cloneEval }: { cloneEval: CloneEval }) {
           tone="green"
         />
         <DeltaStatCard
-          title="Embedding 距离（1 - cosine similarity，范围 0~2，越大越好）"
+          title="Embedding 距离（范围 [0, 2]，越大越好）"
           before={cloneMetrics.embeddingDistanceBefore}
           after={cloneMetrics.embeddingDistanceAfter}
           delta={cloneMetrics.embeddingDistanceDeltaText}
@@ -866,9 +925,6 @@ function CloneIdentityPanel({ cloneEval }: { cloneEval: CloneEval }) {
           />
         ) : null}
       </div>
-      {!hasCloneConfidence ? (
-        <p className="mt-3 text-[11px] leading-5 text-slate-500">克隆置信度需要校准后的 speaker verification probability model，当前未配置，因此不展示。</p>
-      ) : null}
     </section>
   )
 }
@@ -1364,7 +1420,7 @@ function renderDiffOps(diffOps: DiffOp[]): ReactNode[] {
   return nodes
 }
 
-function ScoreBox({ label, value, red, compact, foot }: { label: string; value: string; red?: boolean; compact?: boolean; foot?: string }) {
+function ScoreBox({ label, value, red, compact, foot }: { label: ReactNode; value: string; red?: boolean; compact?: boolean; foot?: string }) {
   return (
     <div className={cn('rounded-[9px] border border-cyan-300/12 bg-slate-950/16 text-center', compact ? 'min-h-[64px] p-2.5' : 'min-h-[82px] p-3')}>
       <p className="mx-auto max-w-full text-[11px] leading-4 text-slate-400">{label}</p>
@@ -1375,6 +1431,81 @@ function ScoreBox({ label, value, red, compact, foot }: { label: string; value: 
       </div>
       {foot ? <p className="mt-1 line-clamp-2 text-[10px] leading-4 text-slate-500" title={foot}>{foot}</p> : null}
     </div>
+  )
+}
+
+const metricGuideGridClass = 'grid grid-cols-[minmax(92px,0.8fr)_64px_minmax(110px,0.9fr)_minmax(0,1.8fr)] gap-x-3 max-md:grid-cols-[minmax(80px,0.8fr)_56px_minmax(92px,0.9fr)_minmax(0,1.6fr)] max-md:gap-x-2'
+
+function MetricGuide() {
+  const rows: Array<{ key: string; name: ReactNode; unit: string; range: string; description: string }> = [
+    {
+      key: 'l2',
+      name: <span className="inline-flex items-center gap-1"><MathText formula="L_2" /> 扰动强度</span>,
+      unit: '无量纲',
+      range: '≥ 0，随音频长度变化',
+      description: '整段音频的总体改动量，越小越接近原音。',
+    },
+    {
+      key: 'epsilon',
+      name: '扰动上限利用率',
+      unit: '%',
+      range: '0%～100%',
+      description: '已使用的扰动预算比例，越接近 100% 表示越接近设定上限。',
+    },
+    {
+      key: 'snr',
+      name: 'SNR',
+      unit: 'dB',
+      range: '无固定范围，可为负值',
+      description: '原始语音与扰动噪声的强弱比，数值越高，音频越接近原音。',
+    },
+    {
+      key: 'pesq',
+      name: 'PESQ',
+      unit: '分',
+      range: '约 -0.5～4.7',
+      description: '模拟人耳评价语音质量，分数越高，听感越好。',
+    },
+    {
+      key: 'stoi',
+      name: 'STOI',
+      unit: '无量纲',
+      range: '0～1',
+      description: '衡量语音是否容易听懂，越接近 1，可懂度越高。',
+    },
+    {
+      key: 'mos',
+      name: 'MOS（人工）',
+      unit: '分',
+      range: '1～5',
+      description: '人工试听给出的主观质量评分，分数越高，听感越好。',
+    },
+  ]
+
+  return (
+    <section className="mt-4 min-h-0 flex-1 overflow-x-hidden overflow-y-auto rounded-[8px] border border-cyan-300/12 bg-slate-950/16 max-xl:max-h-[248px] max-xl:flex-none" aria-labelledby="metric-guide-title">
+      <div className="min-w-0 pr-1">
+        <div className="px-3 pb-2 pt-3">
+          <h3 id="metric-guide-title" className="text-[13px] font-black text-slate-200">指标说明</h3>
+          <div className={cn(metricGuideGridClass, 'mt-2 text-[10px] leading-4 text-slate-500')}>
+            <span>指标</span>
+            <span>单位</span>
+            <span>参考范围</span>
+            <span>衡量内容</span>
+          </div>
+        </div>
+        <div className="border-t border-cyan-300/10">
+          {rows.map((row) => (
+            <div key={row.key} className={cn(metricGuideGridClass, 'border-b border-cyan-300/8 px-3 py-2.5 text-[11px] leading-5 last:border-b-0')}>
+              <span className="min-w-0 break-words font-bold text-slate-300">{row.name}</span>
+              <span className="whitespace-nowrap text-slate-400">{row.unit}</span>
+              <span className="min-w-0 break-words text-slate-400">{row.range}</span>
+              <span className="min-w-0 break-words text-slate-400">{row.description}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
   )
 }
 
@@ -1704,7 +1835,7 @@ function QualityMetric({ label, value, tag, tone, onClick, title }: { label: str
   )
 }
 
-type LossDisplayKey = 'Lid' | 'Lsem' | 'Lpsy' | 'L2'
+type LossDisplayKey = 'Lid' | 'Lsem' | 'Lpsy' | 'L2' | 'total'
 type LossDefinition = { key: LossDisplayKey; legacyKey?: 'Lfeat'; formula: string; altFormula?: string; label: string; description: string; colorClass: string }
 
 const lossDefinitions: LossDefinition[] = [
@@ -1712,55 +1843,52 @@ const lossDefinitions: LossDefinition[] = [
     key: 'Lid',
     legacyKey: 'Lfeat',
     formula: 'L_{\\mathrm{id}}',
-    label: 'Identity Loss',
-    description: '声音身份损失',
+    label: '声音身份目标',
+    description: '声音身份保护目标',
     colorClass: 'bg-cyan-300',
   },
-  { key: 'Lsem', formula: 'L_{\\mathrm{sem}}', label: 'Semantic Loss', description: '语义损失', colorClass: 'bg-emerald-300' },
-  { key: 'Lpsy', formula: 'L_{\\mathrm{psy}}', label: 'Psychoacoustic Loss', description: '心理声学损失，量级可能较大', colorClass: 'bg-amber-300' },
-  { key: 'L2', formula: 'L_2', altFormula: '\\lVert\\delta\\rVert_2', label: 'L2 Constraint', description: '扰动范数约束', colorClass: 'bg-violet-300' },
+  { key: 'Lsem', formula: 'L_{\\mathrm{sem}}', label: '语义保护目标', description: '语义链路保护目标', colorClass: 'bg-emerald-300' },
+  { key: 'Lpsy', formula: 'L_{\\mathrm{psy}}', label: '心理声学目标', description: '心理声学保真目标', colorClass: 'bg-amber-300' },
+  { key: 'L2', formula: 'L_2', altFormula: '\\lVert\\delta\\rVert_2', label: '扰动能量约束', description: '扰动范数约束', colorClass: 'bg-violet-300' },
+  { key: 'total', formula: 'L_{\\mathrm{total}}', label: '总优化目标', description: '加权总损失', colorClass: 'bg-rose-300' },
 ]
 
 function TrendPanel({ result, embedded }: { result: TaskResult; embedded?: boolean }) {
   const trend = downsampleTrace(result.optimizationTrace ?? result.generation?.optimizationTrace ?? result.charts.optimizationTrend)
   const lossFinal = result.lossFinal ?? result.generation?.lossFinal ?? finalLossFromTrend(trend)
   const missingLosses = lossDefinitions.filter((loss) => trend.length > 0 && trend.every((point) => lossPointValue(point, loss) === null))
-  const steps = result.generation?.steps ?? lastStep(trend)
-  const avgIterationSec = optionalNumber(result.averageStepSec) ?? averageStepSecFromTrace(trend) ?? (typeof result.elapsedSec === 'number' && steps && steps > 0 ? result.elapsedSec / steps : null)
+  const totalIterationSteps = lastStep(trend) ?? optionalNumber(result.generation?.steps) ?? optionalNumber(result.generation?.maxSteps)
+  const avgIterationSec = optionalNumber(result.averageStepSec) ?? averageStepSecFromTrace(trend) ?? (typeof result.elapsedSec === 'number' && totalIterationSteps && totalIterationSteps > 0 ? result.elapsedSec / totalIterationSteps : null)
 
   return (
-    <section className={cn('flex h-full min-h-[380px] flex-col overflow-hidden', embedded ? 'rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-5' : 'ui-card p-7')}>
-      <div className="flex items-start justify-between gap-8">
-        <SectionTitle>优化损失趋势</SectionTitle>
-        <div className="shrink-0 rounded-[7px] border border-cyan-300/12 bg-slate-950/20 px-6 py-3.5 text-right">
-          <p className="text-[10px] text-slate-500">平均每次迭代耗时</p>
-          <p className="text-[15px] font-black text-cyan-200">{avgIterationSec === null ? '未生成' : `${avgIterationSec.toFixed(3)} s / step`}</p>
-        </div>
-      </div>
-      <div className="mt-7 grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_280px] gap-6 max-lg:grid-cols-1">
-        <div className="flex min-h-0 flex-col rounded-[7px] border border-cyan-300/12 bg-slate-950/18 p-6">
-          <div className="mb-5 flex flex-wrap items-center gap-x-8 gap-y-2 text-[11px] text-slate-400">
-            {lossDefinitions.map((loss) => (
-              <span key={loss.key} className="inline-flex items-center gap-1.5">
-                <span className={cn('h-2.5 w-2.5 rounded-full', loss.colorClass)} />
-                <MathText formula={loss.formula} />
-                {loss.altFormula ? <MathText formula={loss.altFormula} /> : null}
-              </span>
-            ))}
+    <section className={cn('flex min-h-0 flex-col overflow-hidden', embedded ? 'rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-5' : 'ui-card p-7')}>
+      <SectionTitle>优化损失趋势</SectionTitle>
+      <div className="mt-7 grid min-h-0 grid-cols-[minmax(0,1fr)_280px] gap-6 max-lg:grid-cols-1">
+        <div className="relative min-h-0 max-lg:static">
+          <div className="absolute inset-0 flex min-h-0 flex-col overflow-hidden rounded-[7px] border border-cyan-300/12 bg-slate-950/18 p-5 max-lg:static max-lg:min-h-[560px]">
+            <div className="mb-4 flex flex-wrap items-center gap-x-8 gap-y-2 text-[11px] text-slate-400">
+              {lossDefinitions.map((loss) => (
+                <span key={loss.key} className="inline-flex items-center gap-1.5">
+                  <span className={cn('h-2.5 w-2.5 rounded-full', loss.colorClass)} />
+                  <MathText formula={loss.formula} />
+                  {loss.altFormula ? <MathText formula={loss.altFormula} /> : null}
+                </span>
+              ))}
+            </div>
+            {trend.length > 0 ? (
+              <div className="min-h-0 flex-1 overflow-hidden">
+                <TrendChart data={trend} />
+              </div>
+            ) : (
+              <div className="grid min-h-[210px] flex-1 place-items-center rounded-[6px] border border-dashed border-cyan-300/14 bg-slate-950/16 px-5 text-center text-[12px] leading-5 text-slate-400">
+                后端未记录逐步优化损失，当前仅可在详细数据中查看最终 loss。
+              </div>
+            )}
           </div>
-          {trend.length > 0 ? (
-            <div className="min-h-0 flex-1">
-              <TrendChart data={trend} />
-            </div>
-          ) : (
-            <div className="grid min-h-[210px] flex-1 place-items-center rounded-[6px] border border-dashed border-cyan-300/14 bg-slate-950/16 px-5 text-center text-[12px] leading-5 text-slate-400">
-              后端未记录逐步优化损失，当前仅可在详细数据中查看最终 loss。
-            </div>
-          )}
         </div>
-        <div className="grid content-start gap-4 overflow-y-auto pr-1">
+        <div className="grid content-start gap-5 pr-1">
           {lossDefinitions.map((loss) => (
-            <div key={loss.key} className="rounded-[7px] border border-cyan-300/12 bg-slate-950/18 px-5 py-4">
+            <div key={loss.key} className="rounded-[7px] border border-cyan-300/12 bg-slate-950/18 px-5 py-5">
               <div className="flex items-center justify-between gap-3">
                 <p className="flex items-center gap-2 text-[12px] font-bold text-slate-200">
                   <MathText formula={loss.formula} className="text-cyan-100" />
@@ -1772,10 +1900,14 @@ function TrendPanel({ result, embedded }: { result: TaskResult; embedded?: boole
               <p className="mt-1 text-[10px] text-slate-500">{loss.description}</p>
             </div>
           ))}
-          <div className="rounded-[7px] border border-cyan-300/12 bg-slate-950/18 px-5 py-4">
-            <div className="flex items-center justify-between gap-3">
-              <p className="text-[12px] font-bold text-slate-300">total loss</p>
-              <p className="text-[13px] font-black text-white">{formatLossNumber(lossFinal?.total)}</p>
+          <div className="rounded-[7px] border border-cyan-300/12 bg-slate-950/20 px-5 py-5">
+            <div className="flex items-center justify-between gap-4">
+              <p className="text-[11px] font-bold text-slate-400">平均每次迭代耗时</p>
+              <p className="text-[14px] font-black text-cyan-200">{avgIterationSec === null ? '未生成' : `${avgIterationSec.toFixed(3)} s / step`}</p>
+            </div>
+            <div className="mt-3 flex items-center justify-between gap-4 border-t border-cyan-300/10 pt-3">
+              <p className="text-[11px] font-bold text-slate-400">总共迭代步数</p>
+              <p className="text-[14px] font-black text-white">{totalIterationSteps === null ? '未生成' : `${Math.round(totalIterationSteps)} steps`}</p>
             </div>
           </div>
         </div>
@@ -1793,22 +1925,49 @@ function TrendPanel({ result, embedded }: { result: TaskResult; embedded?: boole
   )
 }
 
-function InsightPanel({ title, items }: { title: string; items: string[] }) {
+function InsightPanel({
+  title,
+  items,
+  fillHeight = false,
+  naturalHeight = false,
+}: {
+  title: string
+  items: string[]
+  fillHeight?: boolean
+  naturalHeight?: boolean
+}) {
   return (
-    <section className="flex h-full min-h-[260px] flex-col overflow-hidden rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-5">
+    <section className={cn('flex flex-col overflow-hidden rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-5', !naturalHeight && 'h-full min-h-[260px]')}>
       <SectionTitle>
         {title} <span className="text-sm font-normal text-slate-500">（自动生成）</span>
       </SectionTitle>
-      <div className="mt-6 grid max-h-[520px] flex-1 grid-cols-1 content-start gap-4 overflow-y-auto rounded-[7px] border border-cyan-300/10 bg-slate-950/12 p-5 pr-2 text-[14px] leading-7 text-slate-200">
+      <div
+        className={cn(
+          'mt-6 grid grid-cols-1 content-start gap-4 rounded-[7px] border border-cyan-300/10 bg-slate-950/12 p-5 text-[14px] leading-7 text-slate-200',
+          !naturalHeight && 'flex-1 overflow-y-auto pr-2',
+          !fillHeight && !naturalHeight && 'max-h-[520px]',
+        )}
+      >
         {items.map((item) => (
           <p key={item} className="flex min-w-0 gap-3">
             <CheckCircle2 className="mt-1.5 h-4 w-4 shrink-0 text-emerald-300" />
-            <span>{item}</span>
+            <RichMathText text={item} />
           </p>
         ))}
       </div>
-      <p className="mt-2 text-right text-[11px] text-slate-500">以上分析仅基于前端可见字段，不调用后端 AI。</p>
     </section>
+  )
+}
+
+function RichMathText({ text }: { text: string }) {
+  const parts = text.split(/(\\\(.+?\\\))/g).filter(Boolean)
+  return (
+    <span>
+      {parts.map((part, index) => {
+        const match = /^\\\((.+)\\\)$/.exec(part)
+        return match ? <MathText key={`${part}-${index}`} formula={match[1]} className="mx-0.5 align-[-1px]" /> : <span key={`${part}-${index}`}>{part}</span>
+      })}
+    </span>
   )
 }
 
@@ -2052,138 +2211,193 @@ function averageStepSecFromTrace(trace: LossTrendPoint[]) {
   return values.reduce((sum, value) => sum + value, 0) / values.length
 }
 
-function mean(values: number[]) {
-  if (values.length === 0) return null
-  return values.reduce((sum, value) => sum + value, 0) / values.length
+function lossTrendText(key: LossDisplayKey, direction: TrendDirection) {
+  if (direction === 'insufficient') return '当前优化记录较少，暂不判断该曲线的整体趋势。'
+  const messages = {
+    Lid: {
+      up: '由图所示，\\(L_{\\mathrm{id}}\\) 整体呈上升趋势，当前声音身份保护效果较弱。若更重视声音身份保护，可适当提高 \\(\\lambda_{\\mathrm{id}}\\)。',
+      down: '由图所示，\\(L_{\\mathrm{id}}\\) 整体呈下降趋势，声音身份保护目标正在稳定优化。',
+      stable: '由图所示，\\(L_{\\mathrm{id}}\\) 整体保持稳定，声音身份保护过程较为平稳。',
+    },
+    Lsem: {
+      up: '由图所示，\\(L_{\\mathrm{sem}}\\) 整体呈上升趋势，当前语义链路保护效果较弱。若更重视语义保护，可适当提高 \\(\\lambda_{\\mathrm{sem}}\\)。',
+      down: '由图所示，\\(L_{\\mathrm{sem}}\\) 整体呈下降趋势，语义链路保护目标正在稳定优化。',
+      stable: '由图所示，\\(L_{\\mathrm{sem}}\\) 整体保持稳定，语义链路保护过程较为平稳。',
+    },
+    Lpsy: {
+      up: '由图所示，\\(L_{\\mathrm{psy}}\\) 整体呈上升趋势，这一般为正常现象。',
+      down: '由图所示，\\(L_{\\mathrm{psy}}\\) 整体呈下降趋势，扰动与心理声学掩蔽范围的匹配正在改善。',
+      stable: '由图所示，\\(L_{\\mathrm{psy}}\\) 整体保持稳定，心理声学保真过程较为平稳。',
+    },
+    L2: {
+      up: '由图所示，\\(L_2\\) 整体呈上升趋势，这一般为正常现象。',
+      down: '由图所示，\\(L_2\\) 整体呈下降趋势，扰动能量正在得到有效约束。',
+      stable: '由图所示，\\(L_2\\) 整体保持稳定，扰动能量控制较为平稳。',
+    },
+    total: {
+      up: '\\(L_{\\mathrm{total}}\\) 整体呈上升趋势，当前优化收敛效果较弱。若更重视收敛稳定性，可适当增加优化步数。',
+      down: '\\(L_{\\mathrm{total}}\\) 整体呈下降趋势，优化过程正在稳定收敛。',
+      stable: '\\(L_{\\mathrm{total}}\\) 整体保持稳定，优化过程已进入平稳阶段。',
+    },
+  } as const
+  return messages[key][direction]
 }
 
-function traceMetricValue(point: LossTrendPoint, key: LossDisplayKey | 'total') {
-  if (key === 'Lid') return optionalNumber(point.Lid) ?? optionalNumber(point.Lfeat)
-  return optionalNumber(point[key])
+type ProtectionEvaluationContext = {
+  linkedTaskStatus?: TaskStatusResponse
+  asrEval?: AsrEval | null
+  cloneEval?: CloneEval | null
 }
 
-function trendDirection(points: LossTrendPoint[] | null | undefined, key: LossDisplayKey | 'total'): 'increasing' | 'decreasing' | 'stable' | 'unknown' {
-  const values = (points ?? []).map((point) => traceMetricValue(point, key)).filter((value): value is number => value !== null)
-  if (values.length < 5) return 'unknown'
-  const segmentSize = Math.max(1, Math.floor(values.length * 0.2))
-  const startMean = mean(values.slice(0, segmentSize))
-  const endMean = mean(values.slice(-segmentSize))
-  if (startMean === null || endMean === null) return 'unknown'
-  const relative = (endMean - startMean) / Math.max(Math.abs(startMean), 1e-8)
-  if (relative > 0.1) return 'increasing'
-  if (relative < -0.1) return 'decreasing'
-  return 'stable'
+function linkedAsrTuningAdvice({ linkedTaskStatus, asrEval }: ProtectionEvaluationContext) {
+  const task = linkedTaskStatus?.asrTask
+  const status = task?.status ?? (linkedTaskStatus?.stage === 'asr_eval' ? linkedTaskStatus.status : undefined)
+  const linkedResult = task?.asrResult ?? linkedTaskStatus?.asrResult
+  const evaluation = linkedResult?.asr ?? asrEval
+  const hasTask = Boolean(task || linkedResult || evaluation)
+
+  if (!hasTask) {
+    return '调参建议（ASR 联动）：暂未生成对应 ASR 任务，请先点击右上角“ASR 测试”完成识别评估。'
+  }
+  if (status === 'queued' || status === 'running') {
+    return '调参建议（ASR 联动）：对应 ASR 任务正在执行，完成后将根据 WER/CER 自动判断是否需要提高 \\(\\lambda_{\\mathrm{sem}}\\)。'
+  }
+  if (status === 'failed' || status === 'error') {
+    return '调参建议（ASR 联动）：对应 ASR 任务执行失败，请先重新运行 ASR 测试，再根据真实 WER/CER 调整语义权重。'
+  }
+  if (status === 'cancelled') {
+    return '调参建议（ASR 联动）：对应 ASR 任务已取消，请先重新运行 ASR 测试。'
+  }
+  if (!evaluation || ['unavailable', 'failed', 'error'].includes(String(evaluation.status ?? ''))) {
+    return '调参建议（ASR 联动）：对应 ASR 任务暂未返回可用评估结果，请检查 ASR 模型后重试。'
+  }
+
+  const level =
+    evaluation.metricLevel === 'word' || evaluation.metricLevel === 'char'
+      ? evaluation.metricLevel
+      : chooseEditLevel(evaluation.referenceText ?? evaluation.originalText ?? '', evaluation.protectedText ?? '')
+  const wer = optionalNumber(evaluation.wer)
+  const cer = optionalNumber(evaluation.cer)
+  const metric = level === 'char' ? cer ?? wer : wer ?? cer
+  const metricName = level === 'char' && cer !== null ? 'CER' : wer !== null ? 'WER' : 'CER'
+  if (metric === null) {
+    return '调参建议（ASR 联动）：对应 ASR 任务已完成，但未返回可用 WER/CER，暂不据此调整 \\(\\lambda_{\\mathrm{sem}}\\)。'
+  }
+
+  const metricText = formatRatioPercent(metric)
+  if (metric < asrWeakDisruptionThreshold) {
+    return `调参建议（ASR 联动）：保护后 ${metricName} 为 ${metricText}，低于 20%，语义干扰较弱；建议提高 \\(\\lambda_{\\mathrm{sem}}\\) 后重新保护并复测。`
+  }
+  if (metric < asrStrongDisruptionThreshold) {
+    return `调参建议（ASR 联动）：保护后 ${metricName} 为 ${metricText}，处于 20%–50% 的中等干扰区间；若优先阻断语义链路，可小幅提高 \\(\\lambda_{\\mathrm{sem}}\\)。`
+  }
+  return `调参建议（ASR 联动）：保护后 ${metricName} 为 ${metricText}，已达到不低于 50% 的强干扰参考区间，当前可保持 \\(\\lambda_{\\mathrm{sem}}\\)。`
 }
 
-function lossChanged(points: LossTrendPoint[], key: LossDisplayKey | 'total') {
-  const direction = trendDirection(points, key)
-  return direction === 'increasing' || direction === 'decreasing'
+function linkedCloneTuningAdvice({ linkedTaskStatus, cloneEval }: ProtectionEvaluationContext) {
+  const task = linkedTaskStatus?.cloneTask
+  const status = task?.status ?? (linkedTaskStatus?.stage === 'downstream_tts_eval' ? linkedTaskStatus.status : undefined)
+  const linkedResult = task?.cloneResult ?? linkedTaskStatus?.cloneResult
+  const evaluation = linkedResult?.cloneEval ?? cloneResultToEval(linkedResult ?? undefined) ?? cloneEval
+  const hasTask = Boolean(task || linkedResult || evaluation)
+
+  if (!hasTask) {
+    return '调参建议（克隆联动）：暂未生成对应克隆任务，请先点击右上角“语音克隆测试”完成声音身份评估。'
+  }
+  if (status === 'queued' || status === 'running') {
+    return '调参建议（克隆联动）：对应克隆任务正在执行，完成后将根据保护后声纹相似度自动判断是否需要提高 \\(\\lambda_{\\mathrm{id}}\\)。'
+  }
+  if (status === 'failed' || status === 'error') {
+    return '调参建议（克隆联动）：对应克隆任务执行失败，请先重新运行语音克隆测试，再根据真实声纹相似度调整身份权重。'
+  }
+  if (status === 'cancelled') {
+    return '调参建议（克隆联动）：对应克隆任务已取消，请先重新运行语音克隆测试。'
+  }
+  if (!evaluation || ['unavailable', 'failed', 'error'].includes(String(evaluation.status ?? ''))) {
+    return '调参建议（克隆联动）：对应克隆任务暂未返回可用声音身份评估，请检查克隆或说话人模型后重试。'
+  }
+
+  const originalSimilarity = optionalNumber(evaluation.originalSimilarity)
+  const protectedSimilarity = optionalNumber(evaluation.protectedSimilarity)
+  const similarityDropRate = optionalNumber(evaluation.similarityDropRate)
+  if (protectedSimilarity === null) {
+    return '调参建议（克隆联动）：对应克隆任务已完成，但未返回保护后声纹相似度，暂不据此调整 \\(\\lambda_{\\mathrm{id}}\\)。'
+  }
+
+  const similarityText = protectedSimilarity.toFixed(3)
+  const dropText = similarityDropRate === null ? '' : `，较原始克隆下降 ${formatRatioPercent(similarityDropRate)}`
+  if (originalSimilarity !== null && originalSimilarity < speakerSameIdentityThreshold) {
+    return `调参建议（克隆联动）：原始音频克隆的声纹相似度仅 ${originalSimilarity.toFixed(3)}，已低于 0.25，说明本次克隆基线本身较弱；建议先更换克隆模型或样本复测，暂不据此调整 \\(\\lambda_{\\mathrm{id}}\\)。`
+  }
+  if (protectedSimilarity >= speakerHighSimilarityThreshold) {
+    return `调参建议（克隆联动）：保护后克隆声纹相似度为 ${similarityText}${dropText}，仍不低于 0.50，声音身份残留较高；建议提高 \\(\\lambda_{\\mathrm{id}}\\) 后重新保护并复测。`
+  }
+  if (protectedSimilarity >= speakerSameIdentityThreshold) {
+    return `调参建议（克隆联动）：保护后克隆声纹相似度为 ${similarityText}${dropText}，处于 0.25–0.50，仍高于论文采用的 0.25 同身份判定阈值；建议小幅提高 \\(\\lambda_{\\mathrm{id}}\\)。`
+  }
+  return `调参建议（克隆联动）：保护后克隆声纹相似度为 ${similarityText}${dropText}，已低于 0.25 的低相似度参考阈值，当前可保持 \\(\\lambda_{\\mathrm{id}}\\)。`
 }
 
-function generateProtectionInsights(result: TaskResult) {
+function generateProtectionInsights(result: TaskResult, evaluationContext: ProtectionEvaluationContext = {}) {
   const perturbation = result.perturbation
   const quality = result.protectionQuality ?? result.quality
-  const psycho = result.psychoacoustic
   const trace = result.optimizationTrace ?? result.generation?.optimizationTrace ?? result.charts?.optimizationTrend ?? []
-  const lossFinal = result.lossFinal ?? result.generation?.lossFinal ?? finalLossFromTrend(trace)
   const snr = optionalNumber(perturbation?.snr) ?? optionalNumber(quality?.snr)
   const pesq = optionalNumber(quality?.pesq)
   const stoi = optionalNumber('stoi' in (quality ?? {}) ? (quality as { stoi?: number | null }).stoi : null)
-  const mos = optionalNumber('mos' in (quality ?? {}) ? (quality as { mos?: number | null }).mos : null)
-  const l2Norm = optionalNumber(perturbation?.l2Norm)
-  const epsilonUsageRate = optionalNumber(perturbation?.epsilonUsageRate)
-  const clippingRate = optionalNumber(perturbation?.clippingRate)
-  const overMaskRate = optionalNumber(psycho?.overMaskRate)
-  const lPsy = optionalNumber(psycho?.lPsy) ?? optionalNumber(lossFinal?.Lpsy)
-  const lid = optionalNumber(lossFinal?.Lid) ?? optionalNumber(lossFinal?.Lfeat)
-  const lsem = optionalNumber(lossFinal?.Lsem)
-  const l2 = optionalNumber(lossFinal?.L2)
-  const total = optionalNumber(lossFinal?.total)
-  const lPsyTrend = trendDirection(trace, 'Lpsy')
-  const lidTrend = trendDirection(trace, 'Lid')
-  const l2Trend = trendDirection(trace, 'L2')
+  const epsilonUsageRate = optionalNumber(perturbation?.epsilonUsageRate) ?? computeEpsilonUsageRate(perturbation)
+  const trends = {
+    Lid: analyzeLossTrend(trace, 'Lid'),
+    Lsem: analyzeLossTrend(trace, 'Lsem'),
+    Lpsy: analyzeLossTrend(trace, 'Lpsy'),
+    L2: analyzeLossTrend(trace, 'L2'),
+    total: analyzeLossTrend(trace, 'total'),
+  }
   const items: string[] = []
-  const missing: string[] = []
 
-  if (l2Norm !== null) {
-    const budget = epsilonUsageRate === null ? '' : `扰动预算使用率为 ${formatRatioPercent(epsilonUsageRate, { clampToUnit: true })}。`
-    let comment = ''
-    if (epsilonUsageRate !== null && epsilonUsageRate <= 0.3) comment = '当前扰动预算使用较低，说明仍有提升防护强度的空间。'
-    else if (epsilonUsageRate !== null && epsilonUsageRate <= 0.8) comment = '当前扰动预算使用适中，防护强度与可听性处于相对平衡状态。'
-    else if (epsilonUsageRate !== null) comment = '当前扰动预算使用较高，若听感下降明显，建议降低扰动预算或提高心理声学约束权重。'
-    items.push(`指标概览：本次保护扰动 L2 范数为 ${formatMetricValue(l2Norm, 'loss')}，表示保护音频相对原始音频的总体扰动能量。${budget}${comment}`)
+  if (epsilonUsageRate === null) {
+    items.push('指标概览：扰动预算使用率尚未完成评估。')
   } else {
-    missing.push('扰动 L2 范数')
+    const usage = formatRatioPercent(epsilonUsageRate, { clampToUnit: true })
+    const strength = epsilonUsageRate < 0.7 ? '保护强度较为保守' : epsilonUsageRate < 0.9 ? '保护强度处于中等水平' : '当前保护强度较高'
+    items.push(`指标概览：本次保护的扰动预算使用率为 ${usage}，${strength}。`)
   }
 
+  const qualityNotes: string[] = []
   if (snr !== null) {
-    let snrText = 'SNR 处于中等水平，说明扰动已经较明显，但仍可能保持基本听感。'
-    if (snr >= 20) snrText = 'SNR 较高，扰动相对较弱，保护音频通常具有较好的可听性。'
-    else if (snr < 12) snrText = 'SNR 偏低，说明扰动较强，可能影响正常听感；若目标是高保真保护，可降低 λid / λsem 或提高 λpsy。'
-    items.push(`听感质量：${snrText}`)
-  } else {
-    missing.push('SNR')
+    const level = snr >= 25 ? '整体听感质量良好' : snr >= 18 ? '整体听感质量中等' : '当前噪声较明显，听感质量较弱'
+    qualityNotes.push(`SNR 为 ${snr.toFixed(2)} dB，${level}。`)
   }
-
-  if (pesq !== null || stoi !== null || mos !== null) {
-    const qualityNotes: string[] = []
-    if (pesq !== null) qualityNotes.push(pesq >= 3 ? 'PESQ 较高，客观感知质量较好。' : pesq >= 2 ? 'PESQ 中等，存在一定感知质量下降。' : 'PESQ 偏低，保护扰动可能明显影响语音质量。')
-    if (stoi !== null) qualityNotes.push(stoi >= 0.85 ? 'STOI 较高，语音可懂度保持较好。' : stoi >= 0.65 ? 'STOI 中等，语音可懂度有一定下降。' : 'STOI 偏低，保护音频可能影响正常理解。')
-    if (mos !== null) qualityNotes.push(`人工/估计 MOS 为 ${formatMetricValue(mos, 'number')}，可作为主观听感参考。`)
-    items.push(`听感质量：${qualityNotes.join('')}`)
-  } else {
-    items.push('听感质量：PESQ/STOI 未生成，当前感知质量主要依据 SNR、人工 MOS 或音频试听判断。')
+  if (pesq !== null) {
+    const level = pesq >= 3 ? '语音感知质量良好' : pesq >= 2 ? '语音感知质量中等' : '语音感知质量较弱'
+    qualityNotes.push(`PESQ 为 ${pesq.toFixed(2)}，${level}。`)
   }
-
-  if (overMaskRate !== null || lPsy !== null) {
-    const psychoNotes: string[] = []
-    if (overMaskRate !== null) {
-      psychoNotes.push(overMaskRate <= 0.05 ? '超过听觉掩蔽阈值的频点较少，扰动大多处于较不易察觉区域。' : overMaskRate <= 0.2 ? '部分扰动超过心理声学掩蔽阈值，可能在少量频段产生可察觉噪声。' : '较多扰动超过心理声学掩蔽阈值，高保真性风险较高，建议增大 λpsy 或降低身份/语义攻击权重。')
-    }
-    if (lPsy !== null) psychoNotes.push(`当前 Lpsy 为 ${formatLossNumber(lPsy)}。Lpsy 表示扰动频谱超过 masking threshold 的惩罚项；数值升高通常意味着扰动更容易被听见。`)
-    if (lPsyTrend === 'increasing') psychoNotes.push('Lpsy 在优化过程中呈上升趋势，说明优化正在增强攻击/防护效果的同时牺牲心理声学约束。若希望获得更高保真，可尝试增大 λpsy，或降低 λid / λsem。')
-    else if (lPsyTrend === 'decreasing' || lPsyTrend === 'stable') psychoNotes.push('Lpsy 未明显上升，说明心理声学约束相对稳定。')
-    items.push(`心理声学：${psychoNotes.join('')}`)
-  } else {
-    missing.push('心理声学 overMaskRate / Lpsy')
+  if (stoi !== null) {
+    const level = stoi >= 0.9 ? '语音可懂度良好' : stoi >= 0.75 ? '语音可懂度中等' : '语音可懂度较弱'
+    qualityNotes.push(`STOI 为 ${stoi.toFixed(3)}，${level}。`)
   }
-
-  const lossNotes: string[] = []
-  if (lid !== null) lossNotes.push(`Lid 为 ${formatLossNumber(lid)}，表示声音身份特征链路的损失。Lid 的方向需要结合后端 loss 定义解释；当前页面只展示数值趋势，不把单独的 Lid 大小作为最终防护结论。`)
-  if (lidTrend === 'increasing') lossNotes.push('Lid 上升可能表示声音身份表示被进一步拉开，通常有利于身份防护，但可能增加可听扰动。')
-  if (lidTrend === 'decreasing') lossNotes.push('Lid 下降表示优化器正在降低当前定义下的身份目标损失；若该损失是相似度型 loss，应确认后端是否采用了最小化相似度或最大化距离的等价形式。')
-  if (lsem !== null) lossNotes.push(`Lsem 为 ${formatLossNumber(lsem)}，表示语义编码器表示层面的扰动目标。Lsem 变化越明显，通常说明保护音频在语义表示空间中与原始音频差异越大，但具体方向取决于后端 loss 定义。`)
-  if (lsem !== null && (Math.abs(lsem) > 1 || lossChanged(trace, 'Lsem'))) lossNotes.push('Lsem 较高或变化明显，说明保护过程对 ASR / tokenizer 语义链路施加了较强影响；若保护音频听感下降，可降低 λsem 或提高 λpsy。')
-  items.push(`身份/语义 loss：${lossNotes.length ? lossNotes.join('') : '后端未返回 Lid/Lsem，当前无法解释身份与语义目标的优化状态。'}`)
-
-  const convergenceNotes: string[] = []
-  if (l2 !== null) convergenceNotes.push(`L2 为 ${formatLossNumber(l2)}，反映扰动总体能量。L2 持续上升通常意味着保护强度增强，但也可能带来听感下降。`)
-  if (total !== null) convergenceNotes.push(`total loss 为 ${formatLossNumber(total)}，是 Lid、Lsem、Lpsy 和 L2 的加权组合，主要用于观察优化过程是否收敛，不应直接等同于最终防护效果。`)
-  if (trace.length === 0) convergenceNotes.push('后端未返回逐步 optimizationTrace，因此无法判断各 loss 的收敛趋势，只能展示最终指标。')
-  items.push(`优化收敛：${convergenceNotes.length ? convergenceNotes.join('') : '后端返回的 loss 信息不足，暂不判断优化收敛状态。'}`)
+  items.push(`听感质量：${qualityNotes.length ? qualityNotes.join('') : '该指标尚未完成评估。'}`)
+  items.push(`心理声学保真：${lossTrendText('Lpsy', trends.Lpsy.direction)}`)
+  items.push(`身份保护：${lossTrendText('Lid', trends.Lid.direction)}`)
+  items.push(`语义保护：${lossTrendText('Lsem', trends.Lsem.direction)}`)
+  items.push(`扰动能量：${lossTrendText('L2', trends.L2.direction)}`)
+  items.push(`优化收敛：${lossTrendText('total', trends.total.direction)}`)
 
   const tuning: string[] = []
-  if ((snr !== null && snr < 12) || (pesq !== null && pesq < 2) || (stoi !== null && stoi < 0.65) || (overMaskRate !== null && overMaskRate > 0.2)) {
-    tuning.push('建议高保真调参：增大 λpsy，适当降低 λid / λsem，或减少迭代步数与扰动预算。')
+  if (trends.Lid.direction === 'up' && trends.Lsem.direction === 'up') {
+    tuning.push('由图所示，身份保护与语义保护曲线整体呈上升趋势。若需要强化对应保护，可适当提高 \\(\\lambda_{\\mathrm{id}}\\) 与 \\(\\lambda_{\\mathrm{sem}}\\)。')
+  } else {
+    if (trends.Lid.direction === 'up') tuning.push('可适当提高 \\(\\lambda_{\\mathrm{id}}\\) 强化声音身份保护。')
+    if (trends.Lsem.direction === 'up') tuning.push('可适当提高 \\(\\lambda_{\\mathrm{sem}}\\) 强化语义保护。')
   }
-  if (epsilonUsageRate !== null && epsilonUsageRate < 0.3 && snr !== null && snr > 20) {
-    tuning.push('建议增强防护调参：当前扰动较保守，可适当增大扰动预算、增加迭代步数，或提高 λid / λsem。')
-  }
-  if (lPsyTrend === 'increasing') tuning.push('建议优先提高 λpsy，使优化器更重视心理声学掩蔽约束。')
-  if (l2Trend === 'increasing' && ((pesq !== null && pesq < 2) || (stoi !== null && stoi < 0.65) || (snr !== null && snr < 12))) {
-    tuning.push('建议提高 λ2 或降低扰动预算，限制整体扰动能量。')
-  }
-  if (clippingRate !== null && clippingRate > 0.01) tuning.push('注意：检测到一定比例削波，可降低扰动预算或增加约束以减少失真。')
-  items.push(`调参建议：${tuning.length ? tuning.join('') : '当前未触发强风险阈值，可优先结合试听和下游 ASR/克隆评测结果微调 λid、λsem 与 λpsy。'}`)
-
-  if (!psycho?.maskingThreshold?.length || !psycho?.perturbationSpectrum?.length) {
-    missing.push('完整心理声学曲线')
-  }
-  if (trace.length === 0) missing.push('optimizationTrace')
-  if (missing.length > 0) items.push(`缺失指标：后端未返回 ${Array.from(new Set(missing)).join('、')}，相关结论会更保守。`)
-
-  while (items.length < 6) items.push('缺失指标：当前保护结果字段仍不完整，建议结合音频试听、ASR 测试和克隆测试共同判断防护效果。')
-  return items.slice(0, 10)
+  if (trends.Lpsy.direction === 'up') tuning.push('可适当提高 \\(\\lambda_{\\mathrm{psy}}\\) 强化听感保真。')
+  if (trends.L2.direction === 'up') tuning.push('可适当提高 \\(\\lambda_2\\) 约束扰动能量。')
+  if (trends.total.direction === 'up') tuning.push('可适当增加优化步数改善收敛稳定性。')
+  if (snr !== null && snr < 18) tuning.push('若优先提升听感，可适当降低扰动预算。')
+  items.push(`调参建议：${tuning.length ? tuning.join('') : '当前曲线运行平稳，保持现有参数即可。'}`)
+  items.push(linkedAsrTuningAdvice(evaluationContext))
+  items.push(linkedCloneTuningAdvice(evaluationContext))
+  return items
 }
 
 function generateAsrInsights(asrEval: AsrEval, editStats: EditMetrics | null, result: TaskResult) {
@@ -2202,7 +2416,7 @@ function generateAsrInsights(asrEval: AsrEval, editStats: EditMetrics | null, re
   if (semanticDrift !== null && semanticSourceKey === 'mfcc_proxy') {
     items.push(`MFCC 代理漂移${semanticDrift >= 0.2 ? '较大' : '较小'}，仅反映声学特征变化。`)
   } else if ((semanticDrift ?? 0) >= 0.2 && semanticSource === 'SemanticEncoderEnsemble') {
-    items.push('后端返回的 semanticDrift 较高，语义 encoder 表示发生偏移。')
+    items.push(`语义漂移为 ${semanticDrift?.toFixed(3)}，语义 encoder 表示发生偏移。`)
   }
   if (items.length === 0) items.push('ASR 指标不足或变化较小，当前仅展示后端返回值与文本级 diff，不推断 token 或语义指标。')
   return items

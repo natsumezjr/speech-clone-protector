@@ -23,6 +23,7 @@ export interface ApiClient {
   getCapabilities(): Promise<CapabilitiesResponse>
   uploadFile(file: File): Promise<AudioFileMeta>
   createProtectionTask(payload: ProtectionTaskRequest): Promise<ProtectionTaskCreated>
+  retryProtectionTask(taskId: string): Promise<ProtectionTaskCreated>
   getTaskStatus(taskId: string): Promise<TaskStatusResponse>
   getTaskResult(taskId: string): Promise<TaskResult>
   getPsychoacousticSlice(taskId: string, params: { mode: PsychoacousticSliceMode; timeSec?: number }): Promise<PsychoacousticSliceResponse>

@@ -604,45 +604,50 @@ def compute_loss_summary(
                 if point is not None:
                     trace.append(point)
     step_times = [float(item["stepElapsedSec"]) for item in trace if item.get("stepElapsedSec") is not None]
-    average_step_sec = float(np.mean(step_times)) if step_times else None
-    loss_final = trace[-1] if trace else None
+    average_step_sec = float(np.mean(step_times)) if step_times else finite_float(protection_details.get("average_step_sec"))
+    selected_step = finite_float(protection_details.get("selected_step", protection_details.get("selectedStep")))
+    selected_index = int(selected_step) - 1 if selected_step is not None else None
+    if trace and selected_index is not None and 0 <= selected_index < len(trace):
+        loss_final = trace[selected_index]
+    else:
+        loss_final = trace[-1] if trace else None
     source_status = "available" if trace else "unavailable"
     sources = {
         "lossFinal.*": metric_source(
             source_status,
-            protection_details.get("source") or "SemanticE2EVGuard.protect",
+            protection_details.get("source") or "VoiceSheild.protect",
             reason=None if trace else "Protection backend did not return an optimization trace",
-            formula="lossFinal=optimizationTrace[-1]",
+            formula="lossFinal=optimizationTrace[selectedStep-1] when selectedStep is available, otherwise optimizationTrace[-1]",
         ),
         "optimizationTrace": metric_source(
             source_status,
-            protection_details.get("source") or "SemanticE2EVGuard.protect",
+            protection_details.get("source") or "VoiceSheild.protect",
             reason=None if trace else "Protection backend did not return per-step loss records",
             formula="normalized backend trace; total=lambdaId*Lid+lambdaSem*Lsem+lambdaPsy*Lpsy+lambda2*L2 when total is absent",
         ),
         "lossFinal.Lid": metric_source(
             source_status,
-            protection_details.get("source") or "SemanticE2EVGuard.protect",
+            protection_details.get("source") or "VoiceSheild.protect",
             reason=None if trace else "Protection backend did not return an optimization trace",
             formula="L_{\\mathrm{id}}",
-            metric="Identity loss from SemanticE2EVGuard optimization trace.",
+            metric="Identity loss from VoiceSheild optimization trace.",
         ),
         "optimizationTrace.Lid": metric_source(
             source_status,
-            protection_details.get("source") or "SemanticE2EVGuard.protect",
+            protection_details.get("source") or "VoiceSheild.protect",
             reason=None if trace else "Protection backend did not return per-step loss records",
             formula="L_{\\mathrm{id}}",
-            metric="Identity loss from SemanticE2EVGuard optimization trace.",
+            metric="Identity loss from VoiceSheild optimization trace.",
         ),
         "lossFinal.Lfeat": metric_source(
             source_status,
-            protection_details.get("source") or "SemanticE2EVGuard.protect",
+            protection_details.get("source") or "VoiceSheild.protect",
             reason="Deprecated legacy alias of Lid.",
             formula="Lfeat := Lid",
         ),
         "optimizationTrace.Lfeat": metric_source(
             source_status,
-            protection_details.get("source") or "SemanticE2EVGuard.protect",
+            protection_details.get("source") or "VoiceSheild.protect",
             reason="Deprecated legacy alias of Lid.",
             formula="Lfeat := Lid",
         ),
@@ -658,6 +663,7 @@ def compute_loss_summary(
         "lossWeights": weights,
         "optimizationTrace": trace,
         "averageStepSec": average_step_sec,
+        "selectedStep": int(selected_step) if selected_step is not None else None,
         "_metricSources": sources,
     }
 
@@ -1482,7 +1488,7 @@ def compute_overall_score(result: dict[str, Any]) -> dict[str, Any]:
     elif score >= 50:
         verdict = "部分防护"
     else:
-        verdict = "防护不足"
+        verdict = "防护完毕"
     source = metric_source(
         "available" if score is not None else "unavailable",
         "weighted_available_mean",

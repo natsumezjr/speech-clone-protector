@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 import numpy as np
 
+from audio_preprocess import AudioPreprocessError, audio_preprocess_capabilities, preprocess_audio
 from metric_definitions import (
     align_audio_pair,
     compute_asr_metrics,
@@ -173,14 +174,23 @@ def _env_list(name: str, default: list[str]) -> list[str]:
     return values or default
 
 
-FORMAL_EPSILON = 8 / 255
-FORMAL_STEPS = 50
-FORMAL_WEIGHT_FEATURE = 500.0
-FORMAL_WEIGHT_SEMANTIC = 100.0
-FORMAL_WEIGHT_PSY = 1.0e-5
+FORMAL_EPSILON = 4 / 255
+FORMAL_STEPS = 100
+FORMAL_WEIGHT_FEATURE = 150.0
+FORMAL_WEIGHT_SEMANTIC = 300.0
+FORMAL_WEIGHT_PSY = 0.001
 FORMAL_WEIGHT_L2 = 0.1
+FIXED_WEIGHT_STFT = 150.0
+FIXED_WEIGHT_SNR = 20.0
+FIXED_TARGET_SNR_DB = 25.0
+FIXED_SELECTION_SNR_DB = 25.0
+FIXED_STEP_SIZE = 0.00012
+FIXED_INIT_NOISE = "zero"
+FIXED_L2_REDUCTION = "rms"
+FIXED_MIN_LR = 1.0e-6
+FORMAL_PRESET_NAME = "lq25_large_balanced"
 FORMAL_SEMANTIC_ENCODERS = ["S3", "HuBERT", "Whisper", "MFCC"]
-FORMAL_TIMBRE_ENCODERS = ["VITS", "GPT-SoVITS", "MFCC", "WavLM", "CosyVoice", "StyleTTS2"]
+FORMAL_TIMBRE_ENCODERS = ["VITS", "GPT-SoVITS", "MFCC", "WavLM", "CosyVoice"]
 FORMAL_ASR_MODEL = "openai/whisper-small"
 FORMAL_TTS_BACKEND = "tts_models/multilingual/multi-dataset/xtts_v2"
 SUPPORTED_TTS_MODELS = [
@@ -216,6 +226,26 @@ SUPPORTED_TTS_MODELS = [
 
 def _tts_cache_dir() -> Path:
     return Path(os.getenv("TTS_HOME", str(PROJECT_TTS_CACHE_DIR)))
+
+
+def _hf_snapshot_path(repo_id: str, project_path: Path | None = None) -> tuple[Path | None, str | None]:
+    candidates = [project_path] if project_path is not None else []
+    for candidate in candidates:
+        if candidate is not None and _model_directory_ready(candidate):
+            return candidate, None
+    try:
+        from huggingface_hub import snapshot_download
+
+        return Path(snapshot_download(repo_id=repo_id, local_files_only=True)), None
+    except Exception as exc:
+        return None, f"local Hugging Face snapshot unavailable: {repo_id} ({type(exc).__name__}: {exc})"
+
+
+def _model_directory_ready(path: Path | None) -> bool:
+    if path is None or not path.is_dir() or not (path / "config.json").is_file():
+        return False
+    weight_patterns = ("*.safetensors", "*.bin", "*.pt", "*.pth")
+    return any(next(path.glob(pattern), None) is not None for pattern in weight_patterns)
 
 
 def _tts_model_cache_status(cache_name: str) -> tuple[str, str | None, str]:
@@ -282,14 +312,11 @@ def _checkpoint_status() -> dict[str, Any]:
         "GPT-SoVITS": ROOT / "checkpoints" / "GSV" / "base_models" / "gsv-v2final-pretrained" / "s2G2333k.pth",
         "CosyVoiceTokenizer": ROOT / "checkpoints" / "CosyVoice" / "speech_tokenizer_v1.onnx",
         "CosyVoiceCAMPP": ROOT / "checkpoints" / "CosyVoice" / "base_models" / "CosyVoice-300M" / "campplus.onnx",
-        "StyleTTS2Config": ROOT / "checkpoints" / "StyleTTS2" / "base_models" / "config.yml",
-        "StyleTTS2Checkpoint": ROOT / "checkpoints" / "StyleTTS2" / "base_models" / "epochs_2nd_00020.pth",
-        "StyleTTS2ASR": ROOT / "tts_models" / "styletts2" / "Utils" / "ASR" / "epoch_00080.pth",
-        "StyleTTS2JDC": ROOT / "tts_models" / "styletts2" / "Utils" / "JDC" / "bst.t7",
-        "StyleTTS2PLBERT": ROOT / "tts_models" / "styletts2" / "Utils" / "PLBERT" / "step_1000000.t7",
+        "WavLM": ROOT / "checkpoints" / "wavlm" / "pytorch_model.bin",
         "ESpeakNG": ROOT / "vendor" / "espeak-ng" / "libespeak-ng.dll",
         "ESpeakNGData": ROOT / "vendor" / "espeak-ng" / "espeak-ng-data",
         "ASRWhisperSmall": ROOT / "checkpoints" / "asr" / "openai-whisper-small" / "config.json",
+        "ECAPA": ROOT / "checkpoints" / "ecapa" / "embedding_model.ckpt",
     }
     entries = {
         name: {
@@ -300,10 +327,31 @@ def _checkpoint_status() -> dict[str, Any]:
         }
         for name, path in required.items()
     }
+    hf_models = {
+        "HuBERTLargeLL60K": (
+            "facebook/hubert-large-ll60k",
+            ROOT / "checkpoints" / "hf" / "facebook" / "hubert-large-ll60k",
+        ),
+        "WhisperLargeV3": (
+            "openai/whisper-large-v3",
+            ROOT / "checkpoints" / "hf" / "openai" / "whisper-large-v3",
+        ),
+    }
+    for name, (repo_id, project_path) in hf_models.items():
+        found_path, reason = _hf_snapshot_path(repo_id, project_path)
+        ready = _model_directory_ready(found_path)
+        entries[name] = {
+            "path": str(project_path),
+            "foundPath": str(found_path) if found_path is not None else None,
+            "exists": ready,
+            "status": "available" if ready else "unavailable",
+            "reason": None if ready else reason or f"incomplete model directory: {found_path}",
+            "repoId": repo_id,
+        }
     missing = [name for name, item in entries.items() if not item["exists"]]
     return {
         "missing": missing,
-        "required": {name: item["path"] for name, item in entries.items()},
+        "required": {name: item.get("path") for name, item in entries.items()},
         "entries": entries,
     }
 
@@ -330,6 +378,7 @@ def _model_option(label: str, value: str, backend_value: str, branch: str, *, st
 def _profile_defaults(profile: str, *, steps: int, semantic_encoders: list[str], timbre_encoders: list[str]) -> dict[str, Any]:
     return {
         "profile": profile,
+        "presetName": FORMAL_PRESET_NAME,
         "realProtect": True,
         "mode": "standard",
         "targets": ["semantic", "timbre"],
@@ -339,8 +388,8 @@ def _profile_defaults(profile: str, *, steps: int, semantic_encoders: list[str],
             "asrModels": [FORMAL_ASR_MODEL],
             "encoders": semantic_encoders,
             "tokenizerPath": "checkpoints/CosyVoice/speech_tokenizer_v1.onnx",
-            "hubertPath": "facebook/hubert-base-ls960",
-            "whisperPath": "openai/whisper-small",
+            "hubertPath": "facebook/hubert-large-ll60k",
+            "whisperPath": "openai/whisper-large-v3",
             "weightSemantic": FORMAL_WEIGHT_SEMANTIC,
         },
         "timbre": {
@@ -363,12 +412,12 @@ def _profile_defaults(profile: str, *, steps: int, semantic_encoders: list[str],
 
 
 def runtime_config() -> dict[str, Any]:
+    audio_preprocessing = audio_preprocess_capabilities()
     checkpoints = _checkpoint_status()
     vits_status, vits_reason = _component_available(checkpoints, ["VITS"])
     gsv_status, gsv_reason = _component_available(checkpoints, ["GPT-SoVITS"])
     s3_status, s3_reason = _component_available(checkpoints, ["CosyVoiceTokenizer"])
     cosy_status, cosy_reason = _component_available(checkpoints, ["CosyVoiceCAMPP"])
-    style_status, style_reason = _component_available(checkpoints, ["StyleTTS2Config", "StyleTTS2Checkpoint", "StyleTTS2ASR", "StyleTTS2JDC", "StyleTTS2PLBERT", "ESpeakNG", "ESpeakNGData"])
     transformers_available = _module_available("transformers")
     whisper_small_available = transformers_available and bool((checkpoints.get("entries") or {}).get("ASRWhisperSmall", {}).get("exists"))
     whisper_small_reason = None if whisper_small_available else "missing local Whisper Small checkpoint" if transformers_available else "transformers not installed"
@@ -378,8 +427,8 @@ def runtime_config() -> dict[str, Any]:
 
     semantic_options = [
         _model_option("S3 Tokenizer Encoder", "S3", "s3", "semantic", status=s3_status, reason=s3_reason),
-        _model_option("HuBERT", "HuBERT", "hubert", "semantic", status="available" if transformers_available else "unavailable", reason=None if transformers_available else "transformers not installed", defaultPath="facebook/hubert-base-ls960"),
-        _model_option("Whisper Encoder", "Whisper", "whisper", "semantic", status="available" if transformers_available else "unavailable", reason=None if transformers_available else "transformers not installed", defaultPath="openai/whisper-small"),
+        _model_option("HuBERT Large", "HuBERT", "hubert", "semantic", status="available" if transformers_available and "HuBERTLargeLL60K" not in checkpoints["missing"] else "unavailable", reason=None if transformers_available and "HuBERTLargeLL60K" not in checkpoints["missing"] else (checkpoints["entries"]["HuBERTLargeLL60K"].get("reason") if transformers_available else "transformers not installed"), defaultPath="facebook/hubert-large-ll60k"),
+        _model_option("Whisper Large-v3 Encoder", "Whisper", "whisper", "semantic", status="available" if transformers_available and "WhisperLargeV3" not in checkpoints["missing"] else "unavailable", reason=None if transformers_available and "WhisperLargeV3" not in checkpoints["missing"] else (checkpoints["entries"]["WhisperLargeV3"].get("reason") if transformers_available else "transformers not installed"), defaultPath="openai/whisper-large-v3"),
         _model_option("MFCC", "MFCC", "mfcc", "semantic"),
     ]
     timbre_options = [
@@ -388,7 +437,6 @@ def runtime_config() -> dict[str, Any]:
         _model_option("MFCC", "MFCC", "mfcc", "timbre"),
         _model_option("WavLM", "WavLM", "wavlm", "timbre", status="available" if transformers_available else "unavailable", reason=None if transformers_available else "transformers not installed"),
         _model_option("CosyVoice CAM++", "CosyVoice", "cosyvoice", "timbre", status=cosy_status, reason=cosy_reason),
-        _model_option("StyleTTS2 Style Encoder", "StyleTTS2", "style", "timbre", status=style_status, reason=style_reason),
     ]
     asr_options = [
         _model_option("Whisper Small", "openai/whisper-small", str(ROOT / "checkpoints" / "asr" / "openai-whisper-small"), "asr", status="available" if whisper_small_available else "unavailable", reason=whisper_small_reason, backend="transformers", localPath=str(ROOT / "checkpoints" / "asr" / "openai-whisper-small")),
@@ -422,8 +470,8 @@ def runtime_config() -> dict[str, Any]:
 
     formal = _profile_defaults("formal", steps=FORMAL_STEPS, semantic_encoders=FORMAL_SEMANTIC_ENCODERS, timbre_encoders=FORMAL_TIMBRE_ENCODERS)
     fields = {
-        "epsilon": {"label": "扰动强度 ε", "path": "optimization.epsilon", "default": round(FORMAL_EPSILON, 9), "min": 0.001, "max": 0.08, "step": 0.001, "unit": "waveform amplitude", "description": "正式默认值为 8/255。"},
-        "steps": {"label": "优化步数", "path": "optimization.steps", "default": FORMAL_STEPS, "min": 1, "max": 500, "step": 1, "description": "默认 50，最大 500。"},
+        "epsilon": {"label": "扰动强度 ε", "path": "optimization.epsilon", "default": round(FORMAL_EPSILON, 9), "min": 0.001, "max": 0.08, "step": 0.001, "unit": "waveform amplitude", "description": "高保真默认值为 4/255。"},
+        "steps": {"label": "优化步数", "path": "optimization.steps", "default": FORMAL_STEPS, "min": 1, "max": 500, "step": 1, "description": "默认 100，最大 500。"},
         "weightIdentity": {"label": "Identity 权重", "path": "timbre.weightIdentity", "default": FORMAL_WEIGHT_FEATURE, "min": 0, "max": 1000, "step": 1},
         "weightFeature": {"label": "Identity 权重（legacy）", "path": "timbre.weightFeature", "default": FORMAL_WEIGHT_FEATURE, "min": 0, "max": 1000, "step": 1},
         "weightSemantic": {"label": "Semantic 权重", "path": "semantic.weightSemantic", "default": FORMAL_WEIGHT_SEMANTIC, "min": 0, "max": 500, "step": 1},
@@ -471,7 +519,7 @@ def runtime_config() -> dict[str, Any]:
         "defaults": {"formal": formal},
         "activeDefaultProfile": active_profile,
         "profiles": [
-            {"value": "formal", "label": "正式保护", "description": "使用论文/原始后端默认参数，steps=50。"},
+            {"value": "formal", "label": "正式保护", "description": "使用 lq25_large_balanced 高保真默认参数，steps=100。"},
         ],
         "fields": fields,
         "modelOptions": {
@@ -496,6 +544,18 @@ def runtime_config() -> dict[str, Any]:
         "formSchema": form_schema,
         "constraints": {
             "maxAudioSizeBytes": _env_int("SEME2E_API_MAX_AUDIO_SIZE_BYTES", 200 * 1024 * 1024),
+            "audioPreprocessing": audio_preprocessing,
+        },
+        "fixedOptimization": {
+            "weight_stft": FIXED_WEIGHT_STFT,
+            "weight_snr": FIXED_WEIGHT_SNR,
+            "target_snr_db": FIXED_TARGET_SNR_DB,
+            "selection_snr_db": FIXED_SELECTION_SNR_DB,
+            "step_size": FIXED_STEP_SIZE,
+            "init_noise": FIXED_INIT_NOISE,
+            "l2_reduction": FIXED_L2_REDUCTION,
+            "min_lr": FIXED_MIN_LR,
+            "readOnly": True,
         },
         "clone": {
             "defaults": {
@@ -516,7 +576,7 @@ def runtime_config() -> dict[str, Any]:
         ],
         "targets": [
             {"value": "semantic", "label": "语义防护", "description": "干扰识别"},
-            {"value": "timbre", "label": "语音特征防护", "description": "阻断特征"},
+            {"value": "timbre", "label": "声音身份防护", "description": "阻断特征"},
             {"value": "joint", "label": "联合防护", "description": "双重防护"},
         ],
         "modePresets": mode_presets,
@@ -525,6 +585,7 @@ def runtime_config() -> dict[str, Any]:
 
 def diagnose_capabilities() -> dict[str, Any]:
     device = os.getenv("SEME2E_API_DEVICE", "cpu")
+    audio_preprocessing = audio_preprocess_capabilities()
     checkpoints = _checkpoint_status()
     missing = checkpoints["missing"]
     protect_required = [
@@ -532,13 +593,9 @@ def diagnose_capabilities() -> dict[str, Any]:
         "GPT-SoVITS",
         "CosyVoiceTokenizer",
         "CosyVoiceCAMPP",
-        "StyleTTS2Config",
-        "StyleTTS2Checkpoint",
-        "StyleTTS2ASR",
-        "StyleTTS2JDC",
-        "StyleTTS2PLBERT",
-        "ESpeakNG",
-        "ESpeakNGData",
+        "WavLM",
+        "HuBERTLargeLL60K",
+        "WhisperLargeV3",
     ]
     protect_missing = [name for name in missing if name in set(protect_required)]
     whisper_available = _module_available("whisper") or _module_available("transformers")
@@ -556,6 +613,13 @@ def diagnose_capabilities() -> dict[str, Any]:
         "checkpoints": checkpoints,
         "config": runtime_config(),
         "chains": {
+            "audio_preprocessing": {
+                "status": audio_preprocessing["status"],
+                "recordingSupported": audio_preprocessing["recordingSupported"],
+                "reason": audio_preprocessing["reason"],
+                "decoder": audio_preprocessing["decoder"],
+                "output": audio_preprocessing["output"],
+            },
             "protect_generation": {
                 "status": "available" if not protect_missing else "unavailable",
                 "reason": None if not protect_missing else f"missing checkpoints: {', '.join(protect_missing)}",
@@ -587,13 +651,25 @@ def diagnose_capabilities() -> dict[str, Any]:
 
 
 def classify_generation_reason(exc: BaseException | None, output_exists: bool) -> str:
-    checkpoint_missing = _checkpoint_status()["missing"]
+    protect_required = {
+        "VITS",
+        "GPT-SoVITS",
+        "CosyVoiceTokenizer",
+        "CosyVoiceCAMPP",
+        "WavLM",
+        "HuBERTLargeLL60K",
+        "WhisperLargeV3",
+    }
+    checkpoint_missing = [name for name in _checkpoint_status()["missing"] if name in protect_required]
     if checkpoint_missing:
         return "checkpoint_missing"
     if exc is not None:
         text = f"{type(exc).__name__}: {exc}".lower()
         if any(token in text for token in ["import", "module", "dependency", "not installed", "no module named"]):
             return "dependency_missing"
+        if any(token in text for token in ["out of memory", "cannot allocate memory", "memoryerror"]):
+            return "resource_exhausted"
+        return "algorithm_runtime_error"
     if not output_exists:
         return "output_file_missing"
     return "unknown"
@@ -695,8 +771,10 @@ def run_protection(
     optimization_defaults = config_defaults["optimization"]
     default_timbre_encoders = (config_defaults.get("timbre") or {}).get("encoders") or []
     active_timbre_encoders = _enabled_encoder_names(timbre.get("encoders"), default_timbre_encoders)
-    epsilon = to_float(optimization.get("epsilon")) or float(optimization_defaults["epsilon"])
-    steps = int(optimization.get("steps") or int(optimization_defaults["steps"]))
+    epsilon_value = to_float(optimization.get("epsilon"))
+    epsilon = epsilon_value if epsilon_value is not None else float(optimization_defaults["epsilon"])
+    steps_raw = optimization.get("steps")
+    steps = int(steps_raw) if steps_raw is not None else int(optimization_defaults["steps"])
     weight_warnings: list[str] = []
     weight_identity = _read_identity_weight(timbre, FORMAL_WEIGHT_FEATURE, weight_warnings)
     weight_semantic = _read_weight(semantic, "weightSemantic", "lambdaSemantic", FORMAL_WEIGHT_SEMANTIC, weight_warnings)
@@ -727,13 +805,23 @@ def run_protection(
             "weightPsy": weight_psy,
             "weightL2": weight_l2,
         },
+        "fixedOptimization": {
+            "weight_stft": FIXED_WEIGHT_STFT,
+            "weight_snr": FIXED_WEIGHT_SNR,
+            "target_snr_db": FIXED_TARGET_SNR_DB,
+            "selection_snr_db": FIXED_SELECTION_SNR_DB,
+            "step_size": FIXED_STEP_SIZE,
+            "init_noise": FIXED_INIT_NOISE,
+            "l2_reduction": FIXED_L2_REDUCTION,
+            "min_lr": FIXED_MIN_LR,
+        },
         "deprecationWarnings": weight_warnings,
         "selectedSemanticEncoders": semantic.get("encoders"),
         "selectedTimbreEncoders": timbre.get("encoders"),
         "activeTimbreEncoders": sorted(active_timbre_encoders),
         "capabilities": diagnose_capabilities(),
         "protectCall": {
-            "class": "SemanticE2EVGuard",
+            "class": "VoiceSheild",
             "inputPath": str(input_path),
             "outputPath": str(output_path),
         },
@@ -745,24 +833,38 @@ def run_protection(
             if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("TASK_CANCELLED")
             import torch
-            from semantic_vguard import SemanticE2EVGuard
+            from core.guard import VoiceSheild
 
-            guard = SemanticE2EVGuard(
+            semantic_defaults = config_defaults.get("semantic") or {}
+            tokenizer_path = semantic.get("tokenizerPath") or semantic_defaults.get("tokenizerPath")
+            if tokenizer_path and not Path(str(tokenizer_path)).is_absolute():
+                tokenizer_path = str((ROOT / str(tokenizer_path)).resolve())
+            hubert_path = semantic.get("hubertPath") or semantic_defaults.get("hubertPath") or "facebook/hubert-large-ll60k"
+            whisper_path = semantic.get("whisperPath") or semantic_defaults.get("whisperPath") or "openai/whisper-large-v3"
+
+            guard = VoiceSheild(
                 epsilon=epsilon,
                 max_items=steps,
                 device=torch.device(device if device == "cpu" or torch.cuda.is_available() else "cpu"),
-                timbre_mode=timbre.get("mode") or "untargeted",
+                tokenizer_path=tokenizer_path,
+                hubert_path=hubert_path,
+                whisper_path=whisper_path,
                 use_vits="vits" in active_timbre_encoders,
                 use_gsv="gsv" in active_timbre_encoders,
                 use_mfcc_timbre="mfcc" in active_timbre_encoders,
                 use_wavlm="wavlm" in active_timbre_encoders,
                 use_cosyvoice="cosyvoice" in active_timbre_encoders,
-                use_style="style" in active_timbre_encoders,
-                weight_identity=weight_identity,
                 weight_feature=weight_identity,
                 weight_semantic=weight_semantic,
                 weight_psy=weight_psy,
                 weight_l2=weight_l2,
+                l2_reduction=FIXED_L2_REDUCTION,
+                init_noise=FIXED_INIT_NOISE,
+                step_size=FIXED_STEP_SIZE,
+                weight_stft=FIXED_WEIGHT_STFT,
+                weight_snr=FIXED_WEIGHT_SNR,
+                target_snr_db=FIXED_TARGET_SNR_DB,
+                selection_snr_db=FIXED_SELECTION_SNR_DB,
             )
             diagnostics["protectCall"]["guardInit"] = "ok"
             result = guard.protect(input_path, output_path, progress_callback=progress_callback, cancel_event=cancel_event)
@@ -797,7 +899,8 @@ def run_protection(
                 )
             if not isinstance(result, dict):
                 result = {"raw_return": repr(result)}
-            result["source"] = "SemanticE2EVGuard.protect"
+            result["source"] = "VoiceSheild.protect"
+            result["preset_name"] = FORMAL_PRESET_NAME
             result["guardDiagnostics"] = diagnostics
             return result
         except Exception as exc:
@@ -1078,8 +1181,11 @@ def build_task_payload(
     started_at: str,
     completed_at: str,
     protection_result: dict[str, Any],
+    source_path: Path | None = None,
+    preprocess_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     base_url = f"/api/artifacts/{task_id}"
+    source_url = f"{base_url}/source/{source_path.name}" if source_path is not None else None
     original_url = f"{base_url}/original/{input_path.name}"
     protected_url = f"{base_url}/protected/{protected_path.name}"
     result_json_url = f"{base_url}/result.json"
@@ -1103,6 +1209,10 @@ def build_task_payload(
             "mode": timbre.get("mode") or payload.get("mode") or "untargeted",
             "epsilon": to_float(optimization.get("epsilon")),
             "steps": int(optimization.get("steps") or 0) or None,
+            "maxSteps": protection_result.get("max_steps") or int(optimization.get("steps") or 0) or None,
+            "selectedStep": loss_summary.get("selectedStep"),
+            "snrDb": to_float(protection_result.get("snr_db", protection_result.get("snr"))),
+            "presetName": protection_result.get("preset_name") or FORMAL_PRESET_NAME,
             "sampleRate": meta["sampleRate"],
             "durationSec": meta["durationSec"],
             "lossFinal": loss_final,
@@ -1117,12 +1227,22 @@ def build_task_payload(
                 "lambdaSem": loss_weights.get("lambdaSem"),
                 "lambdaPsy": loss_weights.get("lambdaPsy"),
                 "lambda2": loss_weights.get("lambda2"),
+                "lambdaStft": FIXED_WEIGHT_STFT,
+                "lambdaSnr": FIXED_WEIGHT_SNR,
+                "targetSnrDb": FIXED_TARGET_SNR_DB,
+                "selectionSnrDb": FIXED_SELECTION_SNR_DB,
             },
             "optimizationTrace": trace,
+            "internalOptimizationTrace": protection_result.get("optimization_trace") or [],
             "averageStepSec": loss_summary["averageStepSec"],
-            "source": protection_result.get("source") or "SemanticE2EVGuard.protect",
+            "effectiveConfig": protection_result.get("effective_config"),
+            "lossItems": protection_result.get("loss_items"),
+            "models": protection_result.get("models"),
+            "checkpoints": protection_result.get("checkpoints"),
+            "source": protection_result.get("source") or "VoiceSheild.protect",
             "status": "computed" if protected_path.exists() else "unavailable",
             "realProtect": True,
+            "preprocessing": preprocess_meta,
         }
     )
     if protection_result.get("warning"):
@@ -1219,14 +1339,17 @@ def build_task_payload(
             "metricSources": metric_sources,
         },
         "artifacts": {
+            "sourceAudioUrl": source_url,
             "originalAudioUrl": original_url,
             "protectedAudioUrl": protected_url,
             "resultJsonUrl": result_json_url,
         },
         "audio": {
+            "source": audio_meta(source_path, source_url, uploaded_file_id) if source_path is not None and source_url is not None else None,
             "original": audio_meta(input_path, original_url, uploaded_file_id),
             "protected": audio_meta(protected_path, protected_url),
         },
+        "preprocessing": preprocess_meta,
         "details": details,
         "chains": chains,
         "charts": charts,
@@ -1265,6 +1388,9 @@ def build_task_payload(
         },
         "metricSources": metric_sources,
         "realProtect": True,
+        "selectedStep": loss_summary.get("selectedStep"),
+        "effectiveConfig": protection_result.get("effective_config"),
+        "presetName": protection_result.get("preset_name") or FORMAL_PRESET_NAME,
         "warning": None,
         "backend": {
             "version": "SemE2E API adapter",
@@ -1323,17 +1449,35 @@ def create_task(
     ensure_runtime_dirs()
     task_id = task_id or new_task_id()
     task_dir = TASK_DIR / task_id
+    source_dir = task_dir / "source"
     original_dir = task_dir / "original"
     protected_dir = task_dir / "protected"
+    source_dir.mkdir(parents=True, exist_ok=True)
     original_dir.mkdir(parents=True, exist_ok=True)
     protected_dir.mkdir(parents=True, exist_ok=True)
 
-    original_path = original_dir / input_path.name
-    if input_path.resolve() != original_path.resolve():
-        shutil.copyfile(input_path, original_path)
-    protected_path = protected_dir / f"{input_path.stem}_protected.wav"
-
     started_at = utc_now_iso()
+    source_path = source_dir / input_path.name
+    if input_path.resolve() != source_path.resolve():
+        shutil.copyfile(input_path, source_path)
+    original_path = original_dir / f"{input_path.stem}.wav"
+    protected_path = protected_dir / f"{input_path.stem}_protected.wav"
+    preprocess_meta = preprocess_audio(
+        source_path,
+        original_path,
+        target_sample_rate=24_000,
+        progress_callback=progress_callback,
+        cancel_event=cancel_event,
+    )
+    preprocess_meta["source"]["fileId"] = uploaded_file_id
+    preprocess_path = task_dir / "preprocess.json"
+    preprocess_temp_path = task_dir / ".preprocess.json.tmp"
+    with preprocess_temp_path.open("w", encoding="utf-8") as file:
+        json.dump(preprocess_meta, file, ensure_ascii=False, indent=2)
+    os.replace(preprocess_temp_path, preprocess_path)
+    if progress_callback is not None:
+        progress_callback(progress=0.18, stage="encoder_loading", message="录音预处理完成，正在加载防护模型")
+
     protection_result = run_protection(
         original_path,
         protected_path,
@@ -1358,6 +1502,8 @@ def create_task(
         started_at,
         completed_at,
         protection_result,
+        source_path=source_path,
+        preprocess_meta=preprocess_meta,
     )
     if progress_callback is not None:
         progress_callback(progress=0.99, stage="report_generation", message="后端正在写入结果报告")

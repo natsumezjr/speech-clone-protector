@@ -102,6 +102,21 @@ export interface AsrEvalResponse {
   asrSubId?: string
 }
 
+export interface SubtaskStatusSnapshot {
+  status?: TaskStatus | string
+  progress?: number | null
+  stage?: TaskStage | string | null
+  message?: string | null
+  elapsedSec?: number | null
+  error?: string | ApiErrorPayload | null
+  createdAt?: string | null
+  updatedAt?: string | null
+  asrSubId?: string | null
+  cloneSubId?: string | null
+  asrResult?: AsrEvalResponse | null
+  cloneResult?: CloneVoiceResult | null
+}
+
 export interface TaskStatusResponse {
   taskId: string
   status: TaskStatus
@@ -116,6 +131,8 @@ export interface TaskStatusResponse {
   error: string | ApiErrorPayload | null
   asrResult?: AsrEvalResponse | null
   cloneResult?: CloneVoiceResult | null
+  asrTask?: SubtaskStatusSnapshot | null
+  cloneTask?: SubtaskStatusSnapshot | null
 }
 
 export interface SpeakerMetrics {
@@ -441,6 +458,9 @@ export interface TaskResult {
   lossWeights?: LossWeights | null
   optimizationTrace?: LossTrendPoint[] | null
   averageStepSec?: number | null
+  selectedStep?: number | null
+  effectiveConfig?: Record<string, unknown> | null
+  presetName?: string | null
   asrEval?: AsrEval | null
   cloneEval?: CloneEval | null
   cloneResults?: CloneVoiceResult[]
@@ -456,6 +476,11 @@ export interface TaskResult {
     lossWeights?: LossWeights
     optimizationTrace?: LossTrendPoint[]
     steps?: number | null
+    maxSteps?: number | null
+    selectedStep?: number | null
+    snrDb?: number | null
+    presetName?: string | null
+    effectiveConfig?: Record<string, unknown> | null
     realProtect?: boolean | null
     source?: string
     status?: string

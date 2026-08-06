@@ -1,10 +1,10 @@
 import { useState } from 'react'
-import { Download, Eye, SlidersHorizontal, Trash2, X } from 'lucide-react'
+import { Download, Eye, RotateCcw, SlidersHorizontal, Trash2, X } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { Badge } from '@/components/common/Badge'
 import { Button } from '@/components/common/Button'
 import { cn } from '@/lib/utils'
-import { deleteTask, downloadProtectedAudio } from '@/services/apiClient'
+import { deleteTask, downloadProtectedAudio, retryProtectionTask } from '@/services/apiClient'
 import { useAppStore } from '@/store/appStore'
 import type { HistoryTask, TaskStatus } from '@/types/task'
 import { downloadBlob } from '@/utils/download'
@@ -129,10 +129,11 @@ function ParamModal({ task, onClose }: { task: HistoryTask; onClose: () => void 
   )
 }
 
-export function TaskTable({ tasks, view, onDeleted }: { tasks: HistoryTask[]; view: HistoryView; onDeleted?: () => void }) {
+export function TaskTable({ tasks, view, onChanged }: { tasks: HistoryTask[]; view: HistoryView; onChanged?: () => void }) {
   const navigate = useNavigate()
   const pushToast = useAppStore((state) => state.pushToast)
   const [paramTask, setParamTask] = useState<HistoryTask | null>(null)
+  const [retryingTaskId, setRetryingTaskId] = useState<string | null>(null)
 
   const handleOpen = (task: HistoryTask) => {
     if (!task.protectedFilename || task.protectedFilename === '-') {
@@ -156,9 +157,22 @@ export function TaskTable({ tasks, view, onDeleted }: { tasks: HistoryTask[]; vi
     try {
       await deleteTask(taskId)
       pushToast({ kind: 'success', title: '历史记录已删除' })
-      onDeleted?.()
+      onChanged?.()
     } catch (error) {
       pushToast({ kind: 'error', title: '删除失败', description: error instanceof Error ? error.message : '请检查后端接口。' })
+    }
+  }
+
+  const handleRetry = async (taskId: string) => {
+    setRetryingTaskId(taskId)
+    try {
+      const created = await retryProtectionTask(taskId)
+      pushToast({ kind: 'success', title: '已重新提交保护任务', description: `新任务：${created.taskId}` })
+      onChanged?.()
+    } catch (error) {
+      pushToast({ kind: 'error', title: '重试失败', description: error instanceof Error ? error.message : '请检查后端接口。' })
+    } finally {
+      setRetryingTaskId(null)
     }
   }
 
@@ -185,6 +199,8 @@ export function TaskTable({ tasks, view, onDeleted }: { tasks: HistoryTask[]; vi
               const progress = progressForView(task, view)
               const elapsed = elapsedForView(task, view)
               const isCustom = task.mode === 'custom'
+              const canRetryProtection = view === 'protection' && (rowStatus === 'failed' || rowStatus === 'error')
+              const isRetrying = retryingTaskId === task.taskId
               const statusGroup = rowStatus === 'running' ? 'running' : rowStatus === 'completed' || rowStatus === 'success' ? 'completed' : null
               const historyStatusClass = statusGroup ? `history-status-${view}-${statusGroup}` : undefined
               const historyProgressClass = statusGroup ? `history-progress-fill-${view}-${statusGroup}` : undefined
@@ -226,9 +242,15 @@ export function TaskTable({ tasks, view, onDeleted }: { tasks: HistoryTask[]; vi
                   <td className="px-4 py-4 text-slate-300">{elapsed !== null ? seconds(elapsed) : '-'}</td>
                   <td className="px-4 py-4">
                     <div className="flex justify-center gap-2">
-                      <Button variant="ghost" className="h-9 px-2" title="查看结果" onClick={() => handleOpen(task)}>
-                        <Eye className="h-4 w-4" />
-                      </Button>
+                      {canRetryProtection ? (
+                        <Button variant="ghost" className="h-9 px-2" title="重试保护" disabled={isRetrying} onClick={() => void handleRetry(task.taskId)}>
+                          <RotateCcw className={cn('h-4 w-4', isRetrying && 'animate-spin')} />
+                        </Button>
+                      ) : (
+                        <Button variant="ghost" className="h-9 px-2" title="查看结果" onClick={() => handleOpen(task)}>
+                          <Eye className="h-4 w-4" />
+                        </Button>
+                      )}
                       <Button variant="ghost" className="h-9 px-2" title="下载保护音频" onClick={() => void handleDownload(task.taskId)}>
                         <Download className="h-4 w-4" />
                       </Button>
