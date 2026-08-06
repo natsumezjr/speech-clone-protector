@@ -381,6 +381,29 @@ function normalizeCloneResult(payload: unknown): CloneVoiceResult {
   }
 }
 
+function normalizeTaskStatus(payload: unknown): TaskStatusResponse {
+  const data = asRecord(payload)
+  const cloneTask = asRecord(data.cloneTask)
+
+  return {
+    ...(data as unknown as TaskStatusResponse),
+    cloneResult:
+      data.cloneResult === null || data.cloneResult === undefined
+        ? data.cloneResult
+        : normalizeCloneResult(data.cloneResult),
+    cloneTask:
+      data.cloneTask === null || data.cloneTask === undefined
+        ? data.cloneTask
+        : {
+            ...(cloneTask as unknown as NonNullable<TaskStatusResponse['cloneTask']>),
+            cloneResult:
+              cloneTask.cloneResult === null || cloneTask.cloneResult === undefined
+                ? cloneTask.cloneResult
+                : normalizeCloneResult(cloneTask.cloneResult),
+          },
+  }
+}
+
 function normalizeTaskResult(payload: unknown): TaskResult {
   const data = asRecord(payload)
   if (data.originalAudio && data.protectedAudio) {
@@ -647,7 +670,7 @@ export const backendClient: ApiClient = {
   },
   async getTaskStatus(taskId: string): Promise<TaskStatusResponse> {
     const response = await http.get(`/api/tasks/${taskId}/status`)
-    return response.data
+    return normalizeTaskStatus(response.data)
   },
   async getTaskResult(taskId: string): Promise<TaskResult> {
     const response = await http.get(`/api/tasks/${taskId}/result`)
