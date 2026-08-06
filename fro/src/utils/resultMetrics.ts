@@ -16,6 +16,30 @@ export interface TrendAnalysis {
   smoothed_values: number[]
 }
 
+export type ConvergenceStatus = 'converged' | 'unconverged' | 'insufficient'
+
+export interface LossSlopeAnalysis {
+  key: TrendMetricKey
+  status: ConvergenceStatus
+  reference_mean_abs_slope: number | null
+  final_mean_abs_slope: number | null
+  final_to_reference_ratio: number | null
+  normalized_final_slope: number | null
+  segment_count: number
+}
+
+export interface ConvergenceAnalysis {
+  status: ConvergenceStatus
+  active_losses: TrendMetricKey[]
+  valid_loss_count: number
+  losses: Record<TrendMetricKey, LossSlopeAnalysis>
+}
+
+const convergenceKeys: TrendMetricKey[] = ['Lid', 'Lsem', 'Lpsy', 'L2', 'total']
+const finalSegmentFraction = 0.2
+const finalToReferenceSlopeRatio = 0.6
+const minimumNormalizedFinalSlope = 0.01
+
 function finiteNumber(value: unknown): number | null {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null
   if (typeof value !== 'string' || value.trim() === '') return null
@@ -26,6 +50,21 @@ function finiteNumber(value: unknown): number | null {
 function metricValue(point: LossTrendPoint, key: TrendMetricKey) {
   if (key === 'Lid') return finiteNumber(point.Lid) ?? finiteNumber(point.Lfeat)
   return finiteNumber(point[key])
+}
+
+function cleanLossPoints(points: LossTrendPoint[] | null | undefined, key: TrendMetricKey) {
+  return (points ?? [])
+    .map((point, index) => ({
+      step: finiteNumber(point.step) ?? index,
+      value: metricValue(point, key),
+      index,
+    }))
+    .filter((item): item is { step: number; value: number; index: number } => item.value !== null)
+    .sort((left, right) => left.step - right.step || left.index - right.index)
+}
+
+function mean(values: number[]) {
+  return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0
 }
 
 function median(values: number[]) {
@@ -94,14 +133,7 @@ function theilSenSlope(x: number[], y: number[]) {
 }
 
 export function analyzeLossTrend(points: LossTrendPoint[] | null | undefined, key: TrendMetricKey): TrendAnalysis {
-  const cleaned = (points ?? [])
-    .map((point, index) => ({
-      step: finiteNumber(point.step) ?? index,
-      value: metricValue(point, key),
-      index,
-    }))
-    .filter((item): item is { step: number; value: number; index: number } => item.value !== null)
-    .sort((left, right) => left.step - right.step || left.index - right.index)
+  const cleaned = cleanLossPoints(points, key)
 
   const rawValues = cleaned.map((item) => item.value)
   if (cleaned.length < 6) {
@@ -153,5 +185,89 @@ export function analyzeLossTrend(points: LossTrendPoint[] | null | undefined, ke
     window_size: windowSize,
     raw_values: rawValues,
     smoothed_values: smoothed,
+  }
+}
+
+function analyzeLossSlope(points: LossTrendPoint[] | null | undefined, key: TrendMetricKey): LossSlopeAnalysis {
+  const cleaned = cleanLossPoints(points, key)
+  const slopes: number[] = []
+  for (let index = 1; index < cleaned.length; index += 1) {
+    const stepDelta = cleaned[index].step - cleaned[index - 1].step
+    if (Math.abs(stepDelta) <= 1e-12) continue
+    slopes.push(Math.abs((cleaned[index].value - cleaned[index - 1].value) / stepDelta))
+  }
+  if (cleaned.length < 6 || slopes.length < 5) {
+    return {
+      key,
+      status: 'insufficient',
+      reference_mean_abs_slope: null,
+      final_mean_abs_slope: null,
+      final_to_reference_ratio: null,
+      normalized_final_slope: null,
+      segment_count: slopes.length,
+    }
+  }
+
+  const finalSegmentCount = Math.max(1, Math.ceil(slopes.length * finalSegmentFraction))
+  const referenceSlopes = slopes.slice(0, -finalSegmentCount)
+  const finalSlopes = slopes.slice(-finalSegmentCount)
+  if (referenceSlopes.length === 0) {
+    return {
+      key,
+      status: 'insufficient',
+      reference_mean_abs_slope: null,
+      final_mean_abs_slope: null,
+      final_to_reference_ratio: null,
+      normalized_final_slope: null,
+      segment_count: slopes.length,
+    }
+  }
+
+  const referenceSlope = mean(referenceSlopes)
+  const finalSlope = mean(finalSlopes)
+  const values = cleaned.map((item) => item.value)
+  const stepSpan = Math.max(1e-8, cleaned.at(-1)!.step - cleaned[0].step)
+  const valueScale = Math.max(
+    Math.abs(median(values)),
+    Math.abs(quantile(values, 0.75) - quantile(values, 0.25)),
+    Math.abs(Math.max(...values) - Math.min(...values)),
+    1e-8,
+  )
+  const normalizedFinalSlope = finalSlope * stepSpan / valueScale
+  const slopeRatio = referenceSlope > 1e-12
+    ? finalSlope / referenceSlope
+    : finalSlope <= 1e-12
+      ? 0
+      : Number.POSITIVE_INFINITY
+  const remainsActive = normalizedFinalSlope >= minimumNormalizedFinalSlope
+    && slopeRatio >= finalToReferenceSlopeRatio
+
+  return {
+    key,
+    status: remainsActive ? 'unconverged' : 'converged',
+    reference_mean_abs_slope: referenceSlope,
+    final_mean_abs_slope: finalSlope,
+    final_to_reference_ratio: slopeRatio,
+    normalized_final_slope: normalizedFinalSlope,
+    segment_count: slopes.length,
+  }
+}
+
+export function analyzeLossConvergence(points: LossTrendPoint[] | null | undefined): ConvergenceAnalysis {
+  const losses = Object.fromEntries(
+    convergenceKeys.map((key) => [key, analyzeLossSlope(points, key)]),
+  ) as Record<TrendMetricKey, LossSlopeAnalysis>
+  const validLosses = convergenceKeys.filter((key) => losses[key].status !== 'insufficient')
+  const activeLosses = validLosses.filter((key) => losses[key].status === 'unconverged')
+  if (validLosses.length < 3) {
+    return { status: 'insufficient', active_losses: activeLosses, valid_loss_count: validLosses.length, losses }
+  }
+  const requiredActiveLosses = Math.max(2, Math.ceil(validLosses.length / 2))
+  const unconverged = losses.total.status === 'unconverged' || activeLosses.length >= requiredActiveLosses
+  return {
+    status: unconverged ? 'unconverged' : 'converged',
+    active_losses: activeLosses,
+    valid_loss_count: validLosses.length,
+    losses,
   }
 }

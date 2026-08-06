@@ -19,6 +19,31 @@ _SEMANTIC_ENCODER_CACHE: dict[tuple[str, str, str, str], Any] = {}
 _SEMANTIC_ENCODER_LAST_ERROR: str | None = None
 
 
+def _checkpoint_file_ready(path: Path) -> bool:
+    try:
+        if not path.is_file() or path.stat().st_size < 1024 * 1024:
+            return False
+        with path.open("rb") as file:
+            return not file.read(64).startswith(b"version https://git-lfs.github.com/spec")
+    except OSError:
+        return False
+
+
+def _default_s3_tokenizer_model() -> str:
+    configured = os.getenv("SEME2E_TOKENIZER_MODEL")
+    if configured:
+        return str(_resolve_local_model_path(configured))
+    project_checkpoint = ROOT / "checkpoints" / "CosyVoice" / "speech_tokenizer_v1.onnx"
+    if _checkpoint_file_ready(project_checkpoint):
+        return str(project_checkpoint.resolve())
+    if os.getenv("SEME2E_ALLOW_MODEL_DOWNLOADS", "0") == "1":
+        return "speech_tokenizer_v1_25hz"
+    raise FileNotFoundError(
+        f"local S3 tokenizer checkpoint is missing or incomplete: {project_checkpoint}; "
+        "set SEME2E_ALLOW_MODEL_DOWNLOADS=1 only when an online download is intended"
+    )
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -84,7 +109,7 @@ def _resolve_local_model_path(value: Any) -> Any:
 def load_s3_tokenizer(model_name_or_path: str | None = None, device: str | None = None) -> Any:
     """Load the S3 semantic tokenizer used for real token metrics."""
 
-    model = _resolve_local_model_path(model_name_or_path or os.getenv("SEME2E_TOKENIZER_MODEL") or "speech_tokenizer_v1_25hz")
+    model = _resolve_local_model_path(model_name_or_path or _default_s3_tokenizer_model())
     resolved_device = device or os.getenv("SEME2E_TOKENIZER_DEVICE") or os.getenv("SEME2E_API_DEVICE") or "cpu"
     cache_key = (str(model), str(resolved_device))
     if cache_key not in _S3_TOKENIZER_CACHE:
@@ -615,39 +640,39 @@ def compute_loss_summary(
     sources = {
         "lossFinal.*": metric_source(
             source_status,
-            protection_details.get("source") or "VoiceSheild.protect",
+            protection_details.get("source") or "VoiceShield.protect",
             reason=None if trace else "Protection backend did not return an optimization trace",
             formula="lossFinal=optimizationTrace[selectedStep-1] when selectedStep is available, otherwise optimizationTrace[-1]",
         ),
         "optimizationTrace": metric_source(
             source_status,
-            protection_details.get("source") or "VoiceSheild.protect",
+            protection_details.get("source") or "VoiceShield.protect",
             reason=None if trace else "Protection backend did not return per-step loss records",
             formula="normalized backend trace; total=lambdaId*Lid+lambdaSem*Lsem+lambdaPsy*Lpsy+lambda2*L2 when total is absent",
         ),
         "lossFinal.Lid": metric_source(
             source_status,
-            protection_details.get("source") or "VoiceSheild.protect",
+            protection_details.get("source") or "VoiceShield.protect",
             reason=None if trace else "Protection backend did not return an optimization trace",
             formula="L_{\\mathrm{id}}",
-            metric="Identity loss from VoiceSheild optimization trace.",
+            metric="Identity loss from VoiceShield optimization trace.",
         ),
         "optimizationTrace.Lid": metric_source(
             source_status,
-            protection_details.get("source") or "VoiceSheild.protect",
+            protection_details.get("source") or "VoiceShield.protect",
             reason=None if trace else "Protection backend did not return per-step loss records",
             formula="L_{\\mathrm{id}}",
-            metric="Identity loss from VoiceSheild optimization trace.",
+            metric="Identity loss from VoiceShield optimization trace.",
         ),
         "lossFinal.Lfeat": metric_source(
             source_status,
-            protection_details.get("source") or "VoiceSheild.protect",
+            protection_details.get("source") or "VoiceShield.protect",
             reason="Deprecated legacy alias of Lid.",
             formula="Lfeat := Lid",
         ),
         "optimizationTrace.Lfeat": metric_source(
             source_status,
-            protection_details.get("source") or "VoiceSheild.protect",
+            protection_details.get("source") or "VoiceShield.protect",
             reason="Deprecated legacy alias of Lid.",
             formula="Lfeat := Lid",
         ),
@@ -1023,7 +1048,7 @@ def _load_semantic_encoder_ensemble(config: dict[str, Any]) -> Any | None:
             os.getenv("SEME2E_SEMANTIC_TOKENIZER_MODEL")
             or os.getenv("SEME2E_TOKENIZER_MODEL")
             or config.get("tokenizerPath")
-            or "speech_tokenizer_v1_25hz"
+            or _default_s3_tokenizer_model()
         )
         tokenizer_path = _resolve_local_model_path(tokenizer_path)
         requested_hubert = os.getenv("SEME2E_HUBERT_MODEL") or config.get("hubertModel") or config.get("hubertPath") or _default_hubert_model()
@@ -1129,7 +1154,7 @@ def compute_semantic_token_metrics(clean_path: Path, protected_path: Path, confi
                     "status": "partial",
                 }
             )
-            source = os.getenv("SEME2E_TOKENIZER_MODEL") or "speech_tokenizer_v1_25hz"
+            source = os.getenv("SEME2E_TOKENIZER_MODEL") or _default_s3_tokenizer_model()
             details["_metricSources"]["asrEval.tokenChangeRate"] = metric_source(
                 "available",
                 source,

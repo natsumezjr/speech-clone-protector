@@ -21,7 +21,8 @@ import {
   X,
 } from 'lucide-react'
 
-import { createProtectionTask, getCapabilities, getTaskStatus, uploadFile } from '@/services/apiClient'
+import { createProtectionTask, getTaskStatus, uploadFile } from '@/services/apiClient'
+import { useCapabilitiesQuery } from '@/hooks/useCapabilitiesQuery'
 import { useAppStore } from '@/store/appStore'
 import { useTaskStore } from '@/store/taskStore'
 import type { CapabilitiesResponse, NumericConfigRange, ProtectionMode, ProtectionRuntimeConfig, ProtectionTarget, ProtectionTaskRequest, RuntimeModelOption, TaskStatusResponse } from '@/types/task'
@@ -37,7 +38,7 @@ const TASK_STATUS_POLL_MS = 1000
 
 const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))
 
-function configFromCapabilities(capabilities: CapabilitiesResponse | null): ProtectionRuntimeConfig | undefined {
+function configFromCapabilities(capabilities: CapabilitiesResponse | null | undefined): ProtectionRuntimeConfig | undefined {
   if (!capabilities) return undefined
   if (capabilities.config) return capabilities.config
   if (capabilities.defaults && capabilities.ranges && capabilities.models) {
@@ -157,13 +158,16 @@ export function WorkspacePage() {
   const [running, setRunning] = useState(false)
   const [taskId, setTaskId] = useState<string>()
   const [taskStatus, setTaskStatus] = useState<TaskStatusResponse | null>(null)
-  const [capabilities, setCapabilities] = useState<CapabilitiesResponse | null>(null)
-  const [configError, setConfigError] = useState<string | null>(null)
+  const activeTaskTokenRef = useRef(0)
+  const { data: capabilities, error: capabilitiesQueryError } = useCapabilitiesQuery()
 
   const pushToast = useAppStore((state) => state.pushToast)
   const uploadedFile = useTaskStore((state) => state.uploadedFile)
   const setCurrentTaskStatus = useTaskStore((state) => state.setCurrentTaskStatus)
   const runtimeConfig = configFromCapabilities(capabilities)
+  const configError = capabilitiesQueryError
+    ? capabilitiesQueryError instanceof Error ? capabilitiesQueryError.message : '无法读取后端参数配置。'
+    : capabilities && !runtimeConfig ? '后端 capabilities 未返回运行时参数配置。' : null
 
   useEffect(() => {
     mountedRef.current = true
@@ -172,35 +176,15 @@ export function WorkspacePage() {
     }
   }, [])
 
-  useEffect(() => {
-    let active = true
-    getCapabilities()
-      .then((payload) => {
-        if (!active) return
-        setCapabilities(payload)
-        if (!configFromCapabilities(payload)) {
-          setConfigError('后端 capabilities 未返回运行时参数配置。')
-        }
-      })
-      .catch((error) => {
-        if (!active) return
-        setCapabilities(null)
-        setConfigError(error instanceof Error ? error.message : '无法读取后端参数配置。')
-      })
-    return () => {
-      active = false
-    }
-  }, [])
-
-  const applyStatus = (status: TaskStatusResponse) => {
-    if (!mountedRef.current) return
+  const applyStatus = (status: TaskStatusResponse, taskToken: number) => {
+    if (!mountedRef.current || taskToken !== activeTaskTokenRef.current) return
     const nextProgress = isDoneStatus(status) ? 1 : clampProgress(status.progress)
     setProgress(nextProgress)
     setTaskStatus(status)
     setCurrentTaskStatus(status)
   }
 
-  const waitForBackendTask = async (createdTaskId: string) => {
+  const waitForBackendTask = async (createdTaskId: string, taskToken: number) => {
     const startedAt = Date.now()
     while (mountedRef.current) {
       let latest: TaskStatusResponse
@@ -213,7 +197,7 @@ export function WorkspacePage() {
         }
         throw error
       }
-      applyStatus(latest)
+      applyStatus(latest, taskToken)
       if (isDoneStatus(latest) || isFailedStatus(latest)) return latest
       await wait(TASK_STATUS_POLL_MS)
     }
@@ -226,6 +210,8 @@ pushToast({ kind: 'error', title: '无法创建任务', description: '后端模�
       return
     }
 
+    const taskToken = activeTaskTokenRef.current + 1
+    activeTaskTokenRef.current = taskToken
     try {
       setRunning(true)
       setProgress(0)
@@ -235,8 +221,9 @@ pushToast({ kind: 'error', title: '无法创建任务', description: '后端模�
       setTaskId(created.taskId)
       pushToast({ kind: 'success', title: '任务已创建', description: `任务 ID：${created.taskId}` })
 
-      const finalStatus = await waitForBackendTask(created.taskId)
+      const finalStatus = await waitForBackendTask(created.taskId, taskToken)
       if (!finalStatus) return
+      if (taskToken !== activeTaskTokenRef.current) return
       if (isFailedStatus(finalStatus)) {
         setRunning(false)
         pushToast({ kind: 'error', title: '任务执行失败', description: formatTaskFailure(finalStatus) })
@@ -245,7 +232,7 @@ pushToast({ kind: 'error', title: '无法创建任务', description: '后端模�
       setRunning(false)
       navigate(`/results/${created.taskId}`)
     } catch (error) {
-      setRunning(false)
+      if (taskToken === activeTaskTokenRef.current) setRunning(false)
       pushToast({ kind: 'error', title: '任务创建失败', description: error instanceof Error ? error.message : '请检查后端服务。' })
     }
   }
@@ -551,6 +538,7 @@ function StrategyConfigCard({
   const [lambdaL2, setLambdaL2] = useState(0)
   const [selectedSemanticEncoders, setSelectedSemanticEncoders] = useState<string[]>([])
   const [selectedFeatureModels, setSelectedFeatureModels] = useState<string[]>([])
+  const [configurationChangedSinceSubmission, setConfigurationChangedSinceSubmission] = useState(false)
   const [modelModalOpen, setModelModalOpen] = useState(false)
 
   const applyPreset = (mode: Exclude<ProtectionMode, 'joint'>, config: ProtectionRuntimeConfig) => {
@@ -643,6 +631,7 @@ function StrategyConfigCard({
   const targetLocked = selectedMode === 'custom'
 
   const handleModeChange = (mode: string) => {
+    setConfigurationChangedSinceSubmission(true)
     const nextMode = mode as Exclude<ProtectionMode, 'joint'>
     setSelectedMode(nextMode)
     if (nextMode === 'custom') setSelectedTarget('joint')
@@ -650,6 +639,7 @@ function StrategyConfigCard({
   }
 
   const switchToCustom = () => {
+    setConfigurationChangedSinceSubmission(true)
     if (selectedMode !== 'custom') {
       setSelectedMode('custom')
       setSelectedTarget('joint')
@@ -671,6 +661,11 @@ function StrategyConfigCard({
   const openModelModal = () => {
     switchToCustom()
     setModelModalOpen(true)
+  }
+
+  const handleTargetChange = (target: ProtectionTarget | 'joint') => {
+    setConfigurationChangedSinceSubmission(true)
+    setSelectedTarget(target)
   }
 
   const buildPayload = (): ProtectionTaskRequest => {
@@ -751,7 +746,7 @@ function StrategyConfigCard({
               key={target.value}
               type="button"
               disabled={disabled}
-              onClick={() => setSelectedTarget(targetValue)}
+              onClick={() => handleTargetChange(targetValue)}
               className={cn(
                 'h-[74px] rounded-[6px] border px-3 py-2 text-left',
                 selected ? 'border-cyan-400 bg-cyan-400/10' : 'border-cyan-300/12 bg-slate-950/18',
@@ -851,12 +846,19 @@ function StrategyConfigCard({
       <div className="mt-5">
         <h3 className="mb-3 text-[15px] font-black text-white">任务执行</h3>
         <div className="grid gap-3">
-          <button disabled={running} onClick={() => onStart(buildPayload())} className="cyan-button inline-flex h-[50px] items-center justify-center gap-2 rounded-[7px] text-[16px] font-black disabled:opacity-60">
-            {running ? <Loader2 className="h-5 w-5 animate-spin" /> : <ShieldCheck className="h-5 w-5" />}
+          <button
+            disabled={running && !configurationChangedSinceSubmission}
+            onClick={() => {
+              setConfigurationChangedSinceSubmission(false)
+              onStart(buildPayload())
+            }}
+            className="cyan-button inline-flex h-[50px] items-center justify-center gap-2 rounded-[7px] text-[16px] font-black disabled:opacity-60"
+          >
+            {running && !configurationChangedSinceSubmission ? <Loader2 className="h-5 w-5 animate-spin" /> : <ShieldCheck className="h-5 w-5" />}
             开始生成保护音频
           </button>
         </div>
-        <p className="mt-3 text-center text-xs text-slate-500">预计耗时：单步 9.2 s，总时长预计 {(steps * 9.2).toFixed(1)} s</p>
+        <p className="mt-3 text-center text-xs text-slate-500">预计耗时：单步 0.9 s，总时长预计 {(steps * 0.9).toFixed(1)} s</p>
       </div>
     </section>
   )
@@ -871,7 +873,7 @@ function ArchitectureCard() {
         <div className="mb-6 flex items-center justify-between">
           <div>
             <h2 className="text-[21px] font-black text-white">系统架构概览</h2>
-            <p className="mt-2 text-sm text-slate-400">克隆防护VoiceSheild</p>
+            <p className="mt-2 text-sm text-slate-400">克隆防护VoiceShield</p>
           </div>
           <button type="button" onClick={() => pushToast({ kind: 'info', title: '系统架构', description: '左侧上传音频，中间生成保护音频，右侧结果页可执行克隆测试与评估导出。' })} className="text-sm font-bold text-cyan-300">查看详情 ›</button>
         </div>

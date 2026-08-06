@@ -425,6 +425,14 @@ export interface CapabilitiesResponse {
   ranges?: ProtectionRuntimeConfig['ranges']
   models?: ProtectionRuntimeConfig['models']
   constraints?: ProtectionRuntimeConfig['constraints']
+  cache?: {
+    hit: boolean
+    revision: number
+    refreshedAt?: string | null
+    refreshRequested?: boolean
+    refreshing?: boolean
+    strategy?: string
+  }
 }
 
 export interface TaskResult {
@@ -562,12 +570,16 @@ export interface HistoryTask {
   asrStage?: TaskStage | string | null
   asrMessage?: string | null
   asrElapsedSec?: number | null
+  asrStartedAt?: string | null
+  asrCompletedAt?: string | null
   asrError?: string | ApiErrorPayload | null
   cloneStatus?: TaskStatus | string | null
   cloneProgress?: number | null
   cloneStage?: TaskStage | string | null
   cloneMessage?: string | null
   cloneElapsedSec?: number | null
+  cloneStartedAt?: string | null
+  cloneCompletedAt?: string | null
   cloneError?: string | ApiErrorPayload | null
   hasAsrResult?: boolean
   hasCloneResult?: boolean

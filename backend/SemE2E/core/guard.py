@@ -63,7 +63,7 @@ def build_gsv_sovits_encoder(sovits_path, device):
     return model.to(device)
 
 
-class VoiceSheild:
+class VoiceShield:
     """E2E-VGuard with Lasr replaced by T-SemAttack Lsem."""
 
     def __init__(

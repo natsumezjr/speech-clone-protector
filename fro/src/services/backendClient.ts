@@ -217,6 +217,10 @@ function normalizeAudio(meta: unknown, fallbackName: string): AudioFileMeta {
     sampleRate: firstNumber(data, ['sampleRate', 'sample_rate']) ?? undefined,
     channels: firstNumber(data, ['channels', 'channelCount']) ?? undefined,
     bitDepth: numberOrNull(data.bitDepth) ?? undefined,
+    codec: typeof data.codec === 'string' ? data.codec : undefined,
+    metadataStatus: data.metadataStatus === 'available' || data.metadataStatus === 'partial' || data.metadataStatus === 'unavailable' ? data.metadataStatus : undefined,
+    metadataSource: typeof data.metadataSource === 'string' ? data.metadataSource : undefined,
+    metadataReason: typeof data.metadataReason === 'string' ? data.metadataReason : undefined,
     sizeBytes: firstNumber(data, ['sizeBytes', 'size', 'fileSize']) ?? 0,
     format: firstString(data, ['format', 'codec', 'ext']) ?? filename.split('.').pop()?.toUpperCase() ?? 'AUDIO',
     src: absoluteUrl(rawSrc),
@@ -594,13 +598,11 @@ function normalizeHistoryTask(payload: unknown): HistoryTask {
     elapsedSec: data.protectionElapsedSec ?? data.elapsedSec,
   })
   const asrElapsedSec = normalizeElapsedSec({
-    ...data,
     elapsedSec: data.asrElapsedSec,
     startedAt: data.asrStartedAt,
     completedAt: data.asrCompletedAt,
   })
   const cloneElapsedSec = normalizeElapsedSec({
-    ...data,
     elapsedSec: data.cloneElapsedSec,
     startedAt: data.cloneStartedAt,
     completedAt: data.cloneCompletedAt,

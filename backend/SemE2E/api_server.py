@@ -20,6 +20,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
+from audio_preprocess import probe_audio_metadata
+from capability_cache import get_capabilities_snapshot
 from result_adapter import (
     TASK_DIR,
     UPLOAD_DIR,
@@ -181,7 +183,7 @@ def protection_progress_status(event: dict[str, Any]) -> dict[str, Any]:
         "currentStep": step_value or None,
         "totalSteps": total_value,
         "stageProgress": round(algorithm_progress, 3),
-        "progressSource": "core.guard.VoiceSheild",
+        "progressSource": "core.guard.VoiceShield",
         "optimizationMetrics": optimization_metrics,
     }
 
@@ -909,9 +911,13 @@ def protect_queue_snapshot() -> dict[str, int]:
         }
 
 
+def cached_capabilities() -> dict[str, Any]:
+    return get_capabilities_snapshot(TASK_DIR.parent, diagnose_capabilities, logger=logger)
+
+
 @app.get("/api/health")
 def health() -> dict[str, Any]:
-    capabilities_payload = diagnose_capabilities()
+    capabilities_payload = cached_capabilities()
     return {
         "ok": True,
         "version": "sem-e2e-api-0.1",
@@ -929,7 +935,7 @@ def health() -> dict[str, Any]:
 
 @app.get("/api/capabilities")
 def capabilities() -> dict[str, Any]:
-    payload = diagnose_capabilities()
+    payload = cached_capabilities()
     payload["time"] = utc_now_iso()
     payload["version"] = "sem-e2e-api-0.1"
     return payload
@@ -942,6 +948,11 @@ def config() -> dict[str, Any]:
         "time": utc_now_iso(),
         "config": runtime_config(),
         "protectQueue": protect_queue_snapshot(),
+        "capabilitiesCache": {
+            "strategy": "disk-snapshot-stale-while-revalidate",
+            "refreshFlag": "seme2e-runtime/capabilities-refresh.flag",
+            "refreshValue": 1,
+        },
     }
 
 
@@ -964,6 +975,7 @@ async def upload_file(file: UploadFile = File(...)) -> dict[str, Any]:
         "uploadedAt": utc_now_iso(),
         "path": path,
     }
+    data.update(probe_audio_metadata(path))
     FILES[file_id] = data
     return {key: value for key, value in data.items() if key != "path"}
 
@@ -1804,12 +1816,16 @@ def list_tasks() -> list[dict[str, Any]]:
                 "asrStage": "asr_eval" if has_asr_result else None,
                 "asrMessage": asr_message,
                 "asrElapsedSec": asr_elapsed,
+                "asrStartedAt": asr_task.get("createdAt") if asr_task else None,
+                "asrCompletedAt": asr_task.get("updatedAt") if asr_task_status in {"completed", "success", "failed", "error", "cancelled"} else None,
                 "asrError": asr_error,
                 "cloneStatus": clone_task_status,
                 "cloneProgress": clone_progress,
                 "cloneStage": "downstream_tts_eval" if has_clone_result else None,
                 "cloneMessage": clone_message,
                 "cloneElapsedSec": clone_elapsed,
+                "cloneStartedAt": clone_task.get("createdAt") if clone_task else None,
+                "cloneCompletedAt": clone_task.get("updatedAt") if clone_task_status in {"completed", "success", "failed", "error", "cancelled"} else None,
                 "cloneError": clone_error,
                 "hasAsrResult": bool(has_asr_result),
                 "hasCloneResult": bool(has_clone_result),
@@ -1946,16 +1962,18 @@ def run_asr_eval(task_id: str, payload: AsrEvalRequest) -> JSONResponse:
     if validation_error is not None:
         return validation_error
     asr_sub_id = f"asr_{uuid.uuid4().hex[:8]}"
+    asr_started_at = time.time()
     cancel_event = threading.Event()
     write_task_status(
         task_id,
         status="running",
         progress=0.05,
         stage="asr_eval",
-            message="后端已排入 ASR 评估队列",
+        message="后端已排入 ASR 评估队列",
         error=None,
         asrSubId=asr_sub_id,
         asrResult=None,
+        elapsedSec=0.0,
     )
 
     def run_asr_background() -> None:
@@ -1970,6 +1988,7 @@ def run_asr_eval(task_id: str, payload: AsrEvalRequest) -> JSONResponse:
                 message="后端正在执行 ASR 评估",
                 error=None,
                 asrResult=None,
+                elapsedSec=round(time.time() - asr_started_at, 3),
             )
             result = create_asr_eval(task_id, payload.model_dump())
             ensure_task_not_cancelled(task_id, cancel_event)
@@ -1992,6 +2011,7 @@ def run_asr_eval(task_id: str, payload: AsrEvalRequest) -> JSONResponse:
                         "details": {"model": payload.model, "reason": str(reason)},
                     },
                     asrResult=result,
+                    elapsedSec=round(time.time() - asr_started_at, 3),
                 )
                 result_path = TASK_DIR / task_id / "asr_result.json"
                 result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2004,6 +2024,7 @@ def run_asr_eval(task_id: str, payload: AsrEvalRequest) -> JSONResponse:
                 message="ASR 评估已完成",
                 error=None,
                 asrResult=result,
+                elapsedSec=round(time.time() - asr_started_at, 3),
             )
             result_path = TASK_DIR / task_id / "asr_result.json"
             result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2015,6 +2036,7 @@ def run_asr_eval(task_id: str, payload: AsrEvalRequest) -> JSONResponse:
                     stage="asr_eval",
                     message="Task cancelled by delete request",
                     error=None,
+                    elapsedSec=round(time.time() - asr_started_at, 3),
                 )
         except Exception as exc:
             write_task_log(
@@ -2042,6 +2064,7 @@ def run_asr_eval(task_id: str, payload: AsrEvalRequest) -> JSONResponse:
                     "stage": "asr_eval",
                     "details": {"model": payload.model, "reason": str(exc)},
                 },
+                elapsedSec=round(time.time() - asr_started_at, 3),
             )
         finally:
             cleanup_task_runtime(task_id)

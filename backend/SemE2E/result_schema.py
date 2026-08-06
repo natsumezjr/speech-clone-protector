@@ -70,7 +70,7 @@ def empty_details() -> dict[str, Any]:
             "lossItems": None,
             "models": None,
             "checkpoints": None,
-            "source": "VoiceSheild.protect",
+            "source": "VoiceShield.protect",
             "status": "unavailable",
         },
         "semantic": {

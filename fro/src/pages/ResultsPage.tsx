@@ -20,7 +20,8 @@ import {
   Volume2,
   X,
 } from 'lucide-react'
-import { cloneVoice, downloadEvidenceZip, downloadProtectedAudio, exportReport, getCapabilities, getPsychoacousticSlice, getTaskResult, getTaskStatus, listTasks, runAsrEval } from '@/services/apiClient'
+import { cloneVoice, downloadEvidenceZip, downloadProtectedAudio, exportReport, getPsychoacousticSlice, getTaskResult, getTaskStatus, listTasks, runAsrEval } from '@/services/apiClient'
+import { useCapabilitiesQuery } from '@/hooks/useCapabilitiesQuery'
 import { useAppStore } from '@/store/appStore'
 import { useTaskStore } from '@/store/taskStore'
 import type { AsrEval, AsrMetrics, CapabilitiesResponse, CloneEval, CloneVoiceRequest, CloneVoiceResult, DiffOp, LossFinal, LossTrendPoint, ProtectionRuntimeConfig, PsychoacousticPoint, PsychoacousticSliceResponse, RadarPoint, TaskResult, TaskStatusResponse } from '@/types/task'
@@ -32,7 +33,7 @@ import { formatDurationSeconds, getAudioDuration, getAudioSource } from '@/utils
 import { TrendChart } from '@/components/charts/TrendChart'
 import { MathText } from '@/components/common/MathText'
 import { cloneMetricDisplay, computeAbsoluteDrop, formatCloneMetricNumber, generateCloneMetricInsights } from '@/utils/cloneMetricDisplay'
-import { analyzeLossTrend, type TrendDirection } from '@/utils/resultMetrics'
+import { analyzeLossConvergence, analyzeLossTrend, type TrendDirection } from '@/utils/resultMetrics'
 
 const statusText: Record<TaskResult['status'], string> = {
   queued: '排队中',
@@ -298,11 +299,7 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
     speed: 1,
     speakerPrompt: '',
   })
-  const { data: capabilities } = useQuery({
-    queryKey: ['capabilities'],
-    queryFn: getCapabilities,
-    staleTime: 60_000,
-  })
+  const { data: capabilities } = useCapabilitiesQuery()
   const { data: linkedTaskStatus, refetch: refetchLinkedTaskStatus } = useQuery({
     queryKey: ['task-linked-evaluations', result.taskId],
     queryFn: () => getTaskStatus(result.taskId),
@@ -2235,9 +2232,9 @@ function lossTrendText(key: LossDisplayKey, direction: TrendDirection) {
       stable: '由图所示，\\(L_2\\) 整体保持稳定，扰动能量控制较为平稳。',
     },
     total: {
-      up: '\\(L_{\\mathrm{total}}\\) 整体呈上升趋势，当前优化收敛效果较弱。若更重视收敛稳定性，可适当增加优化步数。',
-      down: '\\(L_{\\mathrm{total}}\\) 整体呈下降趋势，优化过程正在稳定收敛。',
-      stable: '\\(L_{\\mathrm{total}}\\) 整体保持稳定，优化过程已进入平稳阶段。',
+      up: '由图所示，\\(L_{\\mathrm{total}}\\) 整体呈上升趋势，优化过程仍在持续变化。',
+      down: '由图所示，\\(L_{\\mathrm{total}}\\) 整体呈下降趋势，优化过程正在稳定收敛。',
+      stable: '由图所示，\\(L_{\\mathrm{total}}\\) 整体保持稳定，优化过程已进入平稳阶段。',
     },
   } as const
   return messages[key][direction]
@@ -2286,12 +2283,12 @@ function linkedAsrTuningAdvice({ linkedTaskStatus, asrEval }: ProtectionEvaluati
 
   const metricText = formatRatioPercent(metric)
   if (metric < asrWeakDisruptionThreshold) {
-    return `调参建议（ASR 联动）：保护后 ${metricName} 为 ${metricText}，低于 20%，语义干扰较弱；建议提高 \\(\\lambda_{\\mathrm{sem}}\\) 后重新保护并复测。`
+    return `调参建议（ASR 联动）：保护后 ${metricName} 为 ${metricText}，语义干扰较弱；建议提高 \\(\\lambda_{\\mathrm{sem}}\\) 后重新保护并复测。`
   }
   if (metric < asrStrongDisruptionThreshold) {
-    return `调参建议（ASR 联动）：保护后 ${metricName} 为 ${metricText}，处于 20%–50% 的中等干扰区间；若优先阻断语义链路，可小幅提高 \\(\\lambda_{\\mathrm{sem}}\\)。`
+    return `调参建议（ASR 联动）：保护后 ${metricName} 为 ${metricText}，语义干扰已有一定效果；若优先阻断语义链路，可小幅提高 \\(\\lambda_{\\mathrm{sem}}\\)。`
   }
-  return `调参建议（ASR 联动）：保护后 ${metricName} 为 ${metricText}，已达到不低于 50% 的强干扰参考区间，当前可保持 \\(\\lambda_{\\mathrm{sem}}\\)。`
+  return `调参建议（ASR 联动）：保护后 ${metricName} 为 ${metricText}，语义干扰效果较明显，当前可保持 \\(\\lambda_{\\mathrm{sem}}\\)。`
 }
 
 function linkedCloneTuningAdvice({ linkedTaskStatus, cloneEval }: ProtectionEvaluationContext) {
@@ -2327,21 +2324,21 @@ function linkedCloneTuningAdvice({ linkedTaskStatus, cloneEval }: ProtectionEval
   const similarityText = protectedSimilarity.toFixed(3)
   const dropText = similarityDropRate === null ? '' : `，较原始克隆下降 ${formatRatioPercent(similarityDropRate)}`
   if (originalSimilarity !== null && originalSimilarity < speakerSameIdentityThreshold) {
-    return `调参建议（克隆联动）：原始音频克隆的声纹相似度仅 ${originalSimilarity.toFixed(3)}，已低于 0.25，说明本次克隆基线本身较弱；建议先更换克隆模型或样本复测，暂不据此调整 \\(\\lambda_{\\mathrm{id}}\\)。`
+    return `调参建议（克隆联动）：原始音频克隆的声纹相似度为 ${originalSimilarity.toFixed(3)}，本次克隆基线偏弱；建议先更换克隆模型或样本复测，暂不据此调整 \\(\\lambda_{\\mathrm{id}}\\)。`
   }
   if (protectedSimilarity >= speakerHighSimilarityThreshold) {
-    return `调参建议（克隆联动）：保护后克隆声纹相似度为 ${similarityText}${dropText}，仍不低于 0.50，声音身份残留较高；建议提高 \\(\\lambda_{\\mathrm{id}}\\) 后重新保护并复测。`
+    return `调参建议（克隆联动）：保护后克隆声纹相似度为 ${similarityText}${dropText}，声音身份残留较高；建议提高 \\(\\lambda_{\\mathrm{id}}\\) 后重新保护并复测。`
   }
   if (protectedSimilarity >= speakerSameIdentityThreshold) {
-    return `调参建议（克隆联动）：保护后克隆声纹相似度为 ${similarityText}${dropText}，处于 0.25–0.50，仍高于论文采用的 0.25 同身份判定阈值；建议小幅提高 \\(\\lambda_{\\mathrm{id}}\\)。`
+    return `调参建议（克隆联动）：保护后克隆声纹相似度为 ${similarityText}${dropText}，仍有一定声音身份特征残留；建议小幅提高 \\(\\lambda_{\\mathrm{id}}\\)。`
   }
-  return `调参建议（克隆联动）：保护后克隆声纹相似度为 ${similarityText}${dropText}，已低于 0.25 的低相似度参考阈值，当前可保持 \\(\\lambda_{\\mathrm{id}}\\)。`
+  return `调参建议（克隆联动）：保护后克隆声纹相似度为 ${similarityText}${dropText}，声音身份相似度已明显降低，当前可保持 \\(\\lambda_{\\mathrm{id}}\\)。`
 }
 
 function generateProtectionInsights(result: TaskResult, evaluationContext: ProtectionEvaluationContext = {}) {
   const perturbation = result.perturbation
   const quality = result.protectionQuality ?? result.quality
-  const trace = result.optimizationTrace ?? result.generation?.optimizationTrace ?? result.charts?.optimizationTrend ?? []
+  const trace = downsampleTrace(result.optimizationTrace ?? result.generation?.optimizationTrace ?? result.charts?.optimizationTrend ?? [])
   const snr = optionalNumber(perturbation?.snr) ?? optionalNumber(quality?.snr)
   const pesq = optionalNumber(quality?.pesq)
   const stoi = optionalNumber('stoi' in (quality ?? {}) ? (quality as { stoi?: number | null }).stoi : null)
@@ -2353,6 +2350,7 @@ function generateProtectionInsights(result: TaskResult, evaluationContext: Prote
     L2: analyzeLossTrend(trace, 'L2'),
     total: analyzeLossTrend(trace, 'total'),
   }
+  const convergence = analyzeLossConvergence(trace)
   const items: string[] = []
 
   if (epsilonUsageRate === null) {
@@ -2392,7 +2390,7 @@ function generateProtectionInsights(result: TaskResult, evaluationContext: Prote
   }
   if (trends.Lpsy.direction === 'up') tuning.push('可适当提高 \\(\\lambda_{\\mathrm{psy}}\\) 强化听感保真。')
   if (trends.L2.direction === 'up') tuning.push('可适当提高 \\(\\lambda_2\\) 约束扰动能量。')
-  if (trends.total.direction === 'up') tuning.push('可适当增加优化步数改善收敛稳定性。')
+  if (convergence.status === 'unconverged') tuning.push('如图所示，可能没有收敛，为了更好的效果可以尝试增大迭代次数。')
   if (snr !== null && snr < 18) tuning.push('若优先提升听感，可适当降低扰动预算。')
   items.push(`调参建议：${tuning.length ? tuning.join('') : '当前曲线运行平稳，保持现有参数即可。'}`)
   items.push(linkedAsrTuningAdvice(evaluationContext))

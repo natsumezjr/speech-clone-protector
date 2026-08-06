@@ -6,6 +6,10 @@ export interface AudioFileMeta {
   sampleRate?: number
   channels?: number
   bitDepth?: number
+  codec?: string
+  metadataStatus?: 'available' | 'partial' | 'unavailable'
+  metadataSource?: string
+  metadataReason?: string
   sizeBytes: number
   format: string
   src?: string

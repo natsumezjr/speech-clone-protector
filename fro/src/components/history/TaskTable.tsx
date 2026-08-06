@@ -71,6 +71,12 @@ function elapsedForView(task: HistoryTask, view: HistoryView) {
   return typeof elapsed === 'number' && Number.isFinite(elapsed) ? elapsed : null
 }
 
+function startedAtForView(task: HistoryTask, view: HistoryView) {
+  if (view === 'asr') return task.asrStartedAt
+  if (view === 'clone') return task.cloneStartedAt
+  return task.createdAt
+}
+
 function statusTextForView(task: HistoryTask, view: HistoryView) {
   const status = statusForView(task, view)
   const label = view === 'asr' ? 'ASR' : view === 'clone' ? '克隆' : '防护'
@@ -238,7 +244,7 @@ export function TaskTable({ tasks, view, onChanged }: { tasks: HistoryTask[]; vi
                     <p className="mt-1 text-center font-mono text-xs text-slate-500">{Math.round(progress * 100)}%</p>
                   </td>
                   <td className="px-4 py-4 text-slate-300">{modelForView(task, view) || '-'}</td>
-                  <td className="px-4 py-4 text-slate-400">{formatDate(task.createdAt)}</td>
+                  <td className="px-4 py-4 text-slate-400">{formatDate(startedAtForView(task, view))}</td>
                   <td className="px-4 py-4 text-slate-300">{elapsed !== null ? seconds(elapsed) : '-'}</td>
                   <td className="px-4 py-4">
                     <div className="flex justify-center gap-2">

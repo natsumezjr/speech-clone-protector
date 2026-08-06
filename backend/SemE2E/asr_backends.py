@@ -16,6 +16,9 @@ ROOT = Path(__file__).resolve().parent
 LOCAL_ASR_MODELS = {
     "openai/whisper-small": ROOT / "checkpoints" / "asr" / "openai-whisper-small",
 }
+LOCAL_FUNASR_MODELS = {
+    "paraformer-zh": ROOT / "checkpoints" / "modelscope" / "damo" / "speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+}
 
 
 def resolve_asr_model_path(model_name: str) -> str:
@@ -45,7 +48,9 @@ class ASRTranscriber:
     def _init_funasr(self, model_id: str) -> None:
         from funasr import AutoModel as FunASRAutoModel
 
-        self.model = FunASRAutoModel(model=model_id, disable_update=True)
+        local_path = LOCAL_FUNASR_MODELS.get(model_id)
+        resolved_model = str(local_path) if local_path and (local_path / "model.pt").exists() else model_id
+        self.model = FunASRAutoModel(model=resolved_model, disable_update=True)
 
     def _init_openai_whisper(self, model_id: str) -> None:
         import whisper

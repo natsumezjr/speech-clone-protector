@@ -13,6 +13,7 @@ from audio_preprocess import (
     AudioPreprocessError,
     TARGET_SAMPLE_RATE,
     audio_preprocess_capabilities,
+    probe_audio_metadata,
     preprocess_audio,
     resolve_ffmpeg,
 )
@@ -42,6 +43,19 @@ class AudioPreprocessTests(unittest.TestCase):
             self.assertEqual(info.subtype, "PCM_16")
             self.assertEqual(metadata["decoder"]["name"], "libsndfile")
             self.assertEqual(metadata["output"]["sampleRate"], TARGET_SAMPLE_RATE)
+
+    def test_probe_audio_metadata_returns_upload_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "stereo-48k.wav"
+            self._write_stereo_wav(source)
+
+            metadata = probe_audio_metadata(source)
+
+        self.assertEqual(metadata["metadataStatus"], "available")
+        self.assertEqual(metadata["sampleRate"], 48_000)
+        self.assertEqual(metadata["channels"], 2)
+        self.assertEqual(metadata["bitDepth"], 16)
+        self.assertAlmostEqual(metadata["durationSec"], 0.5, places=2)
 
     def test_decodes_browser_webm_opus_with_resolved_ffmpeg(self) -> None:
         ffmpeg_path, _source = resolve_ffmpeg()

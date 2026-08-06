@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import shutil
@@ -98,6 +99,116 @@ def resolve_ffmpeg() -> tuple[Path | None, str | None]:
     if resolved is not None:
         return resolved, "PATH"
     return None, None
+
+
+def resolve_ffprobe() -> tuple[Path | None, str | None]:
+    configured = _resolve_candidate(os.getenv("SEME2E_FFPROBE_PATH"))
+    if configured is not None:
+        return configured, "SEME2E_FFPROBE_PATH"
+
+    executable_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+    ffmpeg_path, ffmpeg_source = resolve_ffmpeg()
+    if ffmpeg_path is not None:
+        sibling = _resolve_candidate(ffmpeg_path.with_name(executable_name))
+        if sibling is not None:
+            return sibling, ffmpeg_source
+
+    for candidate in [
+        ROOT / "vendor" / "ffmpeg" / executable_name,
+        ROOT / "vendor" / "ffmpeg" / "bin" / executable_name,
+        ROOT / "vendor" / executable_name,
+    ]:
+        resolved = _resolve_candidate(candidate)
+        if resolved is not None:
+            return resolved, "vendor"
+
+    resolved = _resolve_candidate(shutil.which("ffprobe"))
+    return (resolved, "PATH") if resolved is not None else (None, None)
+
+
+def _subtype_bit_depth(subtype: str | None) -> int | None:
+    normalized = str(subtype or "").upper()
+    for marker, depth in (("S8", 8), ("U8", 8), ("16", 16), ("24", 24), ("32", 32), ("64", 64)):
+        if marker in normalized:
+            return depth
+    return None
+
+
+def probe_audio_metadata(source_path: Path) -> dict[str, Any]:
+    """Read upload metadata without normalizing or changing the source file."""
+
+    source_path = Path(source_path)
+    errors: list[str] = []
+    try:
+        info = sf.info(str(source_path))
+        if info.frames > 0 and info.samplerate > 0:
+            return {
+                "durationSec": float(info.duration),
+                "duration": float(info.duration),
+                "sampleRate": int(info.samplerate),
+                "channels": int(info.channels),
+                "bitDepth": _subtype_bit_depth(info.subtype),
+                "codec": info.subtype,
+                "metadataStatus": "available",
+                "metadataSource": "libsndfile",
+            }
+    except Exception as exc:
+        errors.append(f"libsndfile: {type(exc).__name__}: {exc}")
+
+    ffprobe_path, ffprobe_source = resolve_ffprobe()
+    if ffprobe_path is not None:
+        try:
+            completed = subprocess.run(
+                [
+                    str(ffprobe_path),
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "a:0",
+                    "-show_entries",
+                    "stream=sample_rate,channels,bits_per_sample,bits_per_raw_sample,codec_name:format=duration",
+                    "-of",
+                    "json",
+                    str(source_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            payload = json.loads(completed.stdout)
+            stream = (payload.get("streams") or [{}])[0]
+            format_payload = payload.get("format") or {}
+
+            def positive_int(value: Any) -> int | None:
+                try:
+                    parsed = int(value)
+                except (TypeError, ValueError):
+                    return None
+                return parsed if parsed > 0 else None
+
+            try:
+                duration = float(format_payload.get("duration"))
+            except (TypeError, ValueError):
+                duration = None
+            bit_depth = positive_int(stream.get("bits_per_raw_sample")) or positive_int(stream.get("bits_per_sample"))
+            return {
+                "durationSec": duration,
+                "duration": duration,
+                "sampleRate": positive_int(stream.get("sample_rate")),
+                "channels": positive_int(stream.get("channels")),
+                "bitDepth": bit_depth,
+                "codec": stream.get("codec_name"),
+                "metadataStatus": "available" if duration is not None and stream.get("sample_rate") and stream.get("channels") else "partial",
+                "metadataSource": f"ffprobe:{ffprobe_source}",
+            }
+        except Exception as exc:
+            errors.append(f"ffprobe: {type(exc).__name__}: {exc}")
+
+    return {
+        "metadataStatus": "unavailable",
+        "metadataReason": "; ".join(errors) if errors else "no supported audio metadata decoder is available",
+    }
 
 
 def audio_preprocess_capabilities() -> dict[str, Any]:

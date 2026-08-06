@@ -50,7 +50,7 @@ const metrics = [
   { title: 'SNR 信噪比', value: '25.1', sub: '高保真听感', tone: 'green', data: [35, 45, 38, 62, 54, 77, 69, 82] },
   { title: '对抗评估（攻击成功率）', value: '↓ 85.6%', sub: '多攻击平均下降', tone: 'red', data: [22, 38, 55, 31, 76, 42, 37, 25] },
   { title: '任务通过率', value: '98.7%', sub: '通过率（内部基准）', tone: 'cyan', data: [16, 22, 28, 45, 39, 56, 73, 88] },
-  { title: '单步平均时长', value: '9.2s', sub: '平均耗时', tone: 'blue', data: [18, 47, 26, 62, 38, 70, 54, 76] },
+  { title: '单步平均时长', value: '0.9s', sub: '平均耗时', tone: 'blue', data: [18, 47, 26, 62, 38, 70, 54, 76] },
 ]
 
 const capabilities = [
@@ -69,12 +69,12 @@ export function HomePage() {
             发布前保护你的声音，
             <span className="block bg-gradient-to-r from-emerald-300 via-cyan-300 to-sky-400 bg-clip-text text-transparent">降低语音克隆风险</span>
           </h1>
-          <div className="mt-2 w-full max-w-[390px] overflow-hidden" aria-label="VoiceSheild">
+          <div className="mt-2 w-full max-w-[390px] overflow-hidden" aria-label="VoiceShield">
             <span
               aria-hidden="true"
               className="block whitespace-nowrap bg-gradient-to-r from-sky-200 via-cyan-300 to-blue-500 bg-clip-text text-[55px] font-black italic leading-none tracking-[0.055em] text-transparent drop-shadow-[0_5px_20px_rgba(34,211,238,0.28)] [-webkit-text-stroke:1px_rgba(125,211,252,0.28)] [font-family:'Arial_Black','Trebuchet_MS',sans-serif] max-md:text-[48px]"
             >
-              VoiceSheild
+              VoiceShield
             </span>
           </div>
           <p className="mt-5 max-w-[390px] text-[16px] leading-8 text-slate-300">

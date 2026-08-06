@@ -9,6 +9,7 @@ import sys
 import traceback
 import uuid
 import wave
+import zipfile
 import importlib.util
 from pathlib import Path
 from typing import Any, Callable
@@ -16,6 +17,7 @@ from typing import Any, Callable
 import numpy as np
 
 from audio_preprocess import AudioPreprocessError, audio_preprocess_capabilities, preprocess_audio
+from capability_cache import get_capabilities_snapshot
 from metric_definitions import (
     align_audio_pair,
     compute_asr_metrics,
@@ -251,10 +253,30 @@ def _model_directory_ready(path: Path | None) -> bool:
 def _tts_model_cache_status(cache_name: str) -> tuple[str, str | None, str]:
     path = _tts_cache_dir() / cache_name
     config_path = path / "config.json"
-    checkpoint_files = list(path.glob("*.pth")) if path.exists() else []
-    if config_path.exists() and checkpoint_files:
-        return "available", None, str(path)
-    return "download_required", f"missing local Coqui TTS cache: {path}", str(path)
+    checkpoint_path = path / "model.pth"
+    if not checkpoint_path.exists():
+        checkpoint_path = path / "model_file.pth"
+    if not config_path.exists() or not checkpoint_path.exists():
+        return "download_required", f"missing local Coqui TTS cache: {path}", str(path)
+    ready, reason = _torch_checkpoint_ready(checkpoint_path)
+    if not ready:
+        return "unavailable", reason, str(path)
+    return "available", None, str(path)
+
+
+def _torch_checkpoint_ready(path: Path) -> tuple[bool, str | None]:
+    try:
+        if not path.is_file() or path.stat().st_size < 1024 * 1024:
+            return False, f"incomplete checkpoint: {path}"
+        with path.open("rb") as checkpoint_file:
+            signature = checkpoint_file.read(4)
+        if signature.startswith(b"PK"):
+            with zipfile.ZipFile(path) as checkpoint_zip:
+                if not checkpoint_zip.namelist():
+                    return False, f"empty checkpoint archive: {path}"
+    except (OSError, zipfile.BadZipFile) as exc:
+        return False, f"invalid checkpoint archive: {path} ({type(exc).__name__}: {exc})"
+    return True, None
 
 
 def _portable_tts_config(model_dir: Path, config_path: Path) -> Path:
@@ -307,6 +329,7 @@ def supported_tts_languages(model: str | None) -> list[str]:
 
 
 def _checkpoint_status() -> dict[str, Any]:
+    whisper_cache_dir = Path(os.getenv("WHISPER_CACHE_DIR", Path.home() / ".cache" / "whisper"))
     required = {
         "VITS": ROOT / "checkpoints" / "VITS" / "pretrained_ljs.pth",
         "GPT-SoVITS": ROOT / "checkpoints" / "GSV" / "base_models" / "gsv-v2final-pretrained" / "s2G2333k.pth",
@@ -316,6 +339,9 @@ def _checkpoint_status() -> dict[str, Any]:
         "ESpeakNG": ROOT / "vendor" / "espeak-ng" / "libespeak-ng.dll",
         "ESpeakNGData": ROOT / "vendor" / "espeak-ng" / "espeak-ng-data",
         "ASRWhisperSmall": ROOT / "checkpoints" / "asr" / "openai-whisper-small" / "config.json",
+        "ASRWhisperTiny": whisper_cache_dir / "tiny.pt",
+        "ASRWhisperBase": whisper_cache_dir / "base.pt",
+        "ASRParaformerZh": ROOT / "checkpoints" / "modelscope" / "damo" / "speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch" / "model.pt",
         "ECAPA": ROOT / "checkpoints" / "ecapa" / "embedding_model.ckpt",
     }
     entries = {
@@ -422,7 +448,10 @@ def runtime_config() -> dict[str, Any]:
     whisper_small_available = transformers_available and bool((checkpoints.get("entries") or {}).get("ASRWhisperSmall", {}).get("exists"))
     whisper_small_reason = None if whisper_small_available else "missing local Whisper Small checkpoint" if transformers_available else "transformers not installed"
     whisper_package_available = _module_available("whisper")
+    whisper_tiny_available = whisper_package_available and bool((checkpoints.get("entries") or {}).get("ASRWhisperTiny", {}).get("exists"))
+    whisper_base_available = whisper_package_available and bool((checkpoints.get("entries") or {}).get("ASRWhisperBase", {}).get("exists"))
     funasr_available = _module_available("funasr")
+    paraformer_available = funasr_available and bool((checkpoints.get("entries") or {}).get("ASRParaformerZh", {}).get("exists"))
     tts_available = _module_available("TTS")
 
     semantic_options = [
@@ -440,9 +469,9 @@ def runtime_config() -> dict[str, Any]:
     ]
     asr_options = [
         _model_option("Whisper Small", "openai/whisper-small", str(ROOT / "checkpoints" / "asr" / "openai-whisper-small"), "asr", status="available" if whisper_small_available else "unavailable", reason=whisper_small_reason, backend="transformers", localPath=str(ROOT / "checkpoints" / "asr" / "openai-whisper-small")),
-        _model_option("OpenAI Whisper Tiny", "openai-whisper:tiny", "openai-whisper:tiny", "asr", status="available" if whisper_package_available else "unavailable", reason=None if whisper_package_available else "openai-whisper package not installed", backend="openai-whisper"),
-        _model_option("OpenAI Whisper Base", "openai-whisper:base", "openai-whisper:base", "asr", status="available" if whisper_package_available else "unavailable", reason=None if whisper_package_available else "openai-whisper package not installed", backend="openai-whisper"),
-        _model_option("FunASR Paraformer", "funasr:paraformer-zh", "funasr:paraformer-zh", "asr", status="available" if funasr_available else "unavailable", reason=None if funasr_available else "funasr not installed", backend="funasr"),
+        _model_option("OpenAI Whisper Tiny", "openai-whisper:tiny", "openai-whisper:tiny", "asr", status="available" if whisper_tiny_available else "unavailable", reason=None if whisper_tiny_available else "missing local Whisper Tiny checkpoint" if whisper_package_available else "openai-whisper package not installed", backend="openai-whisper"),
+        _model_option("OpenAI Whisper Base", "openai-whisper:base", "openai-whisper:base", "asr", status="available" if whisper_base_available else "unavailable", reason=None if whisper_base_available else "missing local Whisper Base checkpoint" if whisper_package_available else "openai-whisper package not installed", backend="openai-whisper"),
+        _model_option("FunASR Paraformer", "funasr:paraformer-zh", "funasr:paraformer-zh", "asr", status="available" if paraformer_available else "unavailable", reason=None if paraformer_available else "missing local Paraformer checkpoint" if funasr_available else "funasr not installed", backend="funasr"),
     ]
     tts_options = []
     for item in SUPPORTED_TTS_MODELS:
@@ -819,9 +848,9 @@ def run_protection(
         "selectedSemanticEncoders": semantic.get("encoders"),
         "selectedTimbreEncoders": timbre.get("encoders"),
         "activeTimbreEncoders": sorted(active_timbre_encoders),
-        "capabilities": diagnose_capabilities(),
+        "capabilities": get_capabilities_snapshot(RUNTIME_DIR, diagnose_capabilities),
         "protectCall": {
-            "class": "VoiceSheild",
+            "class": "VoiceShield",
             "inputPath": str(input_path),
             "outputPath": str(output_path),
         },
@@ -833,7 +862,7 @@ def run_protection(
             if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("TASK_CANCELLED")
             import torch
-            from core.guard import VoiceSheild
+            from core.guard import VoiceShield
 
             semantic_defaults = config_defaults.get("semantic") or {}
             tokenizer_path = semantic.get("tokenizerPath") or semantic_defaults.get("tokenizerPath")
@@ -842,7 +871,7 @@ def run_protection(
             hubert_path = semantic.get("hubertPath") or semantic_defaults.get("hubertPath") or "facebook/hubert-large-ll60k"
             whisper_path = semantic.get("whisperPath") or semantic_defaults.get("whisperPath") or "openai/whisper-large-v3"
 
-            guard = VoiceSheild(
+            guard = VoiceShield(
                 epsilon=epsilon,
                 max_items=steps,
                 device=torch.device(device if device == "cpu" or torch.cuda.is_available() else "cpu"),
@@ -899,7 +928,7 @@ def run_protection(
                 )
             if not isinstance(result, dict):
                 result = {"raw_return": repr(result)}
-            result["source"] = "VoiceSheild.protect"
+            result["source"] = "VoiceShield.protect"
             result["preset_name"] = FORMAL_PRESET_NAME
             result["guardDiagnostics"] = diagnostics
             return result
@@ -1183,6 +1212,7 @@ def build_task_payload(
     protection_result: dict[str, Any],
     source_path: Path | None = None,
     preprocess_meta: dict[str, Any] | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     base_url = f"/api/artifacts/{task_id}"
     source_url = f"{base_url}/source/{source_path.name}" if source_path is not None else None
@@ -1239,7 +1269,7 @@ def build_task_payload(
             "lossItems": protection_result.get("loss_items"),
             "models": protection_result.get("models"),
             "checkpoints": protection_result.get("checkpoints"),
-            "source": protection_result.get("source") or "VoiceSheild.protect",
+            "source": protection_result.get("source") or "VoiceShield.protect",
             "status": "computed" if protected_path.exists() else "unavailable",
             "realProtect": True,
             "preprocessing": preprocess_meta,
@@ -1257,6 +1287,8 @@ def build_task_payload(
         details["generation"]["deprecationWarnings"] = protection_result["guardDiagnostics"]["deprecationWarnings"]
     update_chain(chains, "protect_generation", details["generation"]["status"], details["generation"]["lossFinal"] or {})
 
+    if progress_callback is not None:
+        progress_callback(progress=0.96, stage="result_evaluation", message="正在计算扰动与可听性指标")
     details["perception"] = compute_perception(input_path, protected_path, payload)
     metric_sources.update(details["perception"].get("_metricSources") or {})
     if details["perception"]["snr"] is None:
@@ -1268,6 +1300,8 @@ def build_task_payload(
         {"snr": details["perception"]["snr"], "pesq": details["perception"]["pesq"]},
     )
 
+    if progress_callback is not None:
+        progress_callback(progress=0.97, stage="result_evaluation", message="正在计算语义与 tokenizer 指标")
     details["semantic"] = compute_mfcc_semantic(input_path, protected_path, semantic_cfg)
     metric_sources.update(details["semantic"].get("_metricSources") or {})
     update_chain(
@@ -1285,6 +1319,8 @@ def build_task_payload(
     metric_sources["asrEval.*"] = metric_source("not_run", "ASRTranscriber", reason="ASR is decoupled from protection; run POST /api/tasks/{taskId}/asr-eval", formula="None until ASR eval runs")
     update_chain(chains, "asr_eval", details["asr"]["status"], {"wer": details["asr"]["wer"], "cer": details["asr"]["cer"]})
 
+    if progress_callback is not None:
+        progress_callback(progress=0.985, stage="result_evaluation", message="正在计算声音身份相似度指标")
     details["speaker"] = maybe_speaker_eval(input_path, protected_path)
     metric_sources.update(details["speaker"].get("_metricSources") or {})
     update_chain(chains, "speaker_eval", details["speaker"]["status"], {"speakerSimilarity": details["speaker"]["simOriginalProtected"]})
@@ -1491,7 +1527,7 @@ def create_task(
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeError("TASK_CANCELLED")
     if progress_callback is not None:
-        progress_callback(progress=0.97, stage="result_evaluation", message="后端正在评估生成的音频")
+        progress_callback(progress=0.955, stage="result_evaluation", message="防护音频已生成，正在准备结果评估")
     completed_at = utc_now_iso()
     result = build_task_payload(
         task_id,
@@ -1504,6 +1540,7 @@ def create_task(
         protection_result,
         source_path=source_path,
         preprocess_meta=preprocess_meta,
+        progress_callback=progress_callback,
     )
     if progress_callback is not None:
         progress_callback(progress=0.99, stage="report_generation", message="后端正在写入结果报告")
@@ -1538,6 +1575,9 @@ def _local_tts_model_files(model: str) -> tuple[Path, Path] | None:
         if not model_path.exists():
             model_path = model_dir / "model_file.pth"
         if config_path.exists() and model_path.exists():
+            ready, reason = _torch_checkpoint_ready(model_path)
+            if not ready:
+                raise RuntimeError(reason or f"invalid local TTS checkpoint: {model_path}")
             config_path = _portable_tts_config(model_dir, config_path)
             if "xtts" in backend_value.lower():
                 return model_dir, config_path

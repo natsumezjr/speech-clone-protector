@@ -97,10 +97,10 @@ def parse_guard_args(argv: list[str]) -> argparse.Namespace:
 def create_guard(args: argparse.Namespace):
     import torch
 
-    from core.guard import VoiceSheild
+    from core.guard import VoiceShield
 
     device = torch.device(args.device)
-    return VoiceSheild(
+    return VoiceShield(
         epsilon=args.epsilon,
         max_items=args.epochs,
         device=device,
