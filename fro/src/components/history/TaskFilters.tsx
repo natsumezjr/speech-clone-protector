@@ -17,7 +17,7 @@ export function TaskFilters({ search, status, mode, onSearchChange, onStatusChan
         <input
           value={search}
           onChange={(event) => onSearchChange(event.target.value)}
-          placeholder="搜索任务 ID 或文件名"
+          placeholder="搜索保护任务或文件名"
           className="h-10 w-full rounded-[6px] border border-cyan-300/14 bg-slate-950/45 py-2 pl-9 pr-3 text-sm text-white outline-none focus:border-cyan-300/60"
         />
       </label>

@@ -174,6 +174,7 @@ SEME2E_RUNTIME_DIR="$project/seme2e-runtime" \
 SEME2E_API_REAL_GUARD=1 \
 SEME2E_ENABLE_ASR=1 \
 SEME2E_API_DEVICE='cuda:0' \
+SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES='5' \
 PYTHONUNBUFFERED=1 \
 nohup "$venv/bin/python" -m uvicorn api_server:app --host 127.0.0.1 --port "$port" > "$outlog" 2> "$errlog" < /dev/null &
 new_pid=$!

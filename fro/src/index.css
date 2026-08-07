@@ -247,6 +247,48 @@ html[data-theme='light'] [class*='text-red-300'] {
   color: #b91c1c;
 }
 
+html[data-theme='light'] [class*='text-violet-100'],
+html[data-theme='light'] [class*='text-violet-200'],
+html[data-theme='light'] [class*='text-violet-300'] {
+  color: #6d28d9;
+}
+
+html[data-theme='light'] [class*='border-violet-300'],
+html[data-theme='light'] [class*='border-violet-400'] {
+  border-color: rgba(109, 40, 217, 0.28);
+}
+
+html[data-theme='light'] [class*='bg-violet-400'] {
+  background-color: rgba(124, 58, 237, 0.1);
+}
+
+html[data-theme='light'] .fine-tune-panel {
+  border-color: rgba(109, 40, 217, 0.3);
+  background: linear-gradient(135deg, rgba(245, 243, 255, 0.98), rgba(237, 233, 254, 0.92));
+}
+
+html[data-theme='light'] .fine-tune-copy {
+  color: #475569;
+}
+
+html[data-theme='light'] .fine-tune-help-button {
+  color: #5b21b6;
+  border-color: rgba(109, 40, 217, 0.34);
+  background-color: rgba(124, 58, 237, 0.13);
+}
+
+html[data-theme='light'] .fine-tune-select {
+  color: #4c1d95;
+  border-color: rgba(109, 40, 217, 0.36);
+  background-color: rgba(255, 255, 255, 0.94);
+}
+
+html[data-theme='light'] .manual-annotation-chip {
+  color: #065f46;
+  border-color: rgba(5, 150, 105, 0.34);
+  background-color: rgba(16, 185, 129, 0.16);
+}
+
 html[data-theme='light'] [class*='border-cyan-300'],
 html[data-theme='light'] [class*='border-cyan-400'] {
   border-color: rgba(14, 116, 144, 0.18);
@@ -285,6 +327,40 @@ html[data-theme='light'] input,
 html[data-theme='light'] select,
 html[data-theme='light'] textarea {
   color: var(--vg-text);
+}
+
+/*
+ * Floating UI must remain visually separate from the page behind it.  Keep
+ * overlays translucent, but make modal panels, menus and native select lists
+ * fully opaque in both themes.
+ */
+[role='dialog'] > .ui-card,
+.ui-popover-surface,
+[role='menu'],
+[role='listbox'] {
+  background: linear-gradient(180deg, #09223c 0%, #041323 100%);
+  backdrop-filter: none;
+}
+
+select,
+select option {
+  color: var(--vg-text);
+  background-color: #041323 !important;
+  color-scheme: dark;
+}
+
+html[data-theme='light'] [role='dialog'] > .ui-card,
+html[data-theme='light'] .ui-popover-surface,
+html[data-theme='light'] [role='menu'],
+html[data-theme='light'] [role='listbox'] {
+  background: linear-gradient(180deg, #ffffff 0%, #edf6ff 100%);
+}
+
+html[data-theme='light'] select,
+html[data-theme='light'] select option {
+  color: var(--vg-text);
+  background-color: #ffffff !important;
+  color-scheme: light;
 }
 
 html[data-theme='light'] [class*='text-slate-950'] {

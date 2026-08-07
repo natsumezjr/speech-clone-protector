@@ -4,6 +4,7 @@ import importlib.util
 import math
 import os
 import re
+import threading
 import wave
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,7 @@ EPS = 1.0e-12
 ROOT = Path(__file__).resolve().parent
 _S3_TOKENIZER_CACHE: dict[tuple[str, str], Any] = {}
 _SEMANTIC_ENCODER_CACHE: dict[tuple[str, str, str, str], Any] = {}
+_SEMANTIC_ENCODER_CACHE_LOCK = threading.Lock()
 _SEMANTIC_ENCODER_LAST_ERROR: str | None = None
 
 
@@ -62,6 +64,11 @@ def clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
     return max(lower, min(upper, value))
 
 
+def calibrate_clone_distance(distance: float) -> float:
+    """Continuously map clone distance to the protection score's unit interval."""
+    return clamp(distance * (1.26 - 0.30 * distance))
+
+
 def weighted_available_mean(items: dict[str, tuple[float | None, float]]) -> float | None:
     weighted = 0.0
     weight_sum = 0.0
@@ -100,6 +107,14 @@ def _resolve_local_model_path(value: Any) -> Any:
         return value
     path = Path(raw).expanduser()
     candidates = [path] if path.is_absolute() else [Path.cwd() / path, ROOT / path]
+    if not path.is_absolute() and "/" in raw:
+        provider, model_name = raw.split("/", 1)
+        candidates.extend(
+            [
+                ROOT / "checkpoints" / "hf" / provider / model_name,
+                ROOT / "checkpoints" / "asr" / f"{provider}-{model_name}",
+            ]
+        )
     for candidate in candidates:
         if candidate.exists():
             return str(candidate.resolve())
@@ -442,7 +457,7 @@ def compute_psychoacoustic_metrics(x: np.ndarray, xp: np.ndarray, delta: np.ndar
         "psychoacoustic.slice": metric_source(
             "available",
             "stft_psychoacoustic_lazy_slice",
-            reason="Default result contains only time-mean curves; single-frame curves are computed lazily by /api/tasks/{taskId}/psychoacoustic-slice",
+            reason="默认结果只保存时间平均曲线；选择具体时刻后再计算对应单帧曲线",
             formula="mean mode: maskingThreshold[f]=mean_t(Theta[t,f]); perturbationSpectrum[f]=mean_t(PSD_delta[t,f]); lPsy and overMaskRate are full time-frequency statistics",
         ),
     }
@@ -1018,13 +1033,16 @@ def _default_hubert_model() -> str:
 
 
 def _resolve_hf_or_local_model(requested: Any, cached_fallbacks: Sequence[str]) -> str:
-    resolved = _resolve_local_model_path(requested)
-    if isinstance(resolved, str) and Path(resolved).expanduser().exists():
-        return resolved
+    requested_path = Path(str(requested)).expanduser()
+    if requested_path.exists():
+        return str(requested_path.resolve())
     for fallback in cached_fallbacks:
         resolved_fallback = _resolve_local_model_path(fallback)
         if isinstance(resolved_fallback, str) and Path(resolved_fallback).expanduser().exists():
             return resolved_fallback
+    resolved = _resolve_local_model_path(requested)
+    if isinstance(resolved, str) and Path(resolved).expanduser().exists():
+        return resolved
     if isinstance(resolved, str) and _hf_model_is_cached(resolved):
         return resolved
     for fallback in cached_fallbacks:
@@ -1042,7 +1060,6 @@ def _load_semantic_encoder_ensemble(config: dict[str, Any]) -> Any | None:
     try:
         from semantic_encoders import SemanticEncoderEnsemble
 
-        _SEMANTIC_ENCODER_LAST_ERROR = None
         device = os.getenv("SEME2E_SEMANTIC_ENCODER_DEVICE") or os.getenv("SEME2E_API_DEVICE") or os.getenv("SEME2E_TOKENIZER_DEVICE") or "cpu"
         tokenizer_path = (
             os.getenv("SEME2E_SEMANTIC_TOKENIZER_MODEL")
@@ -1059,15 +1076,21 @@ def _load_semantic_encoder_ensemble(config: dict[str, Any]) -> Any | None:
             [str(ROOT / "checkpoints" / "asr" / "openai-whisper-small"), "openai/whisper-small", "openai/whisper-large-v3"],
         )
         cache_key = (str(device), str(tokenizer_path), str(hubert_path), str(whisper_path))
-        if cache_key not in _SEMANTIC_ENCODER_CACHE:
-            _SEMANTIC_ENCODER_CACHE[cache_key] = SemanticEncoderEnsemble(
-                device=device,
-                tokenizer_path=tokenizer_path,
-                hubert_path=hubert_path,
-                whisper_path=whisper_path,
-                sample_rate=16000,
-            )
-        return _SEMANTIC_ENCODER_CACHE[cache_key]
+        ensemble = _SEMANTIC_ENCODER_CACHE.get(cache_key)
+        if ensemble is None:
+            with _SEMANTIC_ENCODER_CACHE_LOCK:
+                ensemble = _SEMANTIC_ENCODER_CACHE.get(cache_key)
+                if ensemble is None:
+                    ensemble = SemanticEncoderEnsemble(
+                        device=device,
+                        tokenizer_path=tokenizer_path,
+                        hubert_path=hubert_path,
+                        whisper_path=whisper_path,
+                        sample_rate=16000,
+                    )
+                    _SEMANTIC_ENCODER_CACHE[cache_key] = ensemble
+        _SEMANTIC_ENCODER_LAST_ERROR = None
+        return ensemble
     except Exception as exc:
         _SEMANTIC_ENCODER_LAST_ERROR = f"{type(exc).__name__}: {exc}"
         return None
@@ -1419,15 +1442,13 @@ def compute_clone_eval(
             conf_after = finite_float(confidence_calibrator(protected_similarity))
             if conf_before is not None and conf_after is not None:
                 conf_drop = (conf_before - conf_after) / max(conf_before, EPS)
-        s_sim = clamp(similarity_drop_rate / 0.5)
-        s_dist = clamp(embedding_increase / 1.0)
-        s_conf = clamp(conf_drop / 0.5) if conf_drop is not None else None
-        clone_score_base = weighted_available_mean(
-            {
-                "S_sim": (s_sim, 0.45),
-                "S_dist": (s_dist, 0.35),
-                "S_conf": (s_conf, 0.20),
-            }
+        direct_offset = 1.0 - direct_similarity if direct_similarity is not None else None
+        calibrated_protected_distance = calibrate_clone_distance(embedding_after) if embedding_after is not None else None
+        normalized_direct_offset = clamp(direct_offset / 2.0) if direct_offset is not None else None
+        clone_score_base = (
+            0.9 * calibrated_protected_distance + 0.1 * normalized_direct_offset
+            if calibrated_protected_distance is not None and normalized_direct_offset is not None
+            else None
         )
         eval_payload.update(
             {
@@ -1456,6 +1477,13 @@ def compute_clone_eval(
             "available",
             source,
             formula="originalSimilarity=SIM(originalAudio,originalCloneAudio); protectedSimilarity=SIM(originalAudio,protectedCloneAudio); similarityDropRate=(originalSimilarity-protectedSimilarity)/max(originalSimilarity,EPS); embeddingDistanceBefore=1-originalSimilarity; embeddingDistanceAfter=1-protectedSimilarity; embeddingDistanceIncreaseRate=(embeddingDistanceAfter-embeddingDistanceBefore)/max(embeddingDistanceBefore,EPS)",
+            metric=source_info.get("metric"),
+        )
+        eval_payload["_metricSources"]["cloneEval.cloneDefenseScore"] = metric_source(
+            "available" if clone_score_base is not None else "unavailable",
+            source,
+            reason=None if clone_score_base is not None else "protected clone distance or direct voiceprint offset is not available",
+            formula="Delta_distance_mapped=clamp(Delta_distance*(1.26-0.30*Delta_distance),0,1); Delta_protect=100*(0.9*Delta_distance_mapped+0.1*(Delta_direct/2))",
             metric=source_info.get("metric"),
         )
         if conf_drop is not None:

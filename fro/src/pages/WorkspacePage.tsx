@@ -4,15 +4,11 @@ import { useNavigate } from 'react-router-dom'
 import {
   CheckSquare,
   ChevronDown,
-  Copy,
-  FileAudio,
-  FileText,
-  Gauge,
-  Headphones,
   Info,
   Loader2,
   Mic,
   Settings,
+  Search,
   ShieldCheck,
   SlidersHorizontal,
   StopCircle,
@@ -26,10 +22,11 @@ import { useCapabilitiesQuery } from '@/hooks/useCapabilitiesQuery'
 import { useAppStore } from '@/store/appStore'
 import { useTaskStore } from '@/store/taskStore'
 import type { CapabilitiesResponse, NumericConfigRange, ProtectionMode, ProtectionRuntimeConfig, ProtectionTarget, ProtectionTaskRequest, RuntimeModelOption, TaskStatusResponse } from '@/types/task'
-import { apiBaseUrl } from '@/config/runtime'
 import { cn } from '@/lib/utils'
 import { AudioPlayer } from '@/components/audio/AudioPlayer'
 import { MathText } from '@/components/common/MathText'
+import { ModelInformationModal } from '@/components/common/ModelInformationModal'
+import { WorkspaceEvaluationPanel } from '@/components/evaluation/WorkspaceEvaluationPanel'
 import { formatTaskFailure } from '@/utils/apiError'
 import { formatDurationSeconds, getAudioDuration, getRecordedExtension, getRecorderMimeType, readAudioDuration } from '@/utils/audio'
 import { formatBytes, shortHash } from '@/utils/format'
@@ -46,22 +43,17 @@ function configFromCapabilities(capabilities: CapabilitiesResponse | null | unde
       defaults: capabilities.defaults,
       ranges: capabilities.ranges,
       models: capabilities.models,
+      modelTypes: capabilities.modelTypes,
       constraints: capabilities.constraints,
     }
   }
   return undefined
 }
 
-type UiModelOption = {
-  label: string
-  value: string
-  backendValue?: string
-  status?: string
-  reason?: string | null
-}
+type UiModelOption = RuntimeModelOption & { label: string }
 
 function optionItems(options?: Array<string | RuntimeModelOption>): UiModelOption[] {
-  return (options ?? []).map((option) => (typeof option === 'string' ? { label: option, value: option } : { label: option.label ?? option.value, value: option.value, backendValue: option.backendValue, status: option.status, reason: option.reason }))
+  return (options ?? []).map((option) => (typeof option === 'string' ? { label: option, name: option, value: option } : { ...option, label: option.label ?? option.value }))
 }
 
 function optionValues(options?: Array<string | RuntimeModelOption>) {
@@ -151,12 +143,18 @@ function revokeObjectUrl(url?: string) {
   if (url?.startsWith('blob:')) URL.revokeObjectURL(url)
 }
 
+function splitUploadedAt(value?: string) {
+  const normalized = String(value ?? '').trim().replace('T', ' ')
+  const match = normalized.match(/^(.+?)[,\s]+(\d{1,2}:\d{2}(?::\d{2})?)/)
+  return match ? { date: match[1], time: match[2] } : { date: normalized || '-', time: '-' }
+}
+
 export function WorkspacePage() {
   const navigate = useNavigate()
   const mountedRef = useRef(true)
   const [progress, setProgress] = useState(0)
   const [running, setRunning] = useState(false)
-  const [taskId, setTaskId] = useState<string>()
+  const [, setTaskId] = useState<string>()
   const [taskStatus, setTaskStatus] = useState<TaskStatusResponse | null>(null)
   const activeTaskTokenRef = useRef(0)
   const { data: capabilities, error: capabilitiesQueryError } = useCapabilitiesQuery()
@@ -166,8 +164,8 @@ export function WorkspacePage() {
   const setCurrentTaskStatus = useTaskStore((state) => state.setCurrentTaskStatus)
   const runtimeConfig = configFromCapabilities(capabilities)
   const configError = capabilitiesQueryError
-    ? capabilitiesQueryError instanceof Error ? capabilitiesQueryError.message : '无法读取后端参数配置。'
-    : capabilities && !runtimeConfig ? '后端 capabilities 未返回运行时参数配置。' : null
+    ? capabilitiesQueryError instanceof Error ? capabilitiesQueryError.message : '无法读取系统参数配置。'
+    : capabilities && !runtimeConfig ? '系统暂未返回运行参数配置。' : null
 
   useEffect(() => {
     mountedRef.current = true
@@ -206,7 +204,7 @@ export function WorkspacePage() {
 
   const startTask = async (payload: ProtectionTaskRequest) => {
     if (!uploadedFile?.fileId) {
-pushToast({ kind: 'error', title: '无法创建任务', description: '后端模式下请先上传音频并等待后端返回 fileId。' })
+      pushToast({ kind: 'error', title: '无法创建任务', description: '请先上传音频并等待文件准备完成。' })
       return
     }
 
@@ -219,7 +217,7 @@ pushToast({ kind: 'error', title: '无法创建任务', description: '后端模�
 
       const created = await createProtectionTask({ ...payload, fileId: uploadedFile?.fileId ?? payload.fileId })
       setTaskId(created.taskId)
-      pushToast({ kind: 'success', title: '任务已创建', description: `任务 ID：${created.taskId}` })
+      pushToast({ kind: 'success', title: '保护任务已创建', description: '正在生成保护音频。' })
 
       const finalStatus = await waitForBackendTask(created.taskId, taskToken)
       if (!finalStatus) return
@@ -233,7 +231,7 @@ pushToast({ kind: 'error', title: '无法创建任务', description: '后端模�
       navigate(`/results/${created.taskId}`)
     } catch (error) {
       if (taskToken === activeTaskTokenRef.current) setRunning(false)
-      pushToast({ kind: 'error', title: '任务创建失败', description: error instanceof Error ? error.message : '请检查后端服务。' })
+      pushToast({ kind: 'error', title: '任务创建失败', description: error instanceof Error ? error.message : '请稍后重试。' })
     }
   }
 
@@ -242,10 +240,9 @@ pushToast({ kind: 'error', title: '无法创建任务', description: '后端模�
       <div className="grid grid-cols-[448px_1fr_514px] gap-3 max-2xl:grid-cols-[448px_1fr_514px] max-xl:grid-cols-1">
         <AudioAccessCard maxAudioSizeBytes={runtimeConfig?.constraints?.maxAudioSizeBytes} />
         <StrategyConfigCard running={running} runtimeConfig={runtimeConfig} configError={configError} onStart={(payload) => void startTask(payload)} />
-        <ArchitectureCard />
+        <WorkspaceEvaluationPanel runtimeConfig={runtimeConfig} modelTypes={runtimeConfig?.modelTypes ?? capabilities?.modelTypes} />
       </div>
 
-      <TaskStatusStrip progress={progress} running={running} taskId={taskId} status={taskStatus} />
       {running ? <ProtectionProgressBar progress={progress} status={taskStatus} /> : null}
     </div>
   )
@@ -320,7 +317,7 @@ function AudioAccessCard({ maxAudioSizeBytes }: { maxAudioSizeBytes?: number }) 
 
       const backendMeta = await uploadFile(file)
       setUploadedFile({ ...localMeta, ...backendMeta, objectUrl, rawFile: file })
-      pushToast({ kind: 'success', title: '音频已上传', description: backendMeta.fileId ? `fileId：${backendMeta.fileId}` : `${file.name} 已进入防护队列。` })
+      pushToast({ kind: 'success', title: '音频已上传', description: `${file.name} 已准备完成。` })
     } catch (error) {
       revokeObjectUrl(objectUrl)
       setUploadedFile(null)
@@ -353,7 +350,8 @@ function AudioAccessCard({ maxAudioSizeBytes }: { maxAudioSizeBytes?: number }) 
         const type = recorder.mimeType || mimeType || 'audio/webm'
         const blob = new Blob(chunksRef.current, { type })
         const extension = getRecordedExtension(type)
-        const name = `recorded_voice_${Date.now()}.${extension}`
+        const recordId = typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : `${Date.now()}_${Math.random().toString(16).slice(2)}`
+        const name = `record_${recordId}.${extension}`
         const file = new File([blob], name, { type, lastModified: Date.now() })
 
         clearRecordingTimer()
@@ -395,7 +393,8 @@ function AudioAccessCard({ maxAudioSizeBytes }: { maxAudioSizeBytes?: number }) 
     format: '-',
   }
   const duration = getAudioDuration(uploadedFile)
-  const maxAudioSizeLabel = maxAudioSizeBytes ? formatBytes(maxAudioSizeBytes) : '后端配置'
+  const maxAudioSizeLabel = maxAudioSizeBytes ? formatBytes(maxAudioSizeBytes) : '系统限制'
+  const uploadMoment = splitUploadedAt(uploadedFile?.uploadedAt)
 
   return (
     <section className="ui-card min-h-[730px] p-4">
@@ -460,7 +459,7 @@ function AudioAccessCard({ maxAudioSizeBytes }: { maxAudioSizeBytes?: number }) 
             </button>
             <p className="mt-4 text-[18px] font-black text-white">{recording ? '点击停止录音' : '点击开始录音'}</p>
             <p className="mt-2 font-mono text-[20px] font-black text-cyan-100">{formatDurationSeconds(recordingSec)}</p>
-            <p className="mt-3 text-[15px] text-slate-300">录音结束后会自动作为当前音频输入，并在 Backend 模式上传。</p>
+            <p className="mt-3 text-[15px] text-slate-300">录音结束后会自动作为当前音频输入并完成上传。</p>
             <TinyWave color={recording ? '#f87171' : '#00aef0'} className="mx-auto mt-5 h-9 w-full max-w-[330px]" />
           </div>
         </div>
@@ -491,22 +490,26 @@ function AudioAccessCard({ maxAudioSizeBytes }: { maxAudioSizeBytes?: number }) 
           <span>00:00</span>
           <span>{formatDurationSeconds(duration)}</span>
         </div>
-        <div className="mt-5 grid grid-cols-3 gap-y-6 border-t border-cyan-300/10 pt-4 text-sm">
+        <div className="mt-5 grid grid-cols-3 gap-x-3 gap-y-6 border-t border-cyan-300/10 pt-4 text-sm">
           {[
             ['文件名', displayFile.filename],
             ['时长', duration ? `${duration.toFixed(2)}s` : '待解析'],
-            ['采样率', uploadedFile?.sampleRate ? `${uploadedFile.sampleRate.toLocaleString()} Hz` : '待后端解析'],
-            ['声道', uploadedFile?.channels ? `${uploadedFile.channels}` : '待后端解析'],
+            ['采样率', uploadedFile?.sampleRate ? `${uploadedFile.sampleRate.toLocaleString()} Hz` : '待解析'],
+            ['声道', uploadedFile?.channels ? `${uploadedFile.channels}` : '待解析'],
             ['大小', uploadedFile ? formatBytes(uploadedFile.sizeBytes) : '-'],
             ['格式', displayFile.format],
-            ['上传时间', uploadedFile?.uploadedAt ?? '-'],
-            ['指纹', uploadedFile?.fingerprint ?? '-'],
+            ['上传日期', uploadMoment.date],
+            ['上传时间', uploadMoment.time],
           ].map(([label, value]) => (
             <div key={label} className="min-w-0">
               <p className="text-slate-500">{label}</p>
               <p className="mt-1 truncate font-semibold text-slate-200">{value}</p>
             </div>
           ))}
+          <div className="col-span-3 min-w-0 border-t border-cyan-300/8 pt-4">
+            <p className="text-slate-500">文件指纹</p>
+            <p className="mt-1 break-all font-mono text-xs font-semibold leading-5 text-slate-200">{uploadedFile?.fingerprint ?? '-'}</p>
+          </div>
         </div>
       </div>
 
@@ -529,6 +532,7 @@ function StrategyConfigCard({
   const [selectedMode, setSelectedMode] = useState<Exclude<ProtectionMode, 'joint'>>('standard')
   const [selectedTarget, setSelectedTarget] = useState<ProtectionTarget | 'joint'>('joint')
   const [lambdaModalOpen, setLambdaModalOpen] = useState(false)
+  const [architectureModalOpen, setArchitectureModalOpen] = useState(false)
   const [epsilon, setEpsilon] = useState(0)
   const [steps, setSteps] = useState(0)
   const [lambdaSem, setLambdaSem] = useState(0)
@@ -587,8 +591,8 @@ function StrategyConfigCard({
         <div className="grid min-h-[560px] place-items-center rounded-[7px] border border-cyan-300/14 bg-slate-950/20 p-6 text-center">
           <div>
             {configError ? <Info className="mx-auto h-10 w-10 text-amber-300" /> : <Loader2 className="mx-auto h-10 w-10 animate-spin text-cyan-300" />}
-            <p className="mt-4 text-base font-black text-white">{configError ? '后端参数配置读取失败' : '正在读取后端参数配置'}</p>
-            <p className="mt-2 text-sm leading-6 text-slate-400">{configError || '默认参数、有效范围和模型列表将由 /api/capabilities 返回。'}</p>
+            <p className="mt-4 text-base font-black text-white">{configError ? '系统参数读取失败' : '正在读取系统参数'}</p>
+            <p className="mt-2 text-sm leading-6 text-slate-400">{configError || '暂时无法读取默认参数和模型列表，请稍后重试。'}</p>
           </div>
         </div>
         <div className="mt-5 grid gap-3">
@@ -772,16 +776,15 @@ function StrategyConfigCard({
           <ModelSelectSummary label="语义编码器" values={selectedSemanticEncoders} options={semanticOptionItems} onOpen={openModelModal} />
           <ModelSelectSummary label="身份编码器" values={selectedFeatureModels} options={featureOptionItems} onOpen={openModelModal} />
         </div>
-        <button
-          type="button"
-          onClick={() => setLambdaModalOpen(true)}
-          className="mt-6 flex w-full items-center justify-between border-t border-cyan-300/10 pt-3 text-left text-sm font-bold text-slate-300"
-        >
-          <span className="inline-flex items-center gap-1">
-            高级选项（<MathText formula="\lambda" className="text-cyan-100" />）
-          </span>
-          <ChevronDown className="h-4 w-4 text-cyan-300" />
-        </button>
+        <div className="mt-6 flex items-center gap-2 border-t border-cyan-300/10 pt-3">
+          <button type="button" onClick={() => setLambdaModalOpen(true)} className="flex min-w-0 flex-1 items-center justify-between text-left text-sm font-bold text-slate-300">
+            <span className="inline-flex items-center gap-1">高级选项（<MathText formula="\lambda" className="text-cyan-100" />）</span>
+            <ChevronDown className="h-4 w-4 text-cyan-300" />
+          </button>
+          <button type="button" onClick={() => setArchitectureModalOpen(true)} className="grid h-8 w-8 shrink-0 place-items-center rounded-[6px] border border-cyan-300/18 text-cyan-200 hover:bg-cyan-300/10" aria-label="查看系统架构和优化目标" title="查看系统架构和优化目标">
+            <Search className="h-4 w-4" />
+          </button>
+        </div>
         <div className="mt-5 rounded-[7px] border border-cyan-300/16 bg-sky-400/10 p-3 text-[12px] leading-5 text-slate-300">
           <p className="font-bold text-cyan-200">参数说明</p>
           <p>
@@ -796,6 +799,7 @@ function StrategyConfigCard({
           semanticOptions={semanticOptionItems}
           featureValues={selectedFeatureModels}
           featureOptions={featureOptionItems}
+          modelTypes={runtimeConfig.modelTypes}
           onToggleSemantic={(value) => toggleOption(value, selectedSemanticEncoders, setSelectedSemanticEncoders)}
           onToggleFeature={(value) => toggleOption(value, selectedFeatureModels, setSelectedFeatureModels)}
           onSelectAllSemantic={() => {
@@ -842,6 +846,8 @@ function StrategyConfigCard({
         </div>
       ) : null}
 
+      {architectureModalOpen ? <ArchitectureOverviewModal onClose={() => setArchitectureModalOpen(false)} /> : null}
+
       <div className="mt-5">
         <h3 className="mb-3 text-[15px] font-black text-white">任务执行</h3>
         <div className="grid gap-3">
@@ -857,82 +863,46 @@ function StrategyConfigCard({
             开始生成保护音频
           </button>
         </div>
-        <p className="mt-3 text-center text-xs text-slate-500">预计耗时：单步 0.9 s，总时长预计 {(steps * 0.9).toFixed(1)} s</p>
+        <p className="mt-3 text-center text-xs text-slate-500">预计耗时：单步 0.90 s，总时长预计 {(steps * 0.9).toFixed(2)} s</p>
       </div>
     </section>
   )
 }
 
-function ArchitectureCard() {
-  const pushToast = useAppStore((state) => state.pushToast)
-
+function ArchitectureOverviewModal({ onClose }: { onClose: () => void }) {
   return (
-    <section className="grid gap-3">
-      <div className="ui-card min-h-[550px] p-5">
-        <div className="mb-6 flex items-center justify-between">
+    <div className="fixed inset-0 z-[95] grid place-items-center bg-slate-950/72 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="系统架构与优化目标">
+      <div className="ui-card max-h-[90vh] w-full max-w-[980px] overflow-y-auto p-5 shadow-[0_28px_80px_rgba(0,0,0,0.48)]">
+        <div className="flex items-start justify-between gap-4">
           <div>
-            <h2 className="text-[21px] font-black text-white">系统架构概览</h2>
-            <p className="mt-2 text-sm text-slate-400">克隆防护VoiceShield</p>
+            <h2 className="text-[21px] font-black text-white">系统架构与优化目标</h2>
+            <p className="mt-1 text-xs text-slate-500">保护音频由语义、声音身份和听感约束共同优化</p>
           </div>
-          <button type="button" onClick={() => pushToast({ kind: 'info', title: '系统架构', description: '左侧上传音频，中间生成保护音频，右侧结果页可执行克隆测试与评估导出。' })} className="text-sm font-bold text-cyan-300">查看详情 ›</button>
+          <button type="button" onClick={onClose} className="grid h-9 w-9 place-items-center rounded-full border border-cyan-300/14 text-slate-300 hover:text-white" aria-label="关闭系统架构说明"><X className="h-4 w-4" /></button>
         </div>
-        <div className="grid grid-cols-[118px_36px_132px_36px_128px] items-center gap-2">
+        <div className="mt-5 grid grid-cols-[minmax(140px,1fr)_40px_minmax(170px,1.1fr)_40px_minmax(140px,1fr)] items-center gap-2">
           <ArchBox title="输入音频" sub={<VariableSymbol name="x" />} icon={<Waves className="h-10 w-10 text-sky-200" />} />
           <Arrow />
           <ArchBox title="防护优化引擎" sub="" icon={<ShieldCheck className="h-12 w-12 text-cyan-300" />} active />
           <Arrow />
           <ArchBox title="保护音频" sub={<VariableSymbol name="x" prime />} icon={<Waves className="h-10 w-10 text-sky-200" />} />
         </div>
-        <div className="mt-8 grid grid-cols-3 gap-3">
-          <Branch title="语义分支" color="green" items={['语义理解模型', '多模型语义编码', '表示空间约束', '...']} />
-          <Branch title="身份分支" color="blue" items={['身份编码器', '声音身份约束', '说话人不可恢复', '...']} />
-          <Branch title="听感约束" color="purple" items={['心理声学模型', '掩蔽阈值建模', '听感优化', '...']} />
+        <div className="mt-5 grid grid-cols-3 gap-3">
+          <Branch title="语义分支" color="green" items={['语义理解模型', '多模型语义编码', '表示空间约束']} />
+          <Branch title="身份分支" color="blue" items={['身份编码器', '声音身份约束', '说话人不可恢复']} />
+          <Branch title="听感约束" color="purple" items={['心理声学模型', '掩蔽阈值建模', '听感优化']} />
         </div>
-        <div className="mt-6 rounded-[7px] border border-cyan-300/20 bg-sky-400/10 p-4 text-center text-sm text-slate-300">
-          <span className="mr-3 text-slate-400">联合优化目标</span>
-          <OptimizationFormula />
-          <p className="mt-2 text-xs text-slate-400">可以在自定义中调整实际 λ 参数</p>
+        <div className="mt-5 rounded-[7px] border border-cyan-300/20 bg-sky-400/10 p-4 text-center text-sm text-slate-300">
+          <span className="mr-3 text-slate-400">联合优化目标</span><OptimizationFormula />
         </div>
-      </div>
-
-      <div className="grid grid-cols-[1fr_238px] gap-3">
-        <div className="ui-card h-[260px] overflow-hidden p-4">
-          <h3 className="font-black text-lime-300">损失函数说明</h3>
-          <div className="mt-3 max-h-[208px] overflow-y-auto pr-2 text-sm leading-6 text-slate-300">
-            <div className="space-y-3">
-              <LossTerm formula="L_{\mathrm{sem}}" title="语义损失">
-                拉开原始音频与保护音频在语义编码器或 speech tokenizer 表示空间中的距离，降低 ASR / LLM 对语音内容的稳定理解。
-              </LossTerm>
-              <LossTerm formula="L_{\mathrm{id}}" title="声音身份损失">
-                扰动说话人身份相关表示，使攻击者更难从保护音频中恢复原说话人的声音身份。
-              </LossTerm>
-              <LossTerm formula="L_{\mathrm{psy}}" title="心理声学损失">
-                约束扰动尽量落在人耳不敏感或可被原语音掩蔽的区域，降低可感知噪声。
-              </LossTerm>
-              <LossTerm formula="\lVert \delta \rVert_{2}" title="扰动范数约束">
-                限制整体扰动大小，避免保护音频被过度破坏。
-              </LossTerm>
-            </div>
-          </div>
-        </div>
-        <div className="ui-card p-4">
-          <h3 className="flex items-center justify-between font-black text-white">
-            API 状态
-            <span className="rounded bg-emerald-400/14 px-2 py-1 text-xs text-emerald-300">已配置</span>
-          </h3>
-          {['POST /api/files/upload', 'POST /api/tasks/protect', 'GET /api/tasks/{id}', 'POST /api/tasks/{id}/clone-voice'].map((item) => (
-            <p key={item} className="mt-3 flex justify-between border-b border-cyan-300/8 pb-2 text-xs text-slate-300">
-              <span>{item.split(' ')[1]}</span>
-              <span className="text-emerald-300">{item.split(' ')[0]}</span>
-            </p>
-          ))}
-          <p className="mt-3 flex items-center justify-between text-xs text-slate-400">
-            服务地址：{apiBaseUrl}
-            <Copy className="h-4 w-4" />
-          </p>
+        <div className="mt-5 grid gap-3 md:grid-cols-2">
+          <LossTerm formula="L_{\mathrm{sem}}" title="语义损失">拉开保护前后的语义表示，降低自动识别和语音理解的稳定性。</LossTerm>
+          <LossTerm formula="L_{\mathrm{id}}" title="声音身份损失">扰动说话人身份表示，使原说话人的声音身份更难恢复。</LossTerm>
+          <LossTerm formula="L_{\mathrm{psy}}" title="心理声学损失">让扰动尽量落在人耳不敏感或可被原语音掩蔽的区域。</LossTerm>
+          <LossTerm formula="\lVert \delta \rVert_{2}" title="扰动范数约束">限制整体扰动大小，避免保护音频被过度破坏。</LossTerm>
         </div>
       </div>
-    </section>
+    </div>
   )
 }
 
@@ -945,60 +915,6 @@ function LossTerm({ formula, title, children }: { formula: string; title: string
       </p>
       <p className="mt-1 text-xs leading-5 text-slate-400">{children}</p>
     </div>
-  )
-}
-
-function TaskStatusStrip({ progress, running, taskId, status }: { progress: number; running: boolean; taskId?: string; status?: TaskStatusResponse | null }) {
-  const steps = [
-    ['file_preprocess', '文件预处理', FileAudio],
-    ['encoder_loading', '编码器加载', Mic],
-    ['perturbation_optimization', '扰动优化', SlidersHorizontal],
-    ['psychoacoustic_constraint', '心理声学约束', Headphones],
-    ['result_evaluation', '结果评估', Gauge],
-    ['report_generation', '报告生成', FileText],
-  ] as const
-  const stageIndex = status?.stage ? steps.findIndex(([stage]) => stage === status.stage) : -1
-  const activeIndex = running ? (stageIndex >= 0 ? stageIndex : Math.min(5, Math.floor(progress * steps.length))) : status?.status === 'completed' || status?.status === 'success' ? steps.length - 1 : -1
-
-  return (
-    <section className="ui-card grid min-h-[150px] grid-cols-[1fr_492px] gap-4 p-4 max-xl:grid-cols-1">
-      <div className="flex flex-col justify-center ml-2.5">
-        <div className="flex items-start justify-between gap-2">
-          {steps.map(([, label, Icon], index) => (
-            <div key={label} className="flex flex-1 items-start">
-              <div className="text-center">
-                <div className={cn('mx-auto grid h-10 w-10 place-items-center rounded-full border', index <= activeIndex ? 'border-cyan-300 bg-cyan-400/14 text-cyan-200' : 'border-slate-600 text-slate-500')}>
-                  <Icon className="h-5 w-5" />
-                </div>
-                <p className="mt-2 text-sm font-bold text-slate-200">{label}</p>
-                <p className="mt-2 text-xs text-slate-500">{index < activeIndex ? '已完成' : index === activeIndex && running ? '处理中' : '等待开始'}</p>
-              </div>
-              {index < steps.length - 1 ? <div className={cn('mt-5 h-px flex-1', index < activeIndex ? 'bg-cyan-400' : 'bg-cyan-300/18')} /> : null}
-            </div>
-          ))}
-        </div>
-        {taskId ? <p className="mt-3 text-xs text-cyan-300">当前任务：{taskId}</p> : null}
-        {status?.message ? <p className="mt-1 text-xs text-slate-400">后端状态：{status.message}</p> : null}
-      </div>
-      <div className="grid grid-cols-[1fr_154px] gap-3">
-        <div className="ui-card -ml-[30px] bg-sky-400/7 p-4">
-          <h3 className="font-black text-white">结果产物（完成后可下载）</h3>
-          <div className="mt-3 grid grid-cols-2 gap-2 text-sm text-slate-300">
-            {['保护音频（.wav）', '评估报告（.pdf）', '中间特征（.npz）', '可视化图表（.png）'].map((item) => (
-              <label key={item} className="flex items-center gap-2">
-                <CheckSquare className="h-4 w-4 text-cyan-300" />
-                {item}
-              </label>
-            ))}
-          </div>
-        </div>
-        <div className="ui-card grid place-items-center p-4 text-center">
-          <FileText className="h-10 w-10 text-slate-300" />
-          <p className="mt-2 font-black text-white">操作日志</p>
-          <p className="text-sm text-slate-400">查看详细日志</p>
-        </div>
-      </div>
-    </section>
   )
 }
 
@@ -1105,7 +1021,7 @@ function OptimizationFormula({ className }: { className?: string }) {
 }
 
 function selectionSummary(values: string[], options: UiModelOption[]) {
-  if (!options.length) return '后端未返回'
+  if (!options.length) return '暂未提供'
   if (values.length >= options.length) return `默认全选 · ${options.length}`
   return `已选 · ${values.length}/${options.length}`
 }
@@ -1138,6 +1054,7 @@ function ModelConfigModal({
   semanticOptions,
   featureValues,
   featureOptions,
+  modelTypes,
   onToggleSemantic,
   onToggleFeature,
   onSelectAllSemantic,
@@ -1148,12 +1065,14 @@ function ModelConfigModal({
   semanticOptions: UiModelOption[]
   featureValues: string[]
   featureOptions: UiModelOption[]
+  modelTypes?: CapabilitiesResponse['modelTypes']
   onToggleSemantic: (value: string) => void
   onToggleFeature: (value: string) => void
   onSelectAllSemantic: () => void
   onSelectAllFeature: () => void
   onClose: () => void
 }) {
+  const [informationModel, setInformationModel] = useState<UiModelOption | null>(null)
   return (
     <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/68 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="代理模型和编码器配置">
       <div className="ui-card w-full max-w-[680px] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.46)]">
@@ -1167,8 +1086,8 @@ function ModelConfigModal({
           </button>
         </div>
         <div className="grid gap-4 md:grid-cols-2">
-          <MultiChoiceGroup title="语义编码器" values={semanticValues} options={semanticOptions} onToggle={onToggleSemantic} onSelectAll={onSelectAllSemantic} />
-          <MultiChoiceGroup title="身份编码器" values={featureValues} options={featureOptions} onToggle={onToggleFeature} onSelectAll={onSelectAllFeature} />
+          <MultiChoiceGroup title="语义编码器" values={semanticValues} options={semanticOptions} onToggle={onToggleSemantic} onSelectAll={onSelectAllSemantic} onInformation={setInformationModel} />
+          <MultiChoiceGroup title="身份编码器" values={featureValues} options={featureOptions} onToggle={onToggleFeature} onSelectAll={onSelectAllFeature} onInformation={setInformationModel} />
         </div>
         <div className="mt-5 flex justify-end">
           <button type="button" onClick={onClose} className="cyan-button h-10 min-w-[116px] rounded-[7px] text-sm font-black">
@@ -1176,11 +1095,12 @@ function ModelConfigModal({
           </button>
         </div>
       </div>
+      <ModelInformationModal model={informationModel} modelTypes={modelTypes} onClose={() => setInformationModel(null)} />
     </div>
   )
 }
 
-function MultiChoiceGroup({ title, values, options, onToggle, onSelectAll }: { title: string; values: string[]; options: UiModelOption[]; onToggle: (value: string) => void; onSelectAll: () => void }) {
+function MultiChoiceGroup({ title, values, options, onToggle, onSelectAll, onInformation }: { title: string; values: string[]; options: UiModelOption[]; onToggle: (value: string) => void; onSelectAll: () => void; onInformation: (option: UiModelOption) => void }) {
   return (
     <div className="rounded-[8px] border border-cyan-300/14 bg-slate-950/24 p-4">
       <div className="mb-3 flex items-center justify-between gap-3">
@@ -1199,25 +1119,28 @@ function MultiChoiceGroup({ title, values, options, onToggle, onSelectAll }: { t
       <div className="max-h-[260px] space-y-2 overflow-y-auto pr-1">
         {options.map((option) => {
           const selected = values.includes(option.value)
-          const unavailable = option.status === 'unavailable'
+          const unavailable = option.status !== undefined && option.status !== 'available'
           return (
-            <button
+            <div
               key={option.value}
-              type="button"
-              disabled={unavailable}
-              title={unavailable ? option.reason ?? '后端不可用' : option.backendValue ?? option.value}
-              onClick={() => onToggle(option.value)}
               className={cn(
                 'flex h-10 w-full items-center justify-between gap-3 rounded-[6px] border px-3 text-left text-sm font-bold transition',
                 selected ? 'border-cyan-300 bg-cyan-400/12 text-cyan-100' : 'border-cyan-300/14 bg-slate-950/45 text-slate-400',
-                unavailable && 'cursor-not-allowed opacity-45',
+                unavailable && 'opacity-60',
               )}
             >
-              <span className="min-w-0 truncate">{option.label}</span>
-              <span className={cn('grid h-4 w-4 shrink-0 place-items-center rounded border', selected ? 'border-cyan-300 bg-cyan-300 text-slate-950' : 'border-slate-600')}>
-                {selected ? <CheckSquare className="h-3 w-3" /> : null}
-              </span>
-            </button>
+              <button type="button" disabled={unavailable} title={unavailable ? option.reason ?? '当前不可用' : option.value} onClick={() => onToggle(option.value)} className={cn('flex min-w-0 flex-1 items-center justify-between gap-3', unavailable && 'cursor-not-allowed')}>
+                <span className="min-w-0 truncate">{option.label}</span>
+                <span className={cn('grid h-4 w-4 shrink-0 place-items-center rounded border', selected ? 'border-cyan-300 bg-cyan-300 text-slate-950' : 'border-slate-600')}>
+                  {selected ? <CheckSquare className="h-3 w-3" /> : null}
+                </span>
+              </button>
+              {option.information ? (
+                <button type="button" onClick={(event) => { event.preventDefault(); event.stopPropagation(); onInformation(option) }} className="grid h-7 w-7 shrink-0 place-items-center rounded-[5px] border border-cyan-300/14 text-cyan-200 hover:bg-cyan-300/10" aria-label={`查看 ${option.label} 详情`} title="查看模型详情">
+                  <Search className="h-3.5 w-3.5" />
+                </button>
+              ) : null}
+            </div>
           )
         })}
       </div>

@@ -2,7 +2,7 @@ import axios from 'axios'
 import { apiBaseUrl } from '@/config/runtime'
 import type { ApiClient } from '@/types/api'
 import type { AudioFileMeta } from '@/types/audio'
-import type { ApiErrorPayload, AsrEvalRequest, AsrEvalResponse, CloneVoiceRequest, CloneVoiceResult, HistoryTask, ProtectionTaskRequest, PsychoacousticSliceResponse, TaskDetailsResponse, TaskResult, TaskStatusResponse } from '@/types/task'
+import type { ApiErrorPayload, AsrEvalRequest, AsrEvalResponse, CloneVoiceRequest, CloneVoiceResult, CreateEvaluationBatchRequest, EvaluationBatch, HistoryTask, ProtectionTaskRequest, PsychoacousticSliceResponse, TaskDetailsResponse, TaskResult, TaskStatusResponse } from '@/types/task'
 import { formatStructuredApiError } from '@/utils/apiError'
 
 const http = axios.create({
@@ -326,12 +326,29 @@ function normalizeAsrEval(value: unknown): TaskResult['asrEval'] {
   }
 }
 
+function normalizeSemanticEval(value: unknown): TaskResult['semanticEval'] {
+  const data = asRecord(value)
+  if (Object.keys(data).length === 0) return null
+  return {
+    status: firstString(data, ['status']),
+    tokenChangeRate: firstNumber(data, ['tokenChangeRate', 'token_change_rate']),
+    tokenErrorRate: firstNumber(data, ['tokenErrorRate', 'token_error_rate']),
+    tokenChangeCount: firstNumber(data, ['tokenChangeCount', 'token_change_count']),
+    tokenTotal: firstNumber(data, ['tokenTotal', 'token_total']),
+    semanticDrift: firstNumber(data, ['semanticDrift', 'semantic_drift']),
+    encoderDistances: Array.isArray(data.encoderDistances) ? data.encoderDistances as Array<Record<string, unknown>> : null,
+    reason: firstString(data, ['reason']),
+    error: firstString(data, ['error']),
+  }
+}
+
 function normalizeCloneEval(value: unknown): TaskResult['cloneEval'] {
   const data = asRecord(value)
+  const nestedEval = asRecord(data.cloneEval)
   const request = asRecord(data.request)
   const originalCloneAudio = data.originalCloneAudio ? normalizeAudio(data.originalCloneAudio, 'original_clone.wav') : null
   const protectedCloneAudio = data.protectedCloneAudio ? normalizeAudio(data.protectedCloneAudio, 'protected_clone.wav') : null
-  const hasMetric = hasAnyNumber(data, ['originalSimilarity', 'simBefore', 'similarityBefore', 'protectedSimilarity', 'simAfter', 'similarityAfter', 'embeddingDistanceBefore', 'distanceBefore', 'embeddingDistanceAfter', 'distanceAfter', 'cloneConfidenceBefore', 'confidenceBefore', 'cloneConfidenceAfter', 'confidenceAfter'])
+  const hasMetric = hasAnyNumber(data, ['directSimilarity', 'direct_similarity', 'originalSimilarity', 'simBefore', 'similarityBefore', 'protectedSimilarity', 'simAfter', 'similarityAfter', 'embeddingDistanceBefore', 'distanceBefore', 'embeddingDistanceAfter', 'distanceAfter', 'cloneConfidenceBefore', 'confidenceBefore', 'cloneConfidenceAfter', 'confidenceAfter'])
   if (!originalCloneAudio && !protectedCloneAudio && !hasMetric && !data.cloneEval) return null
   return {
     cloneModel: firstString(data, ['cloneModel', 'clone_model']) ?? firstString(request, ['model']),
@@ -340,6 +357,7 @@ function normalizeCloneEval(value: unknown): TaskResult['cloneEval'] {
     targetText: firstString(data, ['targetText', 'target_text']) ?? firstString(request, ['text']),
     originalCloneAudio,
     protectedCloneAudio,
+    directSimilarity: firstNumber(data, ['directSimilarity', 'direct_similarity']) ?? firstNumber(nestedEval, ['directSimilarity', 'direct_similarity']),
     originalSimilarity: firstNumber(data, ['originalSimilarity', 'simBefore', 'similarityBefore']),
     protectedSimilarity: firstNumber(data, ['protectedSimilarity', 'simAfter', 'similarityAfter']),
     similarityDropRate: firstNumber(data, ['similarityDropRate', 'similarity_drop_rate', 'simDropRate']),
@@ -358,12 +376,47 @@ function normalizeCloneEval(value: unknown): TaskResult['cloneEval'] {
   }
 }
 
+function normalizeFineTuneCondition(value: unknown): NonNullable<CloneVoiceResult['fineTune']>['original'] {
+  const data = asRecord(value)
+  if (Object.keys(data).length === 0) return null
+  return {
+    textSec: firstNumber(data, ['textSec']),
+    hubertSec: firstNumber(data, ['hubertSec']),
+    semanticSec: firstNumber(data, ['semanticSec']),
+    s1TrainSec: firstNumber(data, ['s1TrainSec']),
+    s2TrainSec: firstNumber(data, ['s2TrainSec']),
+    inferenceWallSec: firstNumber(data, ['inferenceWallSec']),
+    totalWallSec: firstNumber(data, ['totalWallSec']),
+    sourceDurationSec: firstNumber(data, ['sourceDurationSec']),
+    trainingDurationSec: firstNumber(data, ['trainingDurationSec']),
+    gptCheckpoint: firstString(data, ['gptCheckpoint']),
+    sovitsCheckpoint: firstString(data, ['sovitsCheckpoint']),
+    referencePath: firstString(data, ['referencePath']),
+    trainingAudioPath: firstString(data, ['trainingAudioPath']),
+    outputPath: firstString(data, ['outputPath']),
+  }
+}
+
+function normalizeFineTuneEvidence(value: unknown): CloneVoiceResult['fineTune'] {
+  const data = asRecord(value)
+  if (Object.keys(data).length === 0) return null
+  return {
+    model: firstString(data, ['model']),
+    mode: firstString(data, ['mode']),
+    workDir: firstString(data, ['workDir']),
+    pairWallSec: firstNumber(data, ['pairWallSec']),
+    original: normalizeFineTuneCondition(data.original),
+    protected: normalizeFineTuneCondition(data.protected),
+  }
+}
+
 function normalizeCloneResult(payload: unknown): CloneVoiceResult {
   const data = asRecord(payload)
   const request = asRecord(data.request)
   const cloneEval = normalizeCloneEval(data)
   return {
     cloneId: String(data.cloneId ?? ''),
+    cloneSubId: typeof data.cloneSubId === 'string' ? data.cloneSubId : undefined,
     taskId: String(data.taskId ?? ''),
     status: stringOr(data.status, 'partial') as CloneVoiceResult['status'],
     source: typeof data.source === 'string' ? data.source : undefined,
@@ -374,19 +427,73 @@ function normalizeCloneResult(payload: unknown): CloneVoiceResult {
       language: typeof request.language === 'string' ? request.language : undefined,
       speed: numberOrNull(request.speed) ?? 1,
       speakerPrompt: typeof request.speakerPrompt === 'string' ? request.speakerPrompt : undefined,
+      originalSpeakerPrompt: typeof request.originalSpeakerPrompt === 'string' ? request.originalSpeakerPrompt : undefined,
+      protectedSpeakerPrompt: typeof request.protectedSpeakerPrompt === 'string' ? request.protectedSpeakerPrompt : undefined,
+      annotationSource: request.annotationSource === 'asr' ? 'asr' : 'manual',
+      annotationAsrSubId: typeof request.annotationAsrSubId === 'string' ? request.annotationAsrSubId : undefined,
+      annotationAsrModel: typeof request.annotationAsrModel === 'string' ? request.annotationAsrModel : undefined,
+      annotationCreatedAt: typeof request.annotationCreatedAt === 'string' ? request.annotationCreatedAt : undefined,
+      batchId: typeof request.batchId === 'string' ? request.batchId : undefined,
+      batchItemId: typeof request.batchItemId === 'string' ? request.batchItemId : undefined,
     },
     originalCloneAudio: normalizeAudio(data.originalCloneAudio, 'original_clone.wav'),
     protectedCloneAudio: normalizeAudio(data.protectedCloneAudio, 'protected_clone.wav'),
     cloneEval,
+    fineTune: normalizeFineTuneEvidence(data.fineTune),
+  }
+}
+
+function normalizeAsrResult(payload: unknown): AsrEvalResponse {
+  const data = asRecord(payload)
+  const request = asRecord(data.request)
+  return {
+    taskId: String(data.taskId ?? ''),
+    asrSubId: typeof data.asrSubId === 'string' ? data.asrSubId : undefined,
+    status: stringOr(data.status, 'partial'),
+    asr: normalizeAsrEval(data.asr) ?? undefined,
+    request: {
+      model: stringOr(request.model, 'default'),
+      language: typeof request.language === 'string' ? request.language : undefined,
+      referenceText: typeof request.referenceText === 'string' ? request.referenceText : undefined,
+      batchId: typeof request.batchId === 'string' ? request.batchId : undefined,
+      batchItemId: typeof request.batchItemId === 'string' ? request.batchItemId : undefined,
+    },
+    createdAt: firstString(data, ['createdAt', 'created_at']),
   }
 }
 
 function normalizeTaskStatus(payload: unknown): TaskStatusResponse {
   const data = asRecord(payload)
   const cloneTask = asRecord(data.cloneTask)
+  const asrTask = asRecord(data.asrTask)
+
+  const normalizeAsrTask = (value: unknown) => {
+    const task = asRecord(value)
+    return {
+      ...(task as unknown as NonNullable<TaskStatusResponse['asrTask']>),
+      asrResult:
+        task.asrResult === null || task.asrResult === undefined
+          ? task.asrResult
+          : normalizeAsrResult(task.asrResult),
+    }
+  }
+  const normalizeCloneTask = (value: unknown) => {
+    const task = asRecord(value)
+    return {
+      ...(task as unknown as NonNullable<TaskStatusResponse['cloneTask']>),
+      cloneResult:
+        task.cloneResult === null || task.cloneResult === undefined
+          ? task.cloneResult
+          : normalizeCloneResult(task.cloneResult),
+    }
+  }
 
   return {
     ...(data as unknown as TaskStatusResponse),
+    asrResult:
+      data.asrResult === null || data.asrResult === undefined
+        ? data.asrResult
+        : normalizeAsrResult(data.asrResult),
     cloneResult:
       data.cloneResult === null || data.cloneResult === undefined
         ? data.cloneResult
@@ -394,13 +501,13 @@ function normalizeTaskStatus(payload: unknown): TaskStatusResponse {
     cloneTask:
       data.cloneTask === null || data.cloneTask === undefined
         ? data.cloneTask
-        : {
-            ...(cloneTask as unknown as NonNullable<TaskStatusResponse['cloneTask']>),
-            cloneResult:
-              cloneTask.cloneResult === null || cloneTask.cloneResult === undefined
-                ? cloneTask.cloneResult
-                : normalizeCloneResult(cloneTask.cloneResult),
-          },
+        : normalizeCloneTask(cloneTask),
+    asrTask:
+      data.asrTask === null || data.asrTask === undefined
+        ? data.asrTask
+        : normalizeAsrTask(asrTask),
+    asrTasks: Array.isArray(data.asrTasks) ? data.asrTasks.map(normalizeAsrTask) : undefined,
+    cloneTasks: Array.isArray(data.cloneTasks) ? data.cloneTasks.map(normalizeCloneTask) : undefined,
   }
 }
 
@@ -414,7 +521,8 @@ function normalizeTaskResult(payload: unknown): TaskResult {
     const generation = asRecord(data.generation ?? asRecord(details.generation))
     const optimizationTrend = normalizeLossTrend(charts.optimizationTrend ?? asRecord(details.generation).optimizationTrace ?? charts.trend)
     const cloneResults = Array.isArray(data.cloneResults) ? data.cloneResults.map(normalizeCloneResult) : undefined
-    const asrEval = normalizeAsrEval(data.asrEval ?? data.asr)
+    const asrResults = Array.isArray(data.asrResults) ? data.asrResults.map(normalizeAsrResult) : undefined
+    const asrEval = normalizeAsrEval(data.asrEval ?? asrResults?.at(-1)?.asr ?? data.asr)
     const latestCloneEval = normalizeCloneEval(data.cloneEval) ?? cloneResults?.at(-1)?.cloneEval ?? null
     return {
       ...(data as unknown as TaskResult),
@@ -432,6 +540,8 @@ function normalizeTaskResult(payload: unknown): TaskResult {
       effectiveConfig: asRecord(data.effectiveConfig ?? data.effective_config ?? generation.effectiveConfig ?? generation.effective_config),
       presetName: stringOr(data.presetName ?? data.preset_name ?? generation.presetName ?? generation.preset_name, '') || null,
       asrEval,
+      semanticEval: normalizeSemanticEval(data.semanticEval ?? asRecord(details).semantic),
+      asrResults,
       cloneEval: latestCloneEval,
       speakerFeatureMap: {
         radar: normalizeRadarPoints(asRecord(data.speakerFeatureMap).radar ?? asRecord(details.speakerFeatureMap).radar),
@@ -490,7 +600,8 @@ function normalizeTaskResult(payload: unknown): TaskResult {
   const lossFinal = normalizeLossFinal(detailGeneration.lossFinal)
   const lossWeights = normalizeLossWeights(detailGeneration.lossWeights)
   const elapsedSec = normalizeElapsedSec(data)
-  const asrEval = normalizeAsrEval(detailAsr)
+  const asrResults = Array.isArray(data.asrResults) ? data.asrResults.map(normalizeAsrResult) : undefined
+  const asrEval = normalizeAsrEval(asrResults?.at(-1)?.asr ?? detailAsr)
   const asrHasResult = asrEval !== null
   const cloneEval = normalizeCloneEval(data.cloneEval) ?? cloneResults?.at(-1)?.cloneEval ?? null
   const perturbation = normalizePerturbation({
@@ -524,7 +635,7 @@ function normalizeTaskResult(payload: unknown): TaskResult {
     submittedAt: typeof data.submittedAt === 'string' ? data.submittedAt : typeof data.createdAt === 'string' ? data.createdAt : undefined,
     completedAt: stringOr(data.completedAt ?? data.createdAt, '-'),
     elapsedSec,
-    inputSource: '后端 API',
+    inputSource: '服务接口',
     language: stringOr(detailAsr.language, '未标注'),
     processingModel: stringOr(detailGeneration.source ?? backend.version, ''),
     optimizationTarget: stringOr(detailGeneration.mode ?? data.mode, 'joint'),
@@ -544,6 +655,8 @@ function normalizeTaskResult(payload: unknown): TaskResult {
     optimizationTrace: optimizationTrend,
     averageStepSec: firstNumber(data, ['averageStepSec', 'average_step_sec']) ?? firstNumber(detailGeneration, ['averageStepSec', 'average_step_sec']) ?? null,
     asrEval,
+    semanticEval: normalizeSemanticEval(data.semanticEval ?? asRecord(details).semantic),
+    asrResults,
     cloneEval,
     cloneResults,
     speakerFeatureMap: {
@@ -689,6 +802,10 @@ export const backendClient: ApiClient = {
   async getTaskDetails(taskId: string): Promise<TaskDetailsResponse> {
     const response = await http.get(`/api/tasks/${taskId}/details`)
     return response.data
+  },
+  async createEvaluationBatch(taskId: string, payload: CreateEvaluationBatchRequest): Promise<EvaluationBatch> {
+    const response = await http.post(`/api/tasks/${taskId}/evaluation-batches`, payload)
+    return response.data as EvaluationBatch
   },
   async runAsrEval(taskId: string, payload: AsrEvalRequest): Promise<AsrEvalResponse> {
     const response = await http.post(`/api/tasks/${taskId}/asr-eval`, payload)

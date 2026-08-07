@@ -4,13 +4,13 @@ import type { TaskResult } from '@/types/task'
 
 export function TaskSummaryStrip({ result }: { result: TaskResult }) {
   const items = [
-    ['任务 ID', result.taskId],
-    ['任务状态', '已完成'],
+    ['保护任务', result.taskId],
+    ['保护状态', '已完成'],
     ['完成时间', result.completedAt ?? '未完成'],
     ['处理耗时', typeof result.elapsedSec === 'number' ? `${result.elapsedSec}s` : '未生成'],
     ['防护模式', '联合防护（推荐）'],
     ['综合判定', result.verdict],
-    ['综合得分', typeof result.score === 'number' ? result.score.toFixed(1) : '未生成'],
+    ['综合得分', typeof result.score === 'number' ? result.score.toFixed(2) : '未生成'],
   ]
 
   return (

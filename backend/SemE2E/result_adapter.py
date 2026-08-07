@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import traceback
 import uuid
 import wave
@@ -35,6 +36,7 @@ from metric_definitions import (
 from result_schema import default_chains, empty_charts, empty_details, empty_primary_metrics, utc_now_iso
 
 ProgressCallback = Callable[..., None]
+RESULT_WRITE_LOCK = threading.RLock()
 
 ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = Path(os.getenv("SEME2E_RUNTIME_DIR", ROOT.parents[1] / "seme2e-runtime"))
@@ -177,7 +179,7 @@ def _env_list(name: str, default: list[str]) -> list[str]:
 
 
 FORMAL_EPSILON = 4 / 255
-FORMAL_STEPS = 100
+FORMAL_STEPS = 200
 FORMAL_WEIGHT_FEATURE = 150.0
 FORMAL_WEIGHT_SEMANTIC = 300.0
 FORMAL_WEIGHT_PSY = 0.001
@@ -194,7 +196,7 @@ FORMAL_PRESET_NAME = "lq25_large_balanced"
 FORMAL_SEMANTIC_ENCODERS = ["S3", "HuBERT", "Whisper", "MFCC"]
 FORMAL_TIMBRE_ENCODERS = ["VITS", "GPT-SoVITS", "MFCC", "WavLM", "CosyVoice"]
 FORMAL_ASR_MODEL = "openai/whisper-small"
-FORMAL_TTS_BACKEND = "tts_models/multilingual/multi-dataset/xtts_v2"
+FORMAL_TTS_BACKEND = "xtts_v2"
 MODEL_TYPES = {
     "tts": [
         {
@@ -243,6 +245,23 @@ MODEL_TYPES = {
         {"value": "evaluation_model", "name": "独立评估模型", "information": "只用于结果评价，不参与 VoiceShield 扰动生成。"},
     ],
 }
+MODEL_METADATA = {
+    "S3": ("S3 Tokenizer Encoder", ["speech_tokenizer", "semantic_encoder", "llm_frontend"], "CosyVoice S3 前端把连续语音编码为离散语音 Token，作为语义扰动优化目标之一。"),
+    "HuBERT": ("HuBERT Large", ["self_supervised_representation", "semantic_encoder"], "HuBERT Large 自监督语音表示用于约束扰动对高层语音内容特征的影响。"),
+    "Whisper": ("Whisper Large-v3 Encoder", ["asr_encoder", "semantic_encoder"], "Whisper Large-v3 编码前端提供面向语音识别的语义表示，不在此处直接输出转写文本。"),
+    "MFCC": ("MFCC", ["acoustic_feature"], "MFCC 是轻量声学基线，用于描述语音的频谱包络；同一模型可参与语义和声音身份两条分支。"),
+    "VITS": ("VITS Posterior Encoder", ["tts_encoder", "voice_identity_encoder"], "VITS 后验编码器提取合成模型使用的声学与音色条件，作为声音身份扰动目标。"),
+    "GPT-SoVITS": ("GPT-SoVITS Encoder", ["clone_encoder", "fine_tuning_related", "voice_identity_encoder", "llm_frontend"], "GPT-SoVITS 编码组件代表训练式、语义 Token 驱动的语音克隆特征路径。"),
+    "WavLM": ("WavLM", ["self_supervised_representation", "voice_identity_encoder"], "WavLM 自监督语音表示同时保留说话人和声学信息，用于声音身份防护。"),
+    "CosyVoice": ("CosyVoice CAM++", ["speaker_encoder", "speaker_verification", "voice_identity_encoder"], "CosyVoice CAM++ 提取参考音频的说话人条件，参与声音身份扰动优化。"),
+    "openai/whisper-small": ("Whisper Small", ["generative_asr"], "Whisper Small 是本项目英文演示的主 ASR，使用服务器本地权重执行真实转写。"),
+    "openai-whisper:tiny": ("Whisper Tiny", ["generative_asr"], "Whisper Tiny 提供低资源生成式 ASR 基线，使用本地 OpenAI Whisper 检查点。"),
+    "openai-whisper:base": ("Whisper Base", ["generative_asr"], "Whisper Base 提供较 Tiny 更强的本地生成式 ASR 对照。"),
+    "openai-whisper:medium": ("Whisper Medium", ["generative_asr"], "Whisper Medium 是 VoiceShield 作品实验中的强 ASR 评估模型，用于验证保护效果面对更稳定识别能力时的迁移性。"),
+    "facebook/wav2vec2-base-960h": ("Wav2Vec2 Base 960h", ["ctc_asr", "self_supervised_asr"], "Wav2Vec2 Base 960h 使用自监督预训练与 CTC 解码，作为不同于 Whisper 的真实 ASR 路线。"),
+    "funasr:paraformer-zh": ("FunASR Paraformer 中文", ["non_autoregressive_asr", "chinese_asr"], "Paraformer 是面向中文的非自回归 ASR，用于补充中文识别路线。"),
+    "speechbrain/spkrec-ecapa-voxceleb": ("ECAPA-TDNN", ["speaker_verification", "evaluation_model"], "ECAPA-TDNN 只用于独立计算说话人相似度和克隆防护效果，不参与 VoiceShield 扰动优化。"),
+}
 SUPPORTED_TTS_MODELS = [
     {
         "label": "XTTS-v2",
@@ -250,11 +269,12 @@ SUPPORTED_TTS_MODELS = [
         "value": "XTTS-v2",
         "type": ["zero_shot"],
         "information": "仅需短参考语音和目标文本即可生成相似声音，是 VoiceShield 用于验证低门槛零样本克隆风险的主要后端。",
-        "backendValue": "tts_models/multilingual/multi-dataset/xtts_v2",
+        "backendValue": "xtts_v2",
         "cacheName": "tts_models--multilingual--multi-dataset--xtts_v2",
         "aliases": ["default", "xtts", "xtts-v2", "xtts_v2", "coquitts:xtts_v2"],
         "languages": ["en", "zh-cn"],
         "description": "Coqui XTTS-v2 voice cloning backend.",
+        "backend": "CoquiTTS",
     },
     {
         "label": "XTTS-v1.1",
@@ -267,6 +287,7 @@ SUPPORTED_TTS_MODELS = [
         "aliases": ["xtts-v1.1", "xtts_v1.1", "xtts-v1", "xtts_v1", "coquitts:xtts_v1.1"],
         "languages": ["en", "zh-cn"],
         "description": "Coqui XTTS-v1.1 cross-language voice cloning backend.",
+        "backend": "CoquiTTS",
     },
     {
         "label": "YourTTS",
@@ -279,8 +300,74 @@ SUPPORTED_TTS_MODELS = [
         "aliases": ["your-tts", "your_tts", "coquitts:your_tts"],
         "languages": ["en"],
         "description": "Coqui YourTTS voice cloning backend.",
+        "backend": "CoquiTTS",
+    },
+    {
+        "label": "CosyVoice2-0.5B",
+        "name": "CosyVoice2-0.5B",
+        "value": "CosyVoice2-0.5B",
+        "type": ["zero_shot", "llm_based"],
+        "information": "使用 Qwen2.5 驱动的 0.5B 语音 Token 语言模型进行零样本克隆；在 VoiceShield 中作为 LLM 语音克隆代表模型，原始和保护参考音频由同一次模型加载连续评测。",
+        "backendValue": "cosyvoice2:0.5b",
+        "aliases": ["cosyvoice2", "cosyvoice2-0.5b", "cosyvoice2:0.5b"],
+        "languages": ["en", "zh-cn"],
+        "description": "Official FunAudioLLM CosyVoice2 0.5B zero-shot voice cloning backend.",
+        "backend": "CosyVoice2",
+        "promptRequired": True,
+    },
+    {
+        "label": "GPT-SoVITS 微调链路",
+        "name": "GPT-SoVITS",
+        "value": "GPT-SoVITS",
+        "type": ["fine_tuning", "llm_based"],
+        "information": "结合语义 GPT 与 SoVITS 声学生成器的训练式克隆链路。每次使用当前保护任务的原始音频和保护音频分别现场微调，再生成两侧克隆语音进行对比。训练时长由上传音频自动确定，过长音频会在训练上限处截取。",
+        "backendValue": "gpt-sovits:finetune",
+        "aliases": ["gpt-sovits", "gpt-sovits:finetune"],
+        "languages": ["en", "zh-cn"],
+        "description": "GPT-SoVITS live per-upload fine-tuning evaluation chain.",
+        "backend": "GPT-SoVITS",
+        "online": True,
+        "promptRequired": True,
+        "fineTuneMode": "live_fine_tune",
     },
 ]
+
+COSYVOICE_MODEL_DIR = Path(os.getenv("SEME2E_COSYVOICE_MODEL_DIR", ROOT / "checkpoints" / "CosyVoice2-0.5B"))
+COSYVOICE_REPO_DIR = Path(os.getenv("SEME2E_COSYVOICE_REPO_DIR", ROOT.parents[1] / ".runtime" / "cosyvoice" / "CosyVoice"))
+COSYVOICE_PYTHON = Path(os.getenv("SEME2E_COSYVOICE_PYTHON", ROOT.parents[1] / ".runtime" / "cosyvoice" / ".venv" / "bin" / "python"))
+COSYVOICE_REQUIRED_FILES = (
+    "cosyvoice2.yaml",
+    "llm.pt",
+    "flow.pt",
+    "hift.pt",
+    "campplus.onnx",
+    "speech_tokenizer_v2.onnx",
+)
+COSYVOICE_READY_MARKER = COSYVOICE_MODEL_DIR / ".voiceshield-ready.json"
+GPT_SOVITS_RUNTIME_DIR = Path(os.getenv("SEME2E_GPT_SOVITS_RUNTIME_DIR", ROOT.parents[1] / ".runtime" / "gpt-sovits"))
+GPT_SOVITS_REPO_DIR = Path(os.getenv("SEME2E_GPT_SOVITS_REPO_DIR", GPT_SOVITS_RUNTIME_DIR / "GPT-SoVITS"))
+GPT_SOVITS_PYTHON = Path(os.getenv("SEME2E_GPT_SOVITS_PYTHON", GPT_SOVITS_RUNTIME_DIR / ".venv" / "bin" / "python"))
+GPT_SOVITS_CNHUBERT = Path(
+    os.getenv(
+        "SEME2E_GPT_SOVITS_CNHUBERT",
+        ROOT / "checkpoints" / "GSV" / "base_models" / "chinese-hubert-base",
+    )
+)
+GPT_SOVITS_BERT = Path(
+    os.getenv(
+        "SEME2E_GPT_SOVITS_BERT",
+        ROOT / "checkpoints" / "GSV" / "base_models" / "chinese-roberta-wwm-ext-large",
+    )
+)
+GPT_SOVITS_PRETRAINED_DIR = Path(
+    os.getenv(
+        "SEME2E_GPT_SOVITS_PRETRAINED_DIR",
+        ROOT / "checkpoints" / "GSV" / "base_models" / "gsv-v2final-pretrained",
+    )
+)
+GPT_SOVITS_PRETRAINED_S1 = GPT_SOVITS_PRETRAINED_DIR / "s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt"
+GPT_SOVITS_PRETRAINED_S2G = GPT_SOVITS_PRETRAINED_DIR / "s2G2333k.pth"
+GPT_SOVITS_PRETRAINED_S2D = GPT_SOVITS_PRETRAINED_DIR / "s2D2333k.pth"
 
 
 def _tts_cache_dir() -> Path:
@@ -319,6 +406,54 @@ def _tts_model_cache_status(cache_name: str) -> tuple[str, str | None, str]:
     if not ready:
         return "unavailable", reason, str(path)
     return "available", None, str(path)
+
+
+def _cosyvoice_model_status() -> tuple[str, str | None, str]:
+    missing = [name for name in COSYVOICE_REQUIRED_FILES if not (COSYVOICE_MODEL_DIR / name).is_file()]
+    if not (COSYVOICE_MODEL_DIR / "CosyVoice-BlankEN").is_dir():
+        missing.append("CosyVoice-BlankEN/")
+    if missing:
+        return "download_required", "incomplete local CosyVoice2 model: " + ", ".join(missing), str(COSYVOICE_MODEL_DIR)
+    runtime_missing = []
+    if not COSYVOICE_PYTHON.is_file():
+        runtime_missing.append(str(COSYVOICE_PYTHON))
+    if not (COSYVOICE_REPO_DIR / "cosyvoice" / "cli" / "cosyvoice.py").is_file():
+        runtime_missing.append(str(COSYVOICE_REPO_DIR))
+    if runtime_missing:
+        return "unavailable", "missing isolated CosyVoice2 runtime: " + ", ".join(runtime_missing), str(COSYVOICE_MODEL_DIR)
+    if not COSYVOICE_READY_MARKER.is_file():
+        return "unavailable", "CosyVoice2 snapshot is complete, but the server runtime has not passed the VoiceShield generation benchmark", str(COSYVOICE_MODEL_DIR)
+    return "available", None, str(COSYVOICE_MODEL_DIR)
+
+
+def _gpt_sovits_model_status() -> tuple[str, str | None, str]:
+    required_paths = [
+        GPT_SOVITS_PYTHON,
+        GPT_SOVITS_REPO_DIR / "GPT_SoVITS" / "TTS_infer_pack" / "TTS.py",
+        GPT_SOVITS_CNHUBERT,
+        GPT_SOVITS_BERT,
+        ROOT / "gpt_sovits_worker.py",
+        ROOT / "gpt_sovits_live_finetune.py",
+        GPT_SOVITS_PRETRAINED_S1,
+        GPT_SOVITS_PRETRAINED_S2G,
+        GPT_SOVITS_PRETRAINED_S2D,
+    ]
+    missing = [str(path) for path in required_paths if not path.exists()]
+    if missing:
+        return "unavailable", "missing isolated GPT-SoVITS training runtime: " + ", ".join(missing), str(GPT_SOVITS_RUNTIME_DIR)
+    return "available", None, str(GPT_SOVITS_RUNTIME_DIR)
+
+
+def _tts_catalog_status(item: dict[str, Any], *, coqui_available: bool) -> tuple[str, str | None, str | None]:
+    backend = str(item.get("backend") or "CoquiTTS")
+    if backend == "CosyVoice2":
+        return _cosyvoice_model_status()
+    if backend == "GPT-SoVITS":
+        return _gpt_sovits_model_status()
+    cache_status, cache_reason, cache_path = _tts_model_cache_status(str(item["cacheName"]))
+    if not coqui_available:
+        return "unavailable", "Coqui TTS package is not installed", cache_path
+    return cache_status, cache_reason, cache_path
 
 
 def _torch_checkpoint_ready(path: Path) -> tuple[bool, str | None]:
@@ -396,10 +531,13 @@ def _checkpoint_status() -> dict[str, Any]:
         "ESpeakNG": ROOT / "vendor" / "espeak-ng" / "libespeak-ng.dll",
         "ESpeakNGData": ROOT / "vendor" / "espeak-ng" / "espeak-ng-data",
         "ASRWhisperSmall": ROOT / "checkpoints" / "asr" / "openai-whisper-small" / "config.json",
+        "ASRWav2Vec2Base960h": ROOT / "checkpoints" / "hf" / "facebook" / "wav2vec2-base-960h" / "config.json",
         "ASRWhisperTiny": whisper_cache_dir / "tiny.pt",
         "ASRWhisperBase": whisper_cache_dir / "base.pt",
+        "ASRWhisperMedium": whisper_cache_dir / "medium.pt",
         "ASRParaformerZh": ROOT / "checkpoints" / "modelscope" / "damo" / "speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch" / "model.pt",
         "ECAPA": ROOT / "checkpoints" / "ecapa" / "embedding_model.ckpt",
+        "CosyVoice2LLM": COSYVOICE_MODEL_DIR / "cosyvoice2.yaml",
     }
     entries = {
         name: {
@@ -447,11 +585,18 @@ def _component_available(checkpoints: dict[str, Any], names: list[str]) -> tuple
 
 
 def _model_option(label: str, value: str, backend_value: str, branch: str, *, status: str = "available", reason: str | None = None, **extra: Any) -> dict[str, Any]:
+    metadata = MODEL_METADATA.get(value)
+    metadata_name = metadata[0] if metadata else label
+    metadata_types = list(metadata[1]) if metadata else []
+    metadata_information = metadata[2] if metadata else str(extra.get("description") or f"{label} 由后端运行时能力清单提供。")
     return {
         "label": label,
+        "name": extra.pop("name", metadata_name),
         "value": value,
         "backendValue": backend_value,
         "branch": branch,
+        "type": extra.pop("type", metadata_types),
+        "information": extra.pop("information", metadata_information),
         "status": status,
         "reason": reason,
         **extra,
@@ -504,9 +649,12 @@ def runtime_config() -> dict[str, Any]:
     transformers_available = _module_available("transformers")
     whisper_small_available = transformers_available and bool((checkpoints.get("entries") or {}).get("ASRWhisperSmall", {}).get("exists"))
     whisper_small_reason = None if whisper_small_available else "missing local Whisper Small checkpoint" if transformers_available else "transformers not installed"
+    wav2vec_available = transformers_available and bool((checkpoints.get("entries") or {}).get("ASRWav2Vec2Base960h", {}).get("exists"))
+    wav2vec_reason = None if wav2vec_available else "missing local Wav2Vec2 Base 960h checkpoint" if transformers_available else "transformers not installed"
     whisper_package_available = _module_available("whisper")
     whisper_tiny_available = whisper_package_available and bool((checkpoints.get("entries") or {}).get("ASRWhisperTiny", {}).get("exists"))
     whisper_base_available = whisper_package_available and bool((checkpoints.get("entries") or {}).get("ASRWhisperBase", {}).get("exists"))
+    whisper_medium_available = whisper_package_available and bool((checkpoints.get("entries") or {}).get("ASRWhisperMedium", {}).get("exists"))
     funasr_available = _module_available("funasr")
     paraformer_available = funasr_available and bool((checkpoints.get("entries") or {}).get("ASRParaformerZh", {}).get("exists"))
     tts_available = _module_available("TTS")
@@ -528,17 +676,13 @@ def runtime_config() -> dict[str, Any]:
         _model_option("Whisper Small", "openai/whisper-small", str(ROOT / "checkpoints" / "asr" / "openai-whisper-small"), "asr", status="available" if whisper_small_available else "unavailable", reason=whisper_small_reason, backend="transformers", localPath=str(ROOT / "checkpoints" / "asr" / "openai-whisper-small")),
         _model_option("OpenAI Whisper Tiny", "openai-whisper:tiny", "openai-whisper:tiny", "asr", status="available" if whisper_tiny_available else "unavailable", reason=None if whisper_tiny_available else "missing local Whisper Tiny checkpoint" if whisper_package_available else "openai-whisper package not installed", backend="openai-whisper"),
         _model_option("OpenAI Whisper Base", "openai-whisper:base", "openai-whisper:base", "asr", status="available" if whisper_base_available else "unavailable", reason=None if whisper_base_available else "missing local Whisper Base checkpoint" if whisper_package_available else "openai-whisper package not installed", backend="openai-whisper"),
+        _model_option("OpenAI Whisper Medium", "openai-whisper:medium", "openai-whisper:medium", "asr", status="available" if whisper_medium_available else "unavailable", reason=None if whisper_medium_available else "missing local Whisper Medium checkpoint" if whisper_package_available else "openai-whisper package not installed", backend="openai-whisper", localPath=str(Path.home() / ".cache" / "whisper" / "medium.pt")),
+        _model_option("Wav2Vec2 Base 960h", "facebook/wav2vec2-base-960h", str(ROOT / "checkpoints" / "hf" / "facebook" / "wav2vec2-base-960h"), "asr", status="available" if wav2vec_available else "unavailable", reason=wav2vec_reason, backend="transformers", localPath=str(ROOT / "checkpoints" / "hf" / "facebook" / "wav2vec2-base-960h")),
         _model_option("FunASR Paraformer", "funasr:paraformer-zh", "funasr:paraformer-zh", "asr", status="available" if paraformer_available else "unavailable", reason=None if paraformer_available else "missing local Paraformer checkpoint" if funasr_available else "funasr not installed", backend="funasr"),
     ]
     tts_options = []
     for item in SUPPORTED_TTS_MODELS:
-        cache_status, cache_reason, cache_path = _tts_model_cache_status(str(item["cacheName"]))
-        if not tts_available:
-            status = "unavailable"
-            reason = "Coqui TTS package is not installed"
-        else:
-            status = cache_status
-            reason = cache_reason
+        status, reason, cache_path = _tts_catalog_status(item, coqui_available=tts_available)
         tts_options.append(
             _model_option(
                 str(item["label"]),
@@ -547,17 +691,34 @@ def runtime_config() -> dict[str, Any]:
                 "tts",
                 status=status,
                 reason=reason,
-                backend="CoquiTTS",
+                name=str(item["name"]),
+                type=list(item["type"]),
+                information=str(item["information"]),
+                backend=str(item.get("backend") or "CoquiTTS"),
                 localPath=cache_path,
                 languages=item.get("languages", []),
                 description=item.get("description"),
+                promptRequired=bool(item.get("promptRequired")),
+                fineTuneMode=item.get("fineTuneMode"),
             )
         )
+    evaluation_options = [
+        _model_option(
+            "ECAPA-TDNN",
+            "speechbrain/spkrec-ecapa-voxceleb",
+            str(ROOT / "checkpoints" / "ecapa"),
+            "evaluation",
+            status="available" if _module_available("speechbrain") and "ECAPA" not in checkpoints["missing"] else "unavailable",
+            reason=None if _module_available("speechbrain") and "ECAPA" not in checkpoints["missing"] else "SpeechBrain or local ECAPA checkpoint is unavailable",
+            backend="SpeechBrain",
+            localPath=str(ROOT / "checkpoints" / "ecapa"),
+        )
+    ]
 
     formal = _profile_defaults("formal", steps=FORMAL_STEPS, semantic_encoders=FORMAL_SEMANTIC_ENCODERS, timbre_encoders=FORMAL_TIMBRE_ENCODERS)
     fields = {
         "epsilon": {"label": "扰动强度 ε", "path": "optimization.epsilon", "default": round(FORMAL_EPSILON, 9), "min": 0.001, "max": 0.08, "step": 0.001, "unit": "waveform amplitude", "description": "高保真默认值为 4/255。"},
-        "steps": {"label": "优化步数", "path": "optimization.steps", "default": FORMAL_STEPS, "min": 1, "max": 500, "step": 1, "description": "默认 100，最大 500。"},
+        "steps": {"label": "优化步数", "path": "optimization.steps", "default": FORMAL_STEPS, "min": 1, "max": 500, "step": 1, "description": "默认 200，最大 500。"},
         "weightIdentity": {"label": "Identity 权重", "path": "timbre.weightIdentity", "default": FORMAL_WEIGHT_FEATURE, "min": 0, "max": 1000, "step": 1},
         "weightFeature": {"label": "Identity 权重（legacy）", "path": "timbre.weightFeature", "default": FORMAL_WEIGHT_FEATURE, "min": 0, "max": 1000, "step": 1},
         "weightSemantic": {"label": "Semantic 权重", "path": "semantic.weightSemantic", "default": FORMAL_WEIGHT_SEMANTIC, "min": 0, "max": 500, "step": 1},
@@ -605,7 +766,7 @@ def runtime_config() -> dict[str, Any]:
         "defaults": {"formal": formal},
         "activeDefaultProfile": active_profile,
         "profiles": [
-            {"value": "formal", "label": "正式保护", "description": "使用 lq25_large_balanced 高保真默认参数，steps=100。"},
+            {"value": "formal", "label": "正式保护", "description": "使用 lq25_large_balanced 高保真默认参数，steps=200。"},
         ],
         "fields": fields,
         "modelOptions": {
@@ -616,6 +777,7 @@ def runtime_config() -> dict[str, Any]:
         },
     }
     return {
+        "modelTypes": MODEL_TYPES,
         "defaults": formal,
         "profiles": {"formal": formal},
         "activeDefaultProfile": form_schema["activeDefaultProfile"],
@@ -626,6 +788,7 @@ def runtime_config() -> dict[str, Any]:
             "feature": timbre_options,
             "timbre": timbre_options,
             "tts": tts_options,
+            "evaluation": evaluation_options,
         },
         "formSchema": form_schema,
         "constraints": {
@@ -689,10 +852,13 @@ def diagnose_capabilities() -> dict[str, Any]:
     pesq_available = _module_available("pesq")
     stoi_available = _module_available("pystoi")
     tts_available = _module_available("TTS")
+    cosyvoice_status, cosyvoice_reason, _ = _cosyvoice_model_status()
+    gpt_sovits_status, gpt_sovits_reason, _ = _gpt_sovits_model_status()
     perception_available = ["snr", "maskingCurve"] + (["pesq"] if pesq_available else []) + (["stoi"] if stoi_available else [])
     perception_unavailable = ([] if pesq_available else ["pesq"]) + ([] if stoi_available else ["stoi"]) + ["mos", "mosLqo"]
     return {
         "ok": True,
+        "modelTypes": MODEL_TYPES,
         "device": device,
         "python": sys.executable,
         "cwd": os.getcwd(),
@@ -729,8 +895,8 @@ def diagnose_capabilities() -> dict[str, Any]:
                 "reason": "MOS/MOS-LQO require human feedback or a declared calibrated model" if pesq_available and stoi_available else "Install pesq and pystoi to enable objective PESQ/STOI metrics; MOS/MOS-LQO require human feedback or a declared calibrated model",
             },
             "downstream_tts_eval": {
-                "status": "available" if tts_available else "unavailable",
-                "reason": None if tts_available else "Coqui TTS/XTTS package is not installed",
+                "status": "available" if tts_available or cosyvoice_status == "available" or gpt_sovits_status == "available" else "unavailable",
+                "reason": None if tts_available or cosyvoice_status == "available" or gpt_sovits_status == "available" else gpt_sovits_reason or cosyvoice_reason or "No real TTS clone backend is available",
             },
         },
     }
@@ -1154,18 +1320,19 @@ def maybe_asr_eval(clean_path: Path, protected_path: Path, payload: dict[str, An
     asr["model"] = actual_models[0]
     if os.getenv("SEME2E_ENABLE_ASR", "0") != "1" and payload.get("forceAsrEval") is not True:
         asr["status"] = "unavailable"
-        asr["reason"] = "Set SEME2E_ENABLE_ASR=1 to run evaluate_asr.py dependencies."
-        asr["_metricSources"] = {"asrEval.*": metric_source("not_run", "ASRTranscriber", reason=asr["reason"], formula="POST /api/tasks/{taskId}/asr-eval")}
+        asr["reason"] = "当前运行环境未启用 ASR 评估。"
+        asr["_metricSources"] = {"asrEval.*": metric_source("not_run", "ASRTranscriber", reason=asr["reason"], formula="独立 ASR 转写与编辑距离评估")}
         return asr
 
     try:
-        from asr_backends import ASRTranscriber
+        from asr_backends import ASRTranscriber, openai_whisper_session
 
         evaluations = []
         for model in actual_models:
-            transcriber = ASRTranscriber(model, os.getenv("SEME2E_API_DEVICE", "cpu"))
-            clean_text = transcriber.transcribe(clean_path)
-            protected_text = transcriber.transcribe(protected_path)
+            with openai_whisper_session(model):
+                transcriber = ASRTranscriber(model, os.getenv("SEME2E_API_DEVICE", "cpu"), str(payload.get("language") or "en"))
+                clean_text = transcriber.transcribe(clean_path)
+                protected_text = transcriber.transcribe(protected_path)
             item = compute_asr_metrics(
                 clean_text,
                 protected_text,
@@ -1200,37 +1367,49 @@ def create_asr_eval(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         protected_path,
         {
             "referenceText": payload.get("referenceText") or payload.get("reference_text"),
+            "language": payload.get("language"),
             "semantic": semantic_config,
             "forceAsrEval": True,
         },
     )
-    semantic = compute_semantic_token_metrics(original_path, protected_path, semantic_config)
-    asr.setdefault("_metricSources", {})
-    for key in ["tokenChangeRate", "tokenErrorRate", "tokenChangeCount", "tokenTotal", "semanticDrift", "encoderDistances"]:
-        asr[key] = semantic.get(key)
-    asr["_metricSources"].update(semantic.get("_metricSources") or {})
-    details = result.setdefault("details", {})
-    details["asr"] = asr
-    details["semantic"] = semantic
-    primary = result.setdefault("summary", {}).setdefault("primaryMetrics", {})
-    for key in ["wer", "cer", "tokenErrorRate", "tokenChangeRate", "semanticDrift"]:
-        if key in asr:
-            primary[key] = asr.get(key)
-    metric_sources = result.setdefault("summary", {}).setdefault("metricSources", {})
-    metric_sources.update(asr.get("_metricSources") or {})
-    result["asrModel"] = asr.get("model")
-    result["updatedAt"] = utc_now_iso()
-    summary_score = compute_overall_score(result)
-    result.setdefault("summary", {})["score"] = summary_score["score"]
-    result.setdefault("summary", {})["verdict"] = summary_score["verdict"]
-    metric_sources.update(summary_score.get("_metricSources") or {})
-    result["metricSources"] = metric_sources
-    save_result(TASK_DIR / task_id, result)
-    return {
+    created_at = utc_now_iso()
+    response = {
         "taskId": task_id,
+        "asrSubId": payload.get("asrSubId"),
         "status": asr.get("status") or "available",
         "asr": asr,
+        "request": {
+            "model": payload.get("model"),
+            "language": payload.get("language"),
+            "referenceText": payload.get("referenceText") or payload.get("reference_text"),
+        },
+        "createdAt": created_at,
     }
+    with RESULT_WRITE_LOCK:
+        result_path = TASK_DIR / task_id / "result.json"
+        latest_result = load_result(task_id) if result_path.exists() else result
+        details = latest_result.setdefault("details", {})
+        details["asr"] = asr
+        primary = latest_result.setdefault("summary", {}).setdefault("primaryMetrics", {})
+        for key in ["wer", "cer"]:
+            if key in asr:
+                primary[key] = asr.get(key)
+        metric_sources = latest_result.setdefault("summary", {}).setdefault("metricSources", {})
+        metric_sources.update(asr.get("_metricSources") or {})
+        latest_result["asrModel"] = asr.get("model")
+        latest_result["updatedAt"] = created_at
+        asr_results = latest_result.setdefault("asrResults", [])
+        asr_sub_id = response.get("asrSubId")
+        if asr_sub_id:
+            asr_results[:] = [item for item in asr_results if item.get("asrSubId") != asr_sub_id]
+        asr_results.append(response)
+        summary_score = compute_overall_score(latest_result)
+        latest_result.setdefault("summary", {})["score"] = summary_score["score"]
+        latest_result.setdefault("summary", {})["verdict"] = summary_score["verdict"]
+        metric_sources.update(summary_score.get("_metricSources") or {})
+        latest_result["metricSources"] = metric_sources
+        save_result(TASK_DIR / task_id, latest_result)
+    return response
 
 
 def maybe_speaker_eval(clean_path: Path, protected_path: Path) -> dict[str, Any]:
@@ -1372,8 +1551,8 @@ def build_task_payload(
     )
 
     details["asr"] = empty_details()["asr"]
-    details["asr"]["reason"] = f"ASR 评估与保护流程解耦。请使用 /api/tasks/{task_id}/asr-eval 并选定 ASR 模型执行。"
-    metric_sources["asrEval.*"] = metric_source("not_run", "ASRTranscriber", reason="ASR is decoupled from protection; run POST /api/tasks/{taskId}/asr-eval", formula="None until ASR eval runs")
+    details["asr"]["reason"] = "ASR 评估与语音保护独立执行；请在工作台选择识别模型后运行测试。"
+    metric_sources["asrEval.*"] = metric_source("not_run", "ASRTranscriber", reason="尚未执行独立 ASR 测试", formula="运行 ASR 测试后生成")
     update_chain(chains, "asr_eval", details["asr"]["status"], {"wer": details["asr"]["wer"], "cer": details["asr"]["cer"]})
 
     if progress_callback is not None:
@@ -1381,7 +1560,7 @@ def build_task_payload(
     details["speaker"] = maybe_speaker_eval(input_path, protected_path)
     metric_sources.update(details["speaker"].get("_metricSources") or {})
     update_chain(chains, "speaker_eval", details["speaker"]["status"], {"speakerSimilarity": details["speaker"]["simOriginalProtected"]})
-    metric_sources["cloneEval.*"] = metric_source("not_run", "clone-voice", reason="Voice clone evaluation is decoupled from protection; run POST /api/tasks/{taskId}/clone-voice", formula="None until clone eval runs")
+    metric_sources["cloneEval.*"] = metric_source("not_run", "clone-voice", reason="尚未执行独立语音克隆测试", formula="运行语音克隆测试后生成")
     metric_sources["cloneEval.cloneConfidenceBefore"] = metric_source("unavailable", "confidence_calibrator", reason="No confidence calibrator is configured", formula="sigmoid(A*similarity+B)")
     metric_sources["cloneEval.cloneConfidenceAfter"] = metric_source("unavailable", "confidence_calibrator", reason="No confidence calibrator is configured", formula="sigmoid(A*similarity+B)")
     metric_sources["cloneEval.cloneConfidenceDropRate"] = metric_source("unavailable", "confidence_calibrator", reason="No confidence calibrator is configured", formula="(cloneConfidenceBefore-cloneConfidenceAfter)/max(cloneConfidenceBefore,EPS)")
@@ -1534,6 +1713,7 @@ def create_task(
     input_path: Path,
     uploaded_file_id: str | None,
     payload: dict[str, Any],
+    input_filename: str | None = None,
     request_id: str | None = None,
     task_id: str | None = None,
     progress_callback: ProgressCallback | None = None,
@@ -1550,11 +1730,15 @@ def create_task(
     protected_dir.mkdir(parents=True, exist_ok=True)
 
     started_at = utc_now_iso()
-    source_path = source_dir / input_path.name
+    display_filename = Path(input_filename).name if input_filename else input_path.name
+    if not display_filename or display_filename in {".", ".."}:
+        display_filename = input_path.name
+    source_path = source_dir / display_filename
     if input_path.resolve() != source_path.resolve():
         shutil.copyfile(input_path, source_path)
-    original_path = original_dir / f"{input_path.stem}.wav"
-    protected_path = protected_dir / f"{input_path.stem}_protected.wav"
+    display_stem = Path(display_filename).stem
+    original_path = original_dir / f"{display_stem}.wav"
+    protected_path = protected_dir / f"{display_stem}_protected.wav"
     preprocess_meta = preprocess_audio(
         source_path,
         original_path,
@@ -1716,8 +1900,166 @@ def _tts_clone_to_file(reference_path: Path, text: str, output_path: Path, *, mo
     return model
 
 
+def _is_cosyvoice_model(model: str) -> bool:
+    return normalize_tts_model(model).lower() == "cosyvoice2:0.5b"
+
+
+def _is_gpt_sovits_model(model: str) -> bool:
+    return normalize_tts_model(model).lower() == "gpt-sovits:finetune"
+
+
+def _cosyvoice_clone_pair(
+    original_reference: Path,
+    protected_reference: Path,
+    original_output: Path,
+    protected_output: Path,
+    *,
+    text: str,
+    original_prompt_text: str,
+    protected_prompt_text: str,
+    speed: float,
+    device: str,
+) -> dict[str, Any]:
+    status, reason, _ = _cosyvoice_model_status()
+    if status != "available":
+        raise RuntimeError(reason or "CosyVoice2 runtime is unavailable")
+    worker = ROOT / "cosyvoice_worker.py"
+    command = [
+        str(COSYVOICE_PYTHON),
+        str(worker),
+        "--model-dir",
+        str(COSYVOICE_MODEL_DIR),
+        "--cosyvoice-repo",
+        str(COSYVOICE_REPO_DIR),
+        "--original-reference",
+        str(original_reference),
+        "--protected-reference",
+        str(protected_reference),
+        "--original-output",
+        str(original_output),
+        "--protected-output",
+        str(protected_output),
+        "--text",
+        text,
+        "--original-prompt-text",
+        original_prompt_text,
+        "--protected-prompt-text",
+        protected_prompt_text,
+        "--speed",
+        str(speed),
+        "--device",
+        device,
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=str(COSYVOICE_REPO_DIR),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=_env_int("SEME2E_COSYVOICE_TIMEOUT_SECONDS", 900),
+        check=False,
+    )
+    marker = "VOICE_SHIELD_COSYVOICE_RESULT="
+    result_line = next((line for line in reversed(completed.stdout.splitlines()) if line.startswith(marker)), None)
+    if completed.returncode != 0 or result_line is None:
+        stderr_tail = completed.stderr[-4000:].strip()
+        stdout_tail = completed.stdout[-2000:].strip()
+        raise RuntimeError(
+            f"CosyVoice2 worker failed (exit={completed.returncode}): {stderr_tail or stdout_tail or 'missing worker result'}"
+        )
+    return json.loads(result_line[len(marker):])
+
+
+def _gpt_sovits_clone_pair(
+    original_reference: Path,
+    protected_reference: Path,
+    original_output: Path,
+    protected_output: Path,
+    *,
+    original_transcript: str,
+    protected_transcript: str,
+    text: str,
+    language: str,
+    speed: float,
+    device: str,
+) -> dict[str, Any]:
+    status, reason, _ = _gpt_sovits_model_status()
+    if status != "available":
+        raise RuntimeError(reason or "GPT-SoVITS live fine-tuning runtime is unavailable")
+    worker = ROOT / "gpt_sovits_live_finetune.py"
+    work_dir = original_output.parent / "fine_tune"
+    timeout_seconds = _env_int("SEME2E_GPT_SOVITS_TIMEOUT_SECONDS", 900)
+    command = [
+        str(GPT_SOVITS_PYTHON),
+        str(worker),
+        "--repo",
+        str(GPT_SOVITS_REPO_DIR),
+        "--python",
+        str(GPT_SOVITS_PYTHON),
+        "--work-dir",
+        str(work_dir),
+        "--original-audio",
+        str(original_reference),
+        "--protected-audio",
+        str(protected_reference),
+        "--original-transcript",
+        original_transcript,
+        "--protected-transcript",
+        protected_transcript,
+        "--text",
+        text,
+        "--language",
+        language,
+        "--speed",
+        str(speed),
+        "--original-output",
+        str(original_output),
+        "--protected-output",
+        str(protected_output),
+        "--device",
+        device,
+        "--cnhubert",
+        str(GPT_SOVITS_CNHUBERT),
+        "--bert",
+        str(GPT_SOVITS_BERT),
+        "--pretrained-s1",
+        str(GPT_SOVITS_PRETRAINED_S1),
+        "--pretrained-s2g",
+        str(GPT_SOVITS_PRETRAINED_S2G),
+        "--pretrained-s2d",
+        str(GPT_SOVITS_PRETRAINED_S2D),
+        "--timeout",
+        str(timeout_seconds),
+    ]
+    cuda_visible_devices = os.getenv("SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES", "").strip()
+    device_index = device.split(":", 1)[1] if ":" in device else "0"
+    command.extend(["--gpu-numbers", "0" if cuda_visible_devices else device_index])
+    if cuda_visible_devices:
+        command.extend(["--cuda-visible-devices", cuda_visible_devices])
+    completed = subprocess.run(
+        command,
+        cwd=str(GPT_SOVITS_REPO_DIR),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout_seconds * 3,
+        check=False,
+    )
+    marker = "VOICE_SHIELD_GPT_SOVITS_LIVE_RESULT="
+    result_line = next((line for line in reversed(completed.stdout.splitlines()) if line.startswith(marker)), None)
+    if completed.returncode != 0 or result_line is None:
+        stderr_tail = completed.stderr[-4000:].strip()
+        stdout_tail = completed.stdout[-3000:].strip()
+        raise RuntimeError(
+            f"GPT-SoVITS live fine-tuning worker failed (exit={completed.returncode}): {stderr_tail or stdout_tail or 'missing worker result'}"
+        )
+    return json.loads(result_line[len(marker):])
+
+
 def normalize_tts_model(value: str | None) -> str:
-    raw = (value or os.getenv("SEME2E_TTS_MODEL") or "tts_models/multilingual/multi-dataset/xtts_v2").strip()
+    raw = (value or os.getenv("SEME2E_TTS_MODEL") or "CosyVoice2-0.5B").strip()
     return _supported_tts_aliases().get(raw.lower(), raw)
 
 
@@ -1732,6 +2074,14 @@ def normalize_tts_language(value: str | None) -> str:
     return aliases.get(raw, raw)
 
 
+def _tts_catalog_entry(model: str) -> dict[str, Any] | None:
+    backend_value = normalize_tts_model(model)
+    for item in SUPPORTED_TTS_MODELS:
+        if str(item["backendValue"]).lower() == backend_value.lower():
+            return item
+    return None
+
+
 def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback: ProgressCallback | None = None, cancel_event: Any | None = None) -> dict[str, Any]:
     text = str(payload.get("text") or "").strip()
     if not text:
@@ -1743,9 +2093,30 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
     language = normalize_tts_language(str(payload.get("language") or "") or None)
     speed = to_float(payload.get("speed")) or 1.0
     device = os.getenv("SEME2E_TTS_DEVICE") or os.getenv("SEME2E_API_DEVICE", "cpu")
+    cosyvoice_model = _is_cosyvoice_model(model)
+    gpt_sovits_model = _is_gpt_sovits_model(model)
+    prompt_text = str(payload.get("speakerPrompt") or "").strip()
+    original_prompt_text = str(payload.get("originalSpeakerPrompt") or prompt_text).strip()
+    protected_prompt_text = str(payload.get("protectedSpeakerPrompt") or prompt_text).strip()
+    cosyvoice_status, cosyvoice_reason, _ = _cosyvoice_model_status()
+    gpt_sovits_status, gpt_sovits_reason, _ = _gpt_sovits_model_status()
+    catalog_entry = _tts_catalog_entry(model)
+    catalog_status, catalog_reason, catalog_path = (
+        _tts_catalog_status(catalog_entry, coqui_available=_module_available("TTS"))
+        if catalog_entry is not None
+        else ("unavailable", f"unsupported TTS model: {model}", None)
+    )
     diagnostics = {
         "taskId": task_id,
         "ttsPackageAvailable": _module_available("TTS"),
+        "cosyVoiceStatus": cosyvoice_status,
+        "cosyVoiceReason": cosyvoice_reason,
+        "gptSoVitsStatus": gpt_sovits_status,
+        "gptSoVitsReason": gpt_sovits_reason,
+        "fineTuneAudioDurationSec": read_wav_meta(original_path).get("durationSec"),
+        "catalogStatus": catalog_status,
+        "catalogReason": catalog_reason,
+        "catalogPath": catalog_path,
         "model": model,
         "language": language,
         "speed": speed,
@@ -1754,24 +2125,32 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
         "protectedReferencePath": str(protected_path),
     }
     if progress_callback is not None:
-            progress_callback(progress=0.18, message="正在加载真实 TTS 克隆后端")
+        progress_callback(progress=0.18, message="正在加载真实 TTS 克隆后端")
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeError("TASK_CANCELLED")
-    if not diagnostics["ttsPackageAvailable"]:
+    if (cosyvoice_model or gpt_sovits_model) and (not original_prompt_text or not protected_prompt_text):
+        raise CloneBackendUnavailableError(
+            "当前克隆模型需要原始参考音频和保护参考音频各自对应的标注文本。",
+            task_id=task_id,
+            diagnostics=diagnostics,
+            reason="speaker_prompt_required",
+        )
+    if catalog_status != "available":
         downstream = result.setdefault("details", {}).setdefault("downstreamTts", {})
+        unavailable_reason = catalog_reason or "TTS model is unavailable"
         downstream.update(
             {
                 "enabled": False,
                 "ttsModel": model,
                 "status": "unavailable",
-                "source": "CoquiTTS.xtts_v2",
-                "reason": "Coqui TTS/XTTS package is not installed",
+                "source": "CosyVoice2" if cosyvoice_model else "GPT-SoVITS" if gpt_sovits_model else "CoquiTTS.xtts_v2",
+                "reason": unavailable_reason,
                 "cloneText": text,
             }
         )
         save_result(TASK_DIR / task_id, result)
         raise CloneBackendUnavailableError(
-            "真实 TTS 语音克隆后端不可用：未安装 Coqui TTS/XTTS。请安装 TTS 并配置模型后重试。",
+            f"真实 TTS 语音克隆后端不可用：{unavailable_reason}",
             task_id=task_id,
             diagnostics=diagnostics,
             reason="dependency_missing",
@@ -1783,17 +2162,54 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
 
     original_clone_path = clone_dir / f"{clone_id}_original_clone.wav"
     protected_clone_path = clone_dir / f"{clone_id}_protected_clone.wav"
+    worker_result: dict[str, Any] | None = None
+    evaluation_reference_path = original_path
+    evaluation_protected_path = protected_path
     try:
         if progress_callback is not None:
             progress_callback(progress=0.32, message="正在从原始参考音频生成克隆音频")
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("TASK_CANCELLED")
-        source_model = _tts_clone_to_file(original_path, text, original_clone_path, model=model, language=language, speed=speed, device=device)
-        if progress_callback is not None:
-            progress_callback(progress=0.62, message="正在从保护参考音频生成克隆音频")
-        if cancel_event is not None and cancel_event.is_set():
-            raise RuntimeError("TASK_CANCELLED")
-        _tts_clone_to_file(protected_path, text, protected_clone_path, model=model, language=language, speed=speed, device=device)
+        if cosyvoice_model:
+            if progress_callback is not None:
+                progress_callback(progress=0.46, message="CosyVoice2 正在一次加载中评测原始与保护参考音频")
+            worker_result = _cosyvoice_clone_pair(
+                original_path,
+                protected_path,
+                original_clone_path,
+                protected_clone_path,
+                text=text,
+                original_prompt_text=original_prompt_text,
+                protected_prompt_text=protected_prompt_text,
+                speed=speed,
+                device=device,
+            )
+            diagnostics["workerResult"] = worker_result
+            source_model = model
+        elif gpt_sovits_model:
+            if progress_callback is not None:
+                progress_callback(progress=0.42, message="GPT-SoVITS 正在使用当前原始音频和保护音频进行现场微调")
+            worker_result = _gpt_sovits_clone_pair(
+                original_path,
+                protected_path,
+                original_clone_path,
+                protected_clone_path,
+                original_transcript=original_prompt_text,
+                protected_transcript=protected_prompt_text,
+                text=text,
+                language=language,
+                speed=speed,
+                device=device,
+            )
+            diagnostics["workerResult"] = worker_result
+            source_model = model
+        else:
+            source_model = _tts_clone_to_file(original_path, text, original_clone_path, model=model, language=language, speed=speed, device=device)
+            if progress_callback is not None:
+                progress_callback(progress=0.62, message="正在从保护参考音频生成克隆音频")
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("TASK_CANCELLED")
+            _tts_clone_to_file(protected_path, text, protected_clone_path, model=model, language=language, speed=speed, device=device)
         if progress_callback is not None:
             progress_callback(progress=0.9, message="正在保存下游 TTS 克隆结果")
         if cancel_event is not None and cancel_event.is_set():
@@ -1832,24 +2248,45 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
     base_url = f"/api/artifacts/{task_id}/clones/{clone_id}"
     response = {
         "cloneId": clone_id,
+        "cloneSubId": payload.get("cloneSubId"),
         "taskId": task_id,
         "status": "completed",
-        "source": f"CoquiTTS:{source_model}",
-        "message": "真实 TTS 克隆音频已生成。",
+        "source": f"CosyVoice2:{source_model}" if cosyvoice_model else f"GPT-SoVITS:{source_model}:live" if gpt_sovits_model else f"CoquiTTS:{source_model}",
+        "message": "GPT-SoVITS 已使用当前音频完成现场微调与生成。" if gpt_sovits_model else "真实 TTS 克隆音频已生成。",
         "request": {
             "text": text,
             "model": model,
             "language": language,
             "speed": speed,
+            "speakerPrompt": prompt_text or None,
+            "originalSpeakerPrompt": original_prompt_text or None,
+            "protectedSpeakerPrompt": protected_prompt_text or None,
+            "annotationSource": payload.get("annotationSource") or "manual",
+            "annotationAsrSubId": payload.get("annotationAsrSubId"),
+            "annotationAsrModel": payload.get("annotationAsrModel"),
+            "annotationCreatedAt": payload.get("annotationCreatedAt"),
         },
         "originalCloneAudio": audio_meta(original_clone_path, f"{base_url}/{original_clone_path.name}"),
         "protectedCloneAudio": audio_meta(protected_clone_path, f"{base_url}/{protected_clone_path.name}"),
     }
-    clone_eval = compute_clone_eval(original_path, original_clone_path, protected_clone_path, response, protected_audio_path=protected_path)
+    if gpt_sovits_model and worker_result is not None:
+        response["fineTune"] = {
+            key: value
+            for key, value in worker_result.items()
+            if key not in {"cleanReferencePath", "protectedReferencePath"}
+        }
+    clone_eval = compute_clone_eval(
+        evaluation_reference_path,
+        original_clone_path,
+        protected_clone_path,
+        response,
+        protected_audio_path=evaluation_protected_path,
+    )
     clone_eval_sources = clone_eval.get("_metricSources") or {}
     response["cloneEval"] = clone_eval
     response.update(
         {
+            "directSimilarity": clone_eval.get("directSimilarity"),
             "originalSimilarity": clone_eval.get("originalSimilarity"),
             "protectedSimilarity": clone_eval.get("protectedSimilarity"),
             "similarityDropRate": clone_eval.get("similarityDropRate"),
@@ -1866,29 +2303,37 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
         }
     )
 
-    clones = result.setdefault("cloneResults", [])
-    clones.append(response)
-    downstream = (result.setdefault("details", {}).setdefault("downstreamTts", {}))
-    result.setdefault("details", {})["cloneEval"] = clone_eval
-    downstream.update(
-        {
-            "enabled": True,
-            "ttsModel": response["request"]["model"],
-            "status": "computed",
-            "source": response["source"],
-            "lastCloneId": clone_id,
-            "cloneText": text,
-            "simCleanClone": clone_eval.get("originalSimilarity"),
-            "simProtectedClone": clone_eval.get("protectedSimilarity"),
-            "simDropRate": clone_eval.get("similarityDropRate"),
-        }
-    )
-    metric_sources = result.setdefault("summary", {}).setdefault("metricSources", {})
-    metric_sources.update(clone_eval_sources)
-    summary_score = compute_overall_score(result)
-    result.setdefault("summary", {})["score"] = summary_score["score"]
-    result.setdefault("summary", {})["verdict"] = summary_score["verdict"]
-    metric_sources.update(summary_score.get("_metricSources") or {})
-    result["metricSources"] = metric_sources
-    save_result(TASK_DIR / task_id, result)
+    with RESULT_WRITE_LOCK:
+        result_path = TASK_DIR / task_id / "result.json"
+        latest_result = load_result(task_id) if result_path.exists() else result
+        clones = latest_result.setdefault("cloneResults", [])
+        clone_sub_id = response.get("cloneSubId")
+        if clone_sub_id:
+            clones[:] = [item for item in clones if item.get("cloneSubId") != clone_sub_id]
+        clones.append(response)
+        downstream = latest_result.setdefault("details", {}).setdefault("downstreamTts", {})
+        latest_result.setdefault("details", {})["cloneEval"] = clone_eval
+        downstream.update(
+            {
+                "enabled": True,
+                "ttsModel": response["request"]["model"],
+                "status": "computed",
+                "source": response["source"],
+                "lastCloneId": clone_id,
+                "cloneText": text,
+                "simCleanClone": clone_eval.get("originalSimilarity"),
+                "simProtectedClone": clone_eval.get("protectedSimilarity"),
+                "simDropRate": clone_eval.get("similarityDropRate"),
+                "fineTune": response.get("fineTune"),
+            }
+        )
+        metric_sources = latest_result.setdefault("summary", {}).setdefault("metricSources", {})
+        metric_sources.update(clone_eval_sources)
+        summary_score = compute_overall_score(latest_result)
+        latest_result.setdefault("summary", {})["score"] = summary_score["score"]
+        latest_result.setdefault("summary", {})["verdict"] = summary_score["verdict"]
+        metric_sources.update(summary_score.get("_metricSources") or {})
+        latest_result["metricSources"] = metric_sources
+        latest_result["updatedAt"] = utc_now_iso()
+        save_result(TASK_DIR / task_id, latest_result)
     return response

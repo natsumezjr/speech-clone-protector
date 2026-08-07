@@ -5,10 +5,11 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 import wave
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -20,6 +21,7 @@ if str(ROOT) not in sys.path:
 import metric_definitions as metrics
 import api_server as api
 import result_adapter as adapter
+from core import utils as core_utils
 from api_server import frontend_result
 from result_adapter import build_task_payload
 
@@ -323,6 +325,117 @@ class MetricDefinitionsTest(unittest.TestCase):
         self.assertEqual(source["status"], "error")
         self.assertIn("HuBERT model", source["reason"])
 
+    def test_legacy_weight_norm_context_serializes_global_mutation(self) -> None:
+        original_weight_norm = object()
+        parametrizations = SimpleNamespace(weight_norm=original_weight_norm)
+        fake_torch = SimpleNamespace(nn=SimpleNamespace(utils=SimpleNamespace(parametrizations=parametrizations)))
+        first_entered = threading.Event()
+        second_started = threading.Event()
+        second_entered = threading.Event()
+        release_first = threading.Event()
+        errors: list[BaseException] = []
+
+        def first_worker() -> None:
+            try:
+                with core_utils.legacy_weight_norm_for_transformers_audio():
+                    self.assertFalse(hasattr(parametrizations, "weight_norm"))
+                    first_entered.set()
+                    release_first.wait(2)
+            except BaseException as exc:  # pragma: no cover - surfaced by assertion below
+                errors.append(exc)
+
+        def second_worker() -> None:
+            second_started.set()
+            try:
+                with core_utils.legacy_weight_norm_for_transformers_audio():
+                    self.assertFalse(hasattr(parametrizations, "weight_norm"))
+                    second_entered.set()
+            except BaseException as exc:  # pragma: no cover - surfaced by assertion below
+                errors.append(exc)
+
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+            first = threading.Thread(target=first_worker)
+            second = threading.Thread(target=second_worker)
+            first.start()
+            self.assertTrue(first_entered.wait(1))
+            second.start()
+            self.assertTrue(second_started.wait(1))
+            try:
+                self.assertFalse(second_entered.wait(0.1))
+            finally:
+                release_first.set()
+                first.join(2)
+                second.join(2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(second_entered.is_set())
+        self.assertIs(parametrizations.weight_norm, original_weight_norm)
+
+    def test_semantic_encoder_cache_initializes_once_under_concurrency(self) -> None:
+        constructor_started = threading.Event()
+        second_cache_miss = threading.Event()
+        release_constructor = threading.Event()
+        constructor_count = 0
+        count_lock = threading.Lock()
+        results: list[object] = []
+        errors: list[BaseException] = []
+
+        class TrackingCache(dict[tuple[str, str, str, str], object]):
+            def get(self, key: tuple[str, str, str, str], default: object = None) -> object:
+                if threading.current_thread().name == "semantic-second" and key not in self:
+                    second_cache_miss.set()
+                return super().get(key, default)
+
+        class FakeSemanticEncoderEnsemble:
+            def __init__(self, **_: object) -> None:
+                nonlocal constructor_count
+                with count_lock:
+                    constructor_count += 1
+                constructor_started.set()
+                release_constructor.wait(2)
+
+        fake_module = ModuleType("semantic_encoders")
+        fake_module.SemanticEncoderEnsemble = FakeSemanticEncoderEnsemble
+
+        def load_ensemble() -> None:
+            try:
+                results.append(metrics._load_semantic_encoder_ensemble({}))
+            except BaseException as exc:  # pragma: no cover - surfaced by assertion below
+                errors.append(exc)
+
+        env = {
+            "SEME2E_ENABLE_SEMANTIC_ENCODERS": "1",
+            "SEME2E_SEMANTIC_ENCODER_DEVICE": "cpu",
+            "SEME2E_SEMANTIC_TOKENIZER_MODEL": "tokenizer",
+            "SEME2E_HUBERT_MODEL": "hubert",
+            "SEME2E_WHISPER_MODEL": "whisper",
+        }
+        with (
+            mock.patch.dict(os.environ, env, clear=False),
+            mock.patch.dict(sys.modules, {"semantic_encoders": fake_module}),
+            mock.patch.object(metrics, "_SEMANTIC_ENCODER_CACHE", TrackingCache()),
+            mock.patch.object(metrics, "_resolve_local_model_path", side_effect=lambda value: value),
+            mock.patch.object(metrics, "_resolve_hf_or_local_model", side_effect=lambda requested, _: requested),
+        ):
+            first = threading.Thread(target=load_ensemble, name="semantic-first")
+            second = threading.Thread(target=load_ensemble, name="semantic-second")
+            first.start()
+            self.assertTrue(constructor_started.wait(1))
+            second.start()
+            self.assertTrue(second_cache_miss.wait(1))
+            release_constructor.set()
+            first.join(2)
+            second.join(2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(constructor_count, 1)
+        self.assertEqual(len(results), 2)
+        self.assertIs(results[0], results[1])
+
     def test_selected_semantic_encoders_require_semantic_encoder_ensemble(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -501,7 +614,7 @@ class MetricDefinitionsTest(unittest.TestCase):
         self.assertIsNone(result["cloneConfidenceDropRate"])
         self.assertEqual(result["_metricSources"]["cloneEval.cloneConfidenceDropRate"]["status"], "unavailable")
 
-    def test_clone_defense_score_uses_available_weighted_formula(self) -> None:
+    def test_clone_defense_score_uses_soft_mapped_distance_and_direct_offset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             original = root / "original.wav"
@@ -528,19 +641,30 @@ class MetricDefinitionsTest(unittest.TestCase):
                 speaker_model=FakeSpeaker(),
             )
 
-        expected = 100.0 * ((0.5 * 0.45) + (1.0 * 0.35)) / (0.45 + 0.35)
+        distance = 1.0 - 0.6
+        mapped_distance = distance * (1.26 - 0.30 * distance)
+        expected = 100.0 * (0.9 * mapped_distance + 0.1 * ((1.0 - 0.5) / 2.0))
         self.assertTrue(math.isclose(result["cloneDefenseScore"], expected, rel_tol=1e-6))
+        self.assertEqual(
+            result["_metricSources"]["cloneEval.cloneDefenseScore"]["formula"],
+            "Delta_distance_mapped=clamp(Delta_distance*(1.26-0.30*Delta_distance),0,1); Delta_protect=100*(0.9*Delta_distance_mapped+0.1*(Delta_direct/2))",
+        )
 
-    def test_create_asr_eval_merges_semantic_metrics(self) -> None:
+    def test_clone_distance_soft_mapping_matches_score_targets(self) -> None:
+        targets = ((0.50, 49.95), (0.75, 69.8625), (0.90, 80.19))
+        for distance, expected_main_score in targets:
+            with self.subTest(distance=distance):
+                main_score = 100.0 * 0.9 * metrics.calibrate_clone_distance(distance)
+                self.assertTrue(math.isclose(main_score, expected_main_score, rel_tol=1e-6))
+
+    def test_create_asr_eval_preserves_shared_semantic_metrics_without_recomputing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             original = root / "original.wav"
             protected = root / "protected.wav"
             write_wav(original, np.zeros(160, dtype=np.float32))
             write_wav(protected, np.zeros(160, dtype=np.float32))
-            stored_result = {"details": {}, "summary": {"primaryMetrics": {}, "metricSources": {}}}
-            fake_asr = {"wer": 0.1, "cer": 0.2, "status": "available", "_metricSources": {"asrEval.*": {"status": "available", "source": "fake_asr"}}}
-            fake_semantic = {
+            shared_semantic = {
                 "tokenChangeRate": 0.25,
                 "tokenErrorRate": 0.5,
                 "tokenChangeCount": 1,
@@ -549,18 +673,39 @@ class MetricDefinitionsTest(unittest.TestCase):
                 "encoderDistances": [{"encoder": "S3", "distance": 0.1}],
                 "_metricSources": {"asrEval.tokenErrorRate": {"status": "available", "source": "fake_tokenizer"}},
             }
+            stored_result = {
+                "details": {"semantic": shared_semantic},
+                "summary": {
+                    "primaryMetrics": {"tokenChangeRate": 0.25, "tokenErrorRate": 0.5, "semanticDrift": 0.1},
+                    "metricSources": {"asrEval.tokenErrorRate": {"status": "available", "source": "fake_tokenizer"}},
+                },
+            }
+            fake_asr = {"wer": 0.1, "cer": 0.2, "status": "available", "_metricSources": {"asrEval.*": {"status": "available", "source": "fake_asr"}}}
 
-            with mock.patch.object(adapter, "_task_audio_paths", return_value=(original, protected, stored_result)):
-                with mock.patch.object(adapter, "maybe_asr_eval", return_value=fake_asr):
-                    with mock.patch.object(adapter, "compute_semantic_token_metrics", return_value=fake_semantic):
-                        with mock.patch.object(adapter, "save_result"):
-                            response = adapter.create_asr_eval("task_test", {"model": "fake"})
+            with (
+                mock.patch.object(adapter, "TASK_DIR", root / "tasks"),
+                mock.patch.object(adapter, "_task_audio_paths", return_value=(original, protected, stored_result)),
+                mock.patch.object(adapter, "maybe_asr_eval", return_value=fake_asr) as maybe_asr,
+                mock.patch.object(adapter, "compute_semantic_token_metrics") as semantic_compute,
+                mock.patch.object(adapter, "save_result"),
+            ):
+                response = adapter.create_asr_eval("task_test", {"model": "fake", "language": "zh-cn", "asrSubId": "asr_test"})
 
-        self.assertEqual(response["asr"]["tokenChangeRate"], 0.25)
-        self.assertEqual(response["asr"]["tokenErrorRate"], 0.5)
-        self.assertEqual(stored_result["details"]["semantic"], fake_semantic)
-        self.assertEqual(stored_result["details"]["asr"]["encoderDistances"], fake_semantic["encoderDistances"])
+        semantic_compute.assert_not_called()
+        self.assertNotIn("tokenChangeRate", response["asr"])
+        self.assertNotIn("tokenErrorRate", response["asr"])
+        self.assertNotIn("semanticDrift", response["asr"])
+        self.assertNotIn("encoderDistances", response["asr"])
+        self.assertIs(stored_result["details"]["semantic"], shared_semantic)
+        self.assertEqual(stored_result["summary"]["primaryMetrics"]["tokenChangeRate"], 0.25)
+        self.assertEqual(stored_result["summary"]["primaryMetrics"]["tokenErrorRate"], 0.5)
+        self.assertEqual(stored_result["summary"]["primaryMetrics"]["semanticDrift"], 0.1)
+        self.assertEqual(stored_result["summary"]["primaryMetrics"]["wer"], 0.1)
+        self.assertEqual(stored_result["summary"]["primaryMetrics"]["cer"], 0.2)
         self.assertEqual(stored_result["summary"]["metricSources"]["asrEval.tokenErrorRate"]["source"], "fake_tokenizer")
+        self.assertEqual(stored_result["summary"]["metricSources"]["asrEval.*"]["source"], "fake_asr")
+        self.assertEqual(maybe_asr.call_args.args[2]["language"], "zh-cn")
+        self.assertEqual(response["request"]["language"], "zh-cn")
 
     def test_create_clone_voice_writes_clone_eval_to_details(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -661,20 +806,35 @@ class MetricDefinitionsTest(unittest.TestCase):
                 "psychoacoustic": {"enabled": True, "weightPsy": 0.1},
                 "optimization": {"epsilon": 0.01, "steps": 1, "weightL2": 0.01},
             }
+            shared_semantic = {
+                "tokenChangeRate": 0.25,
+                "tokenErrorRate": 0.5,
+                "semanticDrift": 0.1,
+                "encoderDistances": [{"encoder": "S3", "distance": 0.1}],
+                "status": "available",
+                "_metricSources": {"asrEval.semanticDrift": {"status": "available", "source": "fake_semantic"}},
+            }
             with mock.patch.dict(os.environ, {"SEME2E_ENABLE_SPEAKER": "0", "SEME2E_ENABLE_TOKENIZER": "0", "SEME2E_ENABLE_SEMANTIC_ENCODERS": "0"}):
-                result = build_task_payload(
-                    "task_test",
-                    payload,
-                    clean_path,
-                    protected_path,
-                    "file_test",
-                    "2026.6.26 00:00:00",
-                    "2026.6.26 00:00:01",
-                    {"source": "test_guard", "optimizationTrace": []},
-                )
+                with mock.patch.object(adapter, "compute_mfcc_semantic", return_value=shared_semantic) as semantic_compute:
+                    result = build_task_payload(
+                        "task_test",
+                        payload,
+                        clean_path,
+                        protected_path,
+                        "file_test",
+                        "2026.6.26 00:00:00",
+                        "2026.6.26 00:00:01",
+                        {"source": "test_guard", "optimizationTrace": []},
+                    )
             frontend = frontend_result(result)
 
+        semantic_compute.assert_called_once_with(clean_path, protected_path, payload["semantic"])
+        self.assertIs(result["details"]["semantic"], shared_semantic)
+        self.assertEqual(result["summary"]["primaryMetrics"]["tokenChangeRate"], 0.25)
+        self.assertEqual(result["summary"]["primaryMetrics"]["tokenErrorRate"], 0.5)
+        self.assertEqual(result["summary"]["primaryMetrics"]["semanticDrift"], 0.1)
         self.assertIsNone(frontend["asrEval"])
+        self.assertIs(frontend["semanticEval"], shared_semantic)
         self.assertIsNone(frontend["cloneEval"])
         self.assertIsNone(frontend["asr"]["semanticDrift"])
         self.assertIsNotNone(frontend["perturbation"]["l2Norm"])

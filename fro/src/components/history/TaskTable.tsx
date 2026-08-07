@@ -17,6 +17,7 @@ const statusTone: Record<TaskStatus, 'cyan' | 'green' | 'orange' | 'red'> = {
   running: 'orange',
   completed: 'green',
   success: 'green',
+  partial_failed: 'red',
   failed: 'red',
   error: 'red',
   cancelled: 'red',
@@ -55,7 +56,7 @@ function truncateFilename(filename: string, maxBase = 22) {
 
 function statusForView(task: HistoryTask, view: HistoryView): TaskStatus {
   const status = view === 'asr' ? task.asrStatus : view === 'clone' ? task.cloneStatus : task.protectionStatus
-  if (status === 'queued' || status === 'running' || status === 'completed' || status === 'success' || status === 'failed' || status === 'error' || status === 'cancelled') return status
+  if (status === 'queued' || status === 'running' || status === 'completed' || status === 'success' || status === 'partial_failed' || status === 'failed' || status === 'error' || status === 'cancelled') return status
   return 'queued'
 }
 
@@ -82,6 +83,7 @@ function statusTextForView(task: HistoryTask, view: HistoryView) {
   const label = view === 'asr' ? 'ASR' : view === 'clone' ? '克隆' : '防护'
   if (status === 'queued') return `${label}排队中`
   if (status === 'running') return `${label}进行中`
+  if (status === 'partial_failed') return `${label}部分失败`
   if (status === 'failed' || status === 'error') return `${label}失败`
   if (status === 'cancelled') return `${label}已取消`
   return `${label}完成`
@@ -124,7 +126,7 @@ function ParamModal({ task, onClose }: { task: HistoryTask; onClose: () => void 
               {rows.map(([name, value]) => (
                 <tr key={String(name)} className="border-b border-cyan-300/10 last:border-b-0">
                   <td className="px-4 py-3 font-mono text-xs text-slate-400">{name}</td>
-                  <td className="px-4 py-3 text-right font-mono text-cyan-100">{typeof value === 'number' ? value.toFixed(6).replace(/0+$/, '').replace(/\.$/, '') : '-'}</td>
+                  <td className="px-4 py-3 text-right font-mono text-cyan-100">{typeof value === 'number' ? value.toFixed(2) : '-'}</td>
                 </tr>
               ))}
             </tbody>
@@ -155,7 +157,7 @@ export function TaskTable({ tasks, view, onChanged }: { tasks: HistoryTask[]; vi
       downloadBlob(blob, filename)
       pushToast({ kind: 'success', title: '保护音频已开始下载' })
     } catch (error) {
-      pushToast({ kind: 'error', title: '下载失败', description: error instanceof Error ? error.message : '请检查后端接口。' })
+      pushToast({ kind: 'error', title: '下载失败', description: error instanceof Error ? error.message : '请稍后重试。' })
     }
   }
 
@@ -165,7 +167,7 @@ export function TaskTable({ tasks, view, onChanged }: { tasks: HistoryTask[]; vi
       pushToast({ kind: 'success', title: '历史记录已删除' })
       onChanged?.()
     } catch (error) {
-      pushToast({ kind: 'error', title: '删除失败', description: error instanceof Error ? error.message : '请检查后端接口。' })
+      pushToast({ kind: 'error', title: '删除失败', description: error instanceof Error ? error.message : '请稍后重试。' })
     }
   }
 
@@ -176,7 +178,7 @@ export function TaskTable({ tasks, view, onChanged }: { tasks: HistoryTask[]; vi
       pushToast({ kind: 'success', title: '已重新提交保护任务', description: `新任务：${created.taskId}` })
       onChanged?.()
     } catch (error) {
-      pushToast({ kind: 'error', title: '重试失败', description: error instanceof Error ? error.message : '请检查后端接口。' })
+      pushToast({ kind: 'error', title: '重试失败', description: error instanceof Error ? error.message : '请稍后重试。' })
     } finally {
       setRetryingTaskId(null)
     }

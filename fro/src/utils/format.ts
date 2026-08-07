@@ -5,7 +5,7 @@ export function formatBytes(bytes: number) {
   return `${(bytes / 1024 ** index).toFixed(index === 0 ? 0 : 2)} ${units[index]}`
 }
 
-export function percent(value: number | null | undefined, digits = 1) {
+export function percent(value: number | null | undefined, digits = 2) {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '未生成'
   return `${(value * 100).toFixed(digits)}%`
 }

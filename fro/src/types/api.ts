@@ -5,6 +5,8 @@ import type {
   AsrEvalResponse,
   CloneVoiceRequest,
   CloneVoiceResult,
+  CreateEvaluationBatchRequest,
+  EvaluationBatch,
   HistoryTask,
   PsychoacousticSliceMode,
   PsychoacousticSliceResponse,
@@ -28,6 +30,7 @@ export interface ApiClient {
   getTaskResult(taskId: string): Promise<TaskResult>
   getPsychoacousticSlice(taskId: string, params: { mode: PsychoacousticSliceMode; timeSec?: number }): Promise<PsychoacousticSliceResponse>
   getTaskDetails(taskId: string): Promise<TaskDetailsResponse>
+  createEvaluationBatch(taskId: string, payload: CreateEvaluationBatchRequest): Promise<EvaluationBatch>
   runAsrEval(taskId: string, payload: AsrEvalRequest): Promise<AsrEvalResponse>
   cloneVoice(taskId: string, payload: CloneVoiceRequest): Promise<CloneVoiceResult>
   listTasks(): Promise<HistoryTask[]>

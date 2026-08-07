@@ -2,7 +2,7 @@ import type { AudioFileMeta } from './audio'
 
 export type DataMode = 'backend'
 
-export type TaskStatus = 'queued' | 'running' | 'completed' | 'success' | 'failed' | 'error' | 'cancelled'
+export type TaskStatus = 'queued' | 'running' | 'completed' | 'success' | 'partial_failed' | 'failed' | 'error' | 'cancelled'
 export type ProtectionMode = 'standard' | 'strong' | 'high_fidelity' | 'custom' | 'joint'
 export type ProtectionTarget = 'semantic' | 'timbre'
 export type TaskStage =
@@ -100,6 +100,8 @@ export interface AsrEvalResponse {
   status: string
   asr?: AsrMetrics
   asrSubId?: string
+  request?: AsrEvalRequest
+  createdAt?: string | null
 }
 
 export interface SubtaskStatusSnapshot {
@@ -113,8 +115,57 @@ export interface SubtaskStatusSnapshot {
   updatedAt?: string | null
   asrSubId?: string | null
   cloneSubId?: string | null
+  asrRequest?: AsrEvalRequest | null
+  cloneRequest?: CloneVoiceRequest | null
   asrResult?: AsrEvalResponse | null
   cloneResult?: CloneVoiceResult | null
+}
+
+export type EvaluationBatchType = 'asr' | 'clone'
+export type EvaluationBatchStatus = TaskStatus
+
+export interface EvaluationBatchItem {
+  batchItemId: string
+  model: string
+  modelName?: string | null
+  modelType?: string | null
+  annotationSource?: 'manual' | 'asr' | null
+  status: TaskStatus | string
+  progress?: number | null
+  message?: string | null
+  elapsedSec?: number | null
+  error?: string | ApiErrorPayload | null
+  asrSubId?: string | null
+  cloneSubId?: string | null
+  resultRef?: string | null
+}
+
+export interface EvaluationBatch {
+  batchId: string
+  type: EvaluationBatchType
+  taskId: string
+  label: string
+  status: EvaluationBatchStatus | string
+  progress: number
+  elapsedSec?: number | null
+  completedCount: number
+  failedCount: number
+  totalCount: number
+  createdAt?: string | null
+  updatedAt?: string | null
+  items: EvaluationBatchItem[]
+}
+
+export interface CreateEvaluationBatchRequest {
+  batchId: string
+  type: EvaluationBatchType
+  items: Array<{
+    batchItemId: string
+    model: string
+    modelName?: string
+    modelType?: string
+    annotationSource?: 'manual' | 'asr'
+  }>
 }
 
 export interface TaskStatusResponse {
@@ -133,6 +184,22 @@ export interface TaskStatusResponse {
   cloneResult?: CloneVoiceResult | null
   asrTask?: SubtaskStatusSnapshot | null
   cloneTask?: SubtaskStatusSnapshot | null
+  asrTasks?: SubtaskStatusSnapshot[]
+  cloneTasks?: SubtaskStatusSnapshot[]
+  asrBatches?: EvaluationBatch[]
+  cloneBatches?: EvaluationBatch[]
+}
+
+export interface SharedSemanticMetrics {
+  status?: string | null
+  tokenChangeRate?: number | null
+  tokenErrorRate?: number | null
+  tokenChangeCount?: number | null
+  tokenTotal?: number | null
+  semanticDrift?: number | null
+  encoderDistances?: Array<Record<string, unknown>> | null
+  reason?: string | null
+  error?: string | null
 }
 
 export interface SpeakerMetrics {
@@ -283,6 +350,7 @@ export interface CloneEval {
   targetText?: string | null
   originalCloneAudio?: AudioFileMeta | null
   protectedCloneAudio?: AudioFileMeta | null
+  directSimilarity?: number | null
   originalSimilarity?: number | null
   protectedSimilarity?: number | null
   similarityDropRate?: number | null
@@ -332,14 +400,25 @@ export interface NumericConfigRange {
 
 export interface RuntimeModelOption {
   label?: string
+  name?: string
   value: string
   backendValue?: string
   branch?: string
   backend?: string
   defaultPath?: string
-  status?: string
+  type?: string[]
+  information?: string
+  status?: 'available' | 'unavailable' | 'download_required' | string
   reason?: string | null
   languages?: string[]
+  promptRequired?: boolean
+  fineTuneMode?: 'live_fine_tune' | string
+}
+
+export interface RuntimeModelType {
+  value: string
+  name: string
+  information: string
 }
 
 export interface RuntimeChoiceOption {
@@ -357,6 +436,7 @@ export interface RuntimeModePreset {
 }
 
 export interface ProtectionRuntimeConfig {
+  modelTypes?: Record<string, RuntimeModelType[]>
   defaults: ProtectionTaskRequest
   profiles?: Record<string, ProtectionTaskRequest>
   activeDefaultProfile?: string
@@ -418,6 +498,7 @@ export interface RuntimeFormSchema {
 
 export interface CapabilitiesResponse {
   ok: boolean
+  modelTypes?: Record<string, RuntimeModelType[]>
   device?: string
   chains?: Record<string, CapabilityChain>
   config?: ProtectionRuntimeConfig
@@ -470,6 +551,8 @@ export interface TaskResult {
   effectiveConfig?: Record<string, unknown> | null
   presetName?: string | null
   asrEval?: AsrEval | null
+  semanticEval?: SharedSemanticMetrics | null
+  asrResults?: AsrEvalResponse[]
   cloneEval?: CloneEval | null
   cloneResults?: CloneVoiceResult[]
   speakerFeatureMap?: {
@@ -522,15 +605,53 @@ export interface CloneVoiceRequest {
   language?: string
   speed?: number
   speakerPrompt?: string
+  originalSpeakerPrompt?: string
+  protectedSpeakerPrompt?: string
+  annotationSource?: 'manual' | 'asr'
+  annotationAsrSubId?: string
+  annotationAsrModel?: string
+  annotationCreatedAt?: string
+  batchId?: string
+  batchItemId?: string
+}
+
+export interface FineTuneConditionEvidence {
+  textSec?: number | null
+  hubertSec?: number | null
+  semanticSec?: number | null
+  s1TrainSec?: number | null
+  s2TrainSec?: number | null
+  inferenceWallSec?: number | null
+  totalWallSec?: number | null
+  sourceDurationSec?: number | null
+  trainingDurationSec?: number | null
+  gptCheckpoint?: string | null
+  sovitsCheckpoint?: string | null
+  referencePath?: string | null
+  trainingAudioPath?: string | null
+  outputPath?: string | null
+}
+
+export interface FineTuneEvidence {
+  model?: string | null
+  mode?: string | null
+  workDir?: string | null
+  pairWallSec?: number | null
+  original?: FineTuneConditionEvidence | null
+  protected?: FineTuneConditionEvidence | null
 }
 
 export interface AsrEvalRequest {
   model: string
+  language?: string
   referenceText?: string
+  batchId?: string
+  batchItemId?: string
 }
 
 export interface CloneVoiceResult {
   cloneId: string
+  cloneSubId?: string
   taskId: string
   status: 'queued' | 'running' | 'completed' | 'success' | 'partial' | 'failed' | 'error'
   source?: string
@@ -539,6 +660,7 @@ export interface CloneVoiceResult {
   originalCloneAudio: AudioFileMeta
   protectedCloneAudio: AudioFileMeta
   cloneEval?: CloneEval | null
+  fineTune?: FineTuneEvidence | null
 }
 
 export interface HistoryTask {
@@ -564,6 +686,7 @@ export interface HistoryTask {
   protectionStage?: TaskStage | string | null
   protectionMessage?: string | null
   protectionElapsedSec?: number | null
+  protectionCompletedAt?: string | null
   protectionError?: string | ApiErrorPayload | null
   asrStatus?: TaskStatus | string | null
   asrProgress?: number | null
@@ -583,6 +706,8 @@ export interface HistoryTask {
   cloneError?: string | ApiErrorPayload | null
   hasAsrResult?: boolean
   hasCloneResult?: boolean
+  asrTaskCount?: number
+  cloneTaskCount?: number
   elapsedSec?: number | null
   updatedAt?: string | null
   error?: string | ApiErrorPayload | null

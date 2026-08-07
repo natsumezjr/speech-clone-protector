@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
@@ -11,6 +12,7 @@ if TYPE_CHECKING:
 
 
 ROOT = Path(__file__).resolve().parents[1]
+_LEGACY_WEIGHT_NORM_LOCK = threading.RLock()
 
 
 def parse_model_list(value: str) -> list[str]:
@@ -28,13 +30,17 @@ def legacy_weight_norm_for_transformers_audio():
     """Load legacy weight_g/weight_v checkpoints on recent PyTorch releases."""
     import torch
 
-    parametrizations = torch.nn.utils.parametrizations
-    parametrized_weight_norm = parametrizations.weight_norm
-    delattr(parametrizations, "weight_norm")
-    try:
-        yield
-    finally:
-        setattr(parametrizations, "weight_norm", parametrized_weight_norm)
+    with _LEGACY_WEIGHT_NORM_LOCK:
+        parametrizations = torch.nn.utils.parametrizations
+        parametrized_weight_norm = getattr(parametrizations, "weight_norm", None)
+        if parametrized_weight_norm is None:
+            yield
+            return
+        delattr(parametrizations, "weight_norm")
+        try:
+            yield
+        finally:
+            setattr(parametrizations, "weight_norm", parametrized_weight_norm)
 
 
 def read_csv_rows(path: str | Path, required: Iterable[str] | None = None) -> list[dict[str, str]]:

@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useSearchParams } from 'react-router-dom'
 import { Panel } from '@/components/common/Panel'
 import { Spinner } from '@/components/common/Spinner'
 import { TaskFilters } from '@/components/history/TaskFilters'
@@ -28,10 +29,12 @@ function matchesHistoryView(task: { protectionStatus?: string | null; asrStatus?
 }
 
 export function HistoryPage() {
-  const [search, setSearch] = useState('')
+  const [searchParams] = useSearchParams()
+  const initialView = searchParams.get('view')
+  const [search, setSearch] = useState(searchParams.get('search') ?? '')
   const [status, setStatus] = useState('all')
   const [mode, setMode] = useState('all')
-  const [view, setView] = useState<HistoryView>('protection')
+  const [view, setView] = useState<HistoryView>(initialView === 'asr' || initialView === 'clone' ? initialView : 'protection')
   const queryClient = useQueryClient()
   const setHistoryTasks = useTaskStore((state) => state.setHistoryTasks)
   const { data = [], isLoading, error } = useQuery({
@@ -50,7 +53,8 @@ export function HistoryPage() {
   const filtered = useMemo(
     () =>
       data.filter((task) => {
-        const hitText = task.filename.toLowerCase().includes(search.toLowerCase())
+        const query = search.toLowerCase()
+        const hitText = task.filename.toLowerCase().includes(query) || task.taskId.toLowerCase().includes(query)
         const hitStatus = status === 'all' || taskStatusForView(task, view) === status
         const hitMode = mode === 'all' || task.mode === mode
         return hitText && hitStatus && hitMode && matchesHistoryView(task, view)
@@ -82,7 +86,7 @@ export function HistoryPage() {
           <Spinner />
         </Panel>
       ) : error ? (
-        <Panel className="border-red-400/25 bg-red-950/20 text-red-100">后端模式下获取历史任务失败：{error instanceof Error ? error.message : '未知错误'}</Panel>
+        <Panel className="border-red-400/25 bg-red-950/20 text-red-100">获取历史任务失败：{error instanceof Error ? error.message : '未知错误'}</Panel>
       ) : (
         <TaskTable tasks={filtered} view={view} onChanged={() => void queryClient.invalidateQueries({ queryKey: ['tasks'] })} />
       )}

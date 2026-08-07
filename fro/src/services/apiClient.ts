@@ -11,6 +11,7 @@ export const getTaskStatus = apiClient.getTaskStatus
 export const getTaskResult = apiClient.getTaskResult
 export const getPsychoacousticSlice = apiClient.getPsychoacousticSlice
 export const getTaskDetails = apiClient.getTaskDetails
+export const createEvaluationBatch = apiClient.createEvaluationBatch
 export const runAsrEval = apiClient.runAsrEval
 export const cloneVoice = apiClient.cloneVoice
 export const listTasks = apiClient.listTasks

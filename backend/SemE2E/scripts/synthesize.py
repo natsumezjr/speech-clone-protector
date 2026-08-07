@@ -117,7 +117,7 @@ def parse_args():
     parser.add_argument("--target_text", required=True)
     parser.add_argument("--output_dir", type=Path, default=ROOT / "outputs" / "tts_xtts")
     parser.add_argument("--output_manifest", type=Path, default=None)
-    parser.add_argument("--model_name", default="tts_models/multilingual/multi-dataset/xtts_v2")
+    parser.add_argument("--model_name", default="xtts_v2")
     parser.add_argument("--language", default="en")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--limit", type=int, default=None)

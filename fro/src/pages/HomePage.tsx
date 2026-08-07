@@ -46,7 +46,7 @@ const strategies = [
 
 const metrics = [
   { title: 'ASR 干扰（平均）', value: '↓ 62.3%', sub: '识别准确率下降', tone: 'red', data: [40, 72, 52, 69, 50, 80, 61, 34] },
-  { title: '声纹相似度下降', value: '↓ 81.4%', sub: '克隆相似度降低', tone: 'red', data: [28, 46, 66, 50, 74, 42, 56, 38] },
+  { title: '声纹相似度下降', value: '↓ 0.736', sub: '克隆相似度降低', tone: 'red', data: [28, 46, 66, 50, 74, 42, 56, 38] },
   { title: 'SNR 信噪比', value: '25.1', sub: '高保真听感', tone: 'green', data: [35, 45, 38, 62, 54, 77, 69, 82] },
   { title: '对抗评估（攻击成功率）', value: '↓ 85.6%', sub: '多攻击平均下降', tone: 'red', data: [22, 38, 55, 31, 76, 42, 37, 25] },
   { title: '任务通过率', value: '98.7%', sub: '通过率（内部基准）', tone: 'cyan', data: [16, 22, 28, 45, 39, 56, 73, 88] },
@@ -182,7 +182,7 @@ export function HomePage() {
           <span>全链路审计日志</span>
           <span>符合隐私安全要求</span>
         </div>
-        <span>© 2026 语音克隆防护平台</span>
+        <span>© 2026 VoiceShield</span>
       </footer>
     </div>
   )
@@ -209,7 +209,7 @@ function HeroScene() {
                 ['ASR', '语音识别', '↓ 62.3%'],
                 ['Tokenizer', '分词器', '↑ 73.8%'],
                 ['LLM', '语言模型', '↓ 58.7%'],
-                ['TTS', '克隆系统', '↓ 81.4%'],
+                ['TTS', '克隆系统', '↓ 0.736'],
               ].map(([name, sub, value]) => (
                 <div key={name} className="hero-impact-tile h-[96px] rounded-[6px] border border-cyan-300/18 bg-[#07192d] px-1.5 py-2 text-center">
                   <div className="whitespace-nowrap text-[12px] font-black leading-4 text-white">{name}</div>

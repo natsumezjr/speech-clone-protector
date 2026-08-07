@@ -17,9 +17,7 @@ function lossValue(point: LossTrendPoint, series: (typeof lossSeries)[number]) {
 function formatLossValue(value: unknown) {
   const numberValue = typeof value === 'number' ? value : Number(value)
   if (!Number.isFinite(numberValue)) return '未生成'
-  const abs = Math.abs(numberValue)
-  if (abs > 0 && (abs < 0.001 || abs >= 10000)) return numberValue.toExponential(3)
-  return numberValue.toFixed(6).replace(/\.?0+$/, '')
+  return numberValue.toFixed(2)
 }
 
 export function TrendChart({ data }: { data: LossTrendPoint[] }) {

@@ -2,6 +2,7 @@
 import { useNavigate, useParams } from 'react-router-dom'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import {
   CheckCircle2,
   ChevronDown,
@@ -9,22 +10,21 @@ import {
   Clock3,
   Copy,
   Download,
-  FileArchive,
-  FileText,
   Info,
   Loader2,
   RefreshCw,
+  Search,
   ShieldCheck,
   Sparkles,
   TestTube2,
   Volume2,
   X,
 } from 'lucide-react'
-import { cloneVoice, downloadEvidenceZip, downloadProtectedAudio, exportReport, getPsychoacousticSlice, getTaskResult, getTaskStatus, listTasks, runAsrEval } from '@/services/apiClient'
+import { cloneVoice, downloadProtectedAudio, getPsychoacousticSlice, getTaskResult, getTaskStatus, listTasks, runAsrEval } from '@/services/apiClient'
 import { useCapabilitiesQuery } from '@/hooks/useCapabilitiesQuery'
 import { useAppStore } from '@/store/appStore'
 import { useTaskStore } from '@/store/taskStore'
-import type { AsrEval, AsrMetrics, CapabilitiesResponse, CloneEval, CloneVoiceRequest, CloneVoiceResult, DiffOp, LossFinal, LossTrendPoint, ProtectionRuntimeConfig, PsychoacousticPoint, PsychoacousticSliceResponse, RadarPoint, TaskResult, TaskStatusResponse } from '@/types/task'
+import type { AsrEval, AsrEvalResponse, AsrMetrics, CapabilitiesResponse, CloneEval, CloneVoiceRequest, CloneVoiceResult, DiffOp, EvaluationBatch, LossFinal, LossTrendPoint, ProtectionRuntimeConfig, PsychoacousticPoint, PsychoacousticSliceResponse, RadarPoint, RuntimeModelOption, SubtaskStatusSnapshot, TaskResult, TaskStatusResponse } from '@/types/task'
 import type { AudioFileMeta } from '@/types/audio'
 import { downloadBlob } from '@/utils/download'
 import { cn } from '@/lib/utils'
@@ -32,14 +32,17 @@ import { AudioPlayer } from '@/components/audio/AudioPlayer'
 import { formatDurationSeconds, getAudioDuration, getAudioSource } from '@/utils/audio'
 import { TrendChart } from '@/components/charts/TrendChart'
 import { MathText } from '@/components/common/MathText'
-import { cloneMetricDisplay, computeAbsoluteDrop, formatCloneMetricNumber, generateCloneMetricInsights } from '@/utils/cloneMetricDisplay'
+import { ModelInformationModal } from '@/components/common/ModelInformationModal'
+import { computeAbsoluteDrop, formatCloneMetricNumber, generateCloneMetricInsights } from '@/utils/cloneMetricDisplay'
 import { analyzeLossConvergence, analyzeLossTrend, type TrendDirection } from '@/utils/resultMetrics'
+import { seconds } from '@/utils/format'
 
 const statusText: Record<TaskResult['status'], string> = {
   queued: '排队中',
   running: '处理中',
   completed: '已完成',
   success: '已完成',
+  partial_failed: '部分失败',
   failed: '失败',
   error: '失败',
   cancelled: '已取消',
@@ -61,40 +64,47 @@ function configFromCapabilities(capabilities: CapabilitiesResponse | undefined):
       defaults: capabilities.defaults,
       ranges: capabilities.ranges,
       models: capabilities.models,
+      modelTypes: capabilities.modelTypes,
       constraints: capabilities.constraints,
     }
   }
   return undefined
 }
 
-function optionValues(options?: ProtectionRuntimeConfig['models'][string]) {
-  return (options ?? []).map((option) => (typeof option === 'string' ? option : option.value)).filter(Boolean)
-}
-
-type BackendSelectOption = {
-  label: string
-  value: string
-  status?: string
-  languages?: string[]
-}
+type BackendSelectOption = RuntimeModelOption & { label: string; value: string }
 
 function backendOptionItems(options?: ProtectionRuntimeConfig['models'][string]) {
   return (options ?? [])
     .map((option) =>
       typeof option === 'string'
-        ? { label: option, value: option }
+        ? { label: option, name: option, value: option }
         : {
+            ...option,
             label: option.label ?? option.value,
-            value: option.backendValue ?? option.value,
-            status: option.status,
-            languages: Array.isArray(option.languages) ? option.languages : undefined,
+            value: option.value,
           },
     )
     .filter((option) => option.value)
 }
 
-const defaultCloneText =
-  '今天的语音克隆测试包含自然停顿、连续短句和较长上下文。我们希望模型在保持语速稳定的同时复现说话人的音色、韵律和情绪变化，用来比较原始音频与保护音频在下游合成系统中的差异。'
+function isAvailableModel(option: BackendSelectOption) {
+  return option.status === undefined || option.status === 'available'
+}
+
+function normalizeEvaluationLanguage(value?: string | null) {
+  return String(value ?? 'zh-cn').toLowerCase().startsWith('zh') ? 'zh-cn' : 'en'
+}
+
+function preferredAsrModel(options: BackendSelectOption[], language: string) {
+  const available = options.filter(isAvailableModel)
+  const chinese = normalizeEvaluationLanguage(language) === 'zh-cn'
+  const preferred = chinese
+    ? available.find((option) => option.type?.includes('chinese_asr') || option.value === 'funasr:paraformer-zh')
+    : available.find((option) => option.value === 'openai-whisper:medium')
+  return preferred?.value ?? available.find((option) => option.value.includes('whisper'))?.value ?? available[0]?.value ?? ''
+}
+
+const defaultCloneText = 'This test shows how VoiceShield protects a speaker\'s voice.'
 
 const asrWeakDisruptionThreshold = 0.2
 const asrStrongDisruptionThreshold = 0.5
@@ -102,6 +112,52 @@ const speakerSameIdentityThreshold = 0.25
 const speakerHighSimilarityThreshold = 0.5
 
 const delay = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))
+
+function hasRunningLinkedEvaluation(status?: TaskStatusResponse) {
+  const subtaskStates = [
+    ...(status?.asrTasks ?? []).map((task) => task.status),
+    ...(status?.cloneTasks ?? []).map((task) => task.status),
+    status?.asrTask?.status,
+    status?.cloneTask?.status,
+    ...(status?.asrBatches ?? []).map((batch) => batch.status),
+    ...(status?.cloneBatches ?? []).map((batch) => batch.status),
+  ]
+  return subtaskStates.some((value) => value === 'queued' || value === 'running')
+}
+
+function computeCloneDefenseScore(cloneEval?: CloneEval | null) {
+  if (!cloneEval) return null
+  const embeddingDistance = optionalNumber(cloneEval.embeddingDistanceAfter)
+  const directSimilarity = optionalNumber(cloneEval.directSimilarity)
+  if (embeddingDistance !== null && directSimilarity !== null) {
+    const calibratedDistance = clamp(embeddingDistance * (1.26 - 0.3 * embeddingDistance), 0, 1)
+    const directShift = 1 - directSimilarity
+    return 100 * (0.9 * calibratedDistance + 0.1 * clamp(directShift / 2, 0, 1))
+  }
+  return optionalNumber(cloneEval.cloneDefenseScore)
+}
+
+function summarizeCloneDefenseScore(result: TaskResult, status?: TaskStatusResponse) {
+  const candidates = [
+    ...(result.cloneResults ?? []),
+    ...(status?.cloneTasks ?? []).map((task) => task.cloneResult),
+    status?.cloneTask?.cloneResult,
+    status?.cloneResult,
+  ].filter((item): item is CloneVoiceResult => Boolean(item?.cloneId))
+  const unique = new Map<string, CloneVoiceResult>()
+  candidates.forEach((item) => unique.set(item.cloneId, item))
+  const scores = Array.from(unique.values())
+    .map((item) => computeCloneDefenseScore(item.cloneEval ?? cloneResultToEval(item)))
+    .filter((score): score is number => score !== null)
+  if (!scores.length) {
+    const fallbackScore = computeCloneDefenseScore(result.cloneEval)
+    if (fallbackScore !== null) scores.push(fallbackScore)
+  }
+  return {
+    count: scores.length,
+    score: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length : null,
+  }
+}
 
 export function ResultsPage() {
   const { taskId } = useParams()
@@ -137,7 +193,7 @@ export function ResultsPage() {
           id: 'results-missing-task-id',
           kind: 'error',
           title: '请先进行音频保护任务',
-          description: '结果页需要有效的 taskId。',
+          description: '请先选择一条有效的保护记录。',
           dedupeMs: 5000,
         })
         navigate('/workspace', { replace: true })
@@ -147,7 +203,7 @@ export function ResultsPage() {
           id: 'results-missing-task-id',
           kind: 'error',
           title: '请先进行音频保护任务',
-          description: '结果页需要有效的 taskId。',
+          description: '请先选择一条有效的保护记录。',
           dedupeMs: 5000,
         })
         navigate('/workspace', { replace: true })
@@ -186,18 +242,36 @@ export function ResultsPage() {
 }
 
 function SummaryBar({ result, onTaskInfoClick, onDownloadClick }: { result: TaskResult; onTaskInfoClick: () => void; onDownloadClick: () => void }) {
+  const { data: linkedTaskStatus } = useQuery({
+    queryKey: ['task-linked-evaluations', result.taskId],
+    queryFn: () => getTaskStatus(result.taskId),
+    retry: false,
+    refetchInterval: (query) => (hasRunningLinkedEvaluation(query.state.data) ? 1500 : false),
+  })
+  const cloneScore = summarizeCloneDefenseScore(result, linkedTaskStatus)
+  const hasCloneScore = cloneScore.score !== null
+  const cloneScoreText = cloneScore.score === null ? '未生成' : `${cloneScore.score.toFixed(2)} 分`
+
   return (
-    <section className="ui-card grid min-h-[74px] grid-cols-[250px_180px_250px_170px_230px_minmax(260px,1fr)] items-center px-5 max-2xl:grid-cols-[1.05fr_0.78fr_1.08fr_0.75fr_1fr_1.42fr] max-xl:h-auto max-xl:grid-cols-3 max-xl:gap-y-4 max-xl:py-4">
-      <SummaryItem icon={<ClipboardList />} label="任务 ID" value={result.taskId} copy buttonTitle="查看任务信息" onClick={onTaskInfoClick} />
-      <SummaryItem icon={<ShieldCheck />} label="任务状态" value={statusText[result.status] ?? result.status} green={result.status === 'completed' || result.status === 'success'} />
+    <section className="ui-card grid min-h-[74px] grid-cols-[250px_180px_250px_170px_230px_minmax(290px,1fr)] items-center px-5 max-2xl:grid-cols-[1.05fr_0.78fr_1.08fr_0.75fr_1fr_1.55fr] max-xl:h-auto max-xl:grid-cols-3 max-xl:gap-y-4 max-xl:py-4">
+      <SummaryItem icon={<ClipboardList />} label="保护任务" value={result.taskId} copy buttonTitle="查看任务信息" onClick={onTaskInfoClick} />
+      <SummaryItem icon={<ShieldCheck />} label="保护状态" value={statusText[result.status] ?? result.status} green={result.status === 'completed' || result.status === 'success'} />
       <SummaryItem icon={<Clock3 />} label="完成时间" value={result.completedAt ?? '-'} />
       <SummaryItem icon={<Clock3 />} label="处理耗时" value={typeof result.elapsedSec === 'number' ? formatElapsed(result.elapsedSec) : '-'} />
       <SummaryItem icon={<Sparkles />} label="防护模式" value={modeText[result.mode] ?? result.mode} green />
-      <button type="button" onClick={onDownloadClick} className="flex h-full min-h-[58px] items-center justify-center gap-4 border-l border-cyan-300/10 pl-5 transition hover:bg-cyan-400/[0.035]">
-        <ShieldCheck className="h-11 w-11 text-cyan-300" />
+      <button
+        type="button"
+        onClick={onDownloadClick}
+        title={hasCloneScore ? `基于 ${cloneScore.count} 次可用克隆评估的平均分` : '等待语音克隆测试'}
+        className="flex h-full min-h-[58px] items-center justify-center gap-3 border-l border-cyan-300/10 pl-5 transition hover:bg-cyan-400/[0.035]"
+      >
+        {hasCloneScore ? <ShieldCheck className="h-11 w-11 text-cyan-300" /> : null}
+        <p className={cn('shrink-0 font-mono text-[27px] font-black leading-none', hasCloneScore ? 'text-emerald-300' : 'text-rose-300')}>
+          {cloneScoreText}
+        </p>
         <div className="min-w-0 text-left">
-          <p className="text-[27px] font-black leading-none text-cyan-200">已生成防护报告</p>
-          <p className="mt-1 text-xs text-slate-400">点击此处下载</p>
+          <p className="truncate text-[16px] font-black leading-tight text-cyan-100">{hasCloneScore ? '保护结果已生成' : '等待克隆测试'}</p>
+          <p className="mt-1 truncate text-xs text-slate-400">{hasCloneScore ? '点击此处下载' : '完成评估后自动更新'}</p>
         </div>
       </button>
     </section>
@@ -257,7 +331,55 @@ function SectionTitle({ children, info }: { children: ReactNode; info?: boolean 
   )
 }
 
-type ComparePanel = 'protect' | 'asr' | 'clone'
+function MetricInfoButton({ title, children }: { title: ReactNode; children: ReactNode }) {
+  const [open, setOpen] = useState(false)
+
+  useEffect(() => {
+    if (!open) return undefined
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false)
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [open])
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={(event) => {
+          event.preventDefault()
+          event.stopPropagation()
+          setOpen(true)
+        }}
+        className="grid h-7 w-7 shrink-0 place-items-center rounded-[6px] border border-cyan-300/16 text-cyan-200 transition hover:border-cyan-300/32 hover:bg-cyan-300/10"
+        aria-label="查看指标说明"
+        title="查看说明"
+      >
+        <Search className="h-3.5 w-3.5" />
+      </button>
+      {open ? createPortal(
+        <div className="fixed inset-0 z-[240] grid place-items-center bg-slate-950/80 px-4" role="dialog" aria-modal="true" aria-label="指标说明" onClick={() => setOpen(false)}>
+          <div className="ui-card w-full max-w-[520px] !bg-[#061426] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.56)]" onClick={(event) => event.stopPropagation()}>
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <p className="text-xs font-bold tracking-[0.12em] text-cyan-300">指标说明</p>
+                <h3 className="mt-2 text-lg font-black text-white">{title}</h3>
+              </div>
+              <button type="button" onClick={() => setOpen(false)} className="grid h-9 w-9 shrink-0 place-items-center rounded-full border border-cyan-300/14 text-slate-300 hover:text-white" aria-label="关闭指标说明">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="mt-5 rounded-[8px] border border-cyan-300/12 bg-slate-950 p-4 text-sm leading-7 text-slate-300">{children}</div>
+          </div>
+        </div>,
+        document.body,
+      ) : null}
+    </>
+  )
+}
+
+type ComparePanel = 'protect' | 'clone'
 type EditLevel = 'word' | 'char'
 type EditMetrics = {
   level: EditLevel
@@ -278,55 +400,84 @@ type EditMetrics = {
   diffOps: DiffOp[]
 }
 
+type AsrHistoryEntry = AsrEvalResponse & {
+  taskStatus?: SubtaskStatusSnapshot
+}
+
+type CloneHistoryEntry = {
+  key: string
+  taskId: string
+  cloneSubId?: string
+  cloneId?: string
+  status: string
+  request?: CloneVoiceRequest
+  result?: CloneVoiceResult
+  taskStatus?: SubtaskStatusSnapshot
+  createdAt?: string | null
+}
+
 function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdated: (asr: AsrMetrics) => void }) {
   const uploadedFile = useTaskStore((state) => state.uploadedFile)
   const pushToast = useAppStore((state) => state.pushToast)
+  const initialEvaluationLanguage = normalizeEvaluationLanguage(result.asr.language ?? result.cloneResults?.at(-1)?.request?.language)
   const [activePanel, setActivePanel] = useState<ComparePanel>('protect')
   const [protectedObjectUrl, setProtectedObjectUrl] = useState<string>()
   const [cloneModalOpen, setCloneModalOpen] = useState(false)
   const [cloneLoading, setCloneLoading] = useState(false)
   const [cloneError, setCloneError] = useState<string>()
   const [cloneResult, setCloneResult] = useState<CloneVoiceResult | undefined>()
+  const [selectedCloneKey, setSelectedCloneKey] = useState<string>()
+  const [selectedAsrSubId, setSelectedAsrSubId] = useState<string>()
   const [cloneTaskStatus, setCloneTaskStatus] = useState<TaskStatusResponse | null>(null)
   const [asrModalOpen, setAsrModalOpen] = useState(false)
   const [asrLoading, setAsrLoading] = useState(false)
   const [asrError, setAsrError] = useState<string>()
-  const [asrModel, setAsrModel] = useState(result.asrModel || result.asr.model || '')
+  const [asrModel, setAsrModel] = useState('')
+  const [asrLanguage, setAsrLanguage] = useState(initialEvaluationLanguage)
   const [cloneForm, setCloneForm] = useState<CloneVoiceRequest>({
     text: result.asr.originalText || defaultCloneText,
-    model: 'XTTS-v2',
-    language: 'zh-cn',
+    model: result.cloneResults?.at(-1)?.request?.model ?? '',
+    language: initialEvaluationLanguage,
     speed: 1,
-    speakerPrompt: '',
+    speakerPrompt: result.asr.originalText || '',
+    annotationSource: 'manual',
   })
   const { data: capabilities } = useCapabilitiesQuery()
   const { data: linkedTaskStatus, refetch: refetchLinkedTaskStatus } = useQuery({
     queryKey: ['task-linked-evaluations', result.taskId],
     queryFn: () => getTaskStatus(result.taskId),
     retry: false,
-    refetchInterval: (query) => {
-      const status = query.state.data
-      const asrStatus = status?.asrTask?.status
-      const cloneStatus = status?.cloneTask?.status
-      return [asrStatus, cloneStatus].some((value) => value === 'queued' || value === 'running') ? 1500 : false
-    },
+    refetchInterval: (query) => (hasRunningLinkedEvaluation(query.state.data) ? 1500 : false),
   })
   const runtimeConfig = configFromCapabilities(capabilities)
-  const configuredAsrOptions = useMemo(() => optionValues(runtimeConfig?.models.asr), [runtimeConfig?.models.asr])
+  const configuredAsrOptions = useMemo(() => backendOptionItems(runtimeConfig?.models.asr), [runtimeConfig?.models.asr])
   const asrOptions = useMemo(
-    () => (configuredAsrOptions.length ? configuredAsrOptions : [result.asrModel || result.asr.model || 'openai/whisper-small']),
+    () => {
+      if (configuredAsrOptions.length) return configuredAsrOptions
+      const value = result.asrModel || result.asr.model
+      return value ? [{ label: value, name: value, value, status: 'available' as const }] : []
+    },
     [configuredAsrOptions, result.asr.model, result.asrModel],
   )
+  const asrValues = useMemo(() => asrOptions.filter(isAvailableModel).map((option) => option.value), [asrOptions])
+  const effectiveAsrModel = asrValues.includes(asrModel) ? asrModel : preferredAsrModel(asrOptions, asrLanguage)
   const configuredTtsOptions = useMemo(
-    () => backendOptionItems(runtimeConfig?.models.tts).filter((option) => option.status === undefined || option.status === 'available'),
+    () => backendOptionItems(runtimeConfig?.models.tts),
     [runtimeConfig?.models.tts],
   )
   const ttsModelOptions = useMemo(
-    () => (configuredTtsOptions.length ? configuredTtsOptions : [{ label: 'XTTS-v2', value: 'tts_models/multilingual/multi-dataset/xtts_v2' }]),
-    [configuredTtsOptions],
+    () => {
+      if (configuredTtsOptions.length) return configuredTtsOptions
+      const value = result.cloneResults?.at(-1)?.request?.model
+      return value ? [{ label: value, name: value, value, status: 'available' as const }] : []
+    },
+    [configuredTtsOptions, result.cloneResults],
   )
-  const ttsOptions = useMemo(() => ttsModelOptions.map((option) => option.value), [ttsModelOptions])
+  const ttsOptions = useMemo(() => ttsModelOptions.filter(isAvailableModel).map((option) => option.value), [ttsModelOptions])
   const selectedTtsOption = ttsModelOptions.find((option) => option.value === cloneForm.model) ?? ttsModelOptions[0]
+  const evaluationModel = useMemo(() => backendOptionItems(runtimeConfig?.models.evaluation)[0] ?? null, [runtimeConfig?.models.evaluation])
+  const oneClickAsrLimit = Math.max(1, asrOptions.filter(isAvailableModel).length)
+  const oneClickCloneLimit = Math.max(1, ttsModelOptions.filter(isAvailableModel).reduce((count, option) => count + (option.promptRequired ? 2 : 1), 0))
   const cloneLanguages = useMemo(
     () => (selectedTtsOption?.languages?.length ? selectedTtsOption.languages : runtimeConfig?.clone?.languages?.length ? runtimeConfig.clone.languages : ['zh-cn', 'en']),
     [runtimeConfig, selectedTtsOption],
@@ -342,42 +493,138 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
     audioUrl: result.originalAudio.audioUrl ?? uploadedFile?.audioUrl,
   }
   const protectedAudio = { ...result.protectedAudio, objectUrl: result.protectedAudio.objectUrl ?? protectedObjectUrl }
-  const linkedAsrResult = linkedTaskStatus?.asrTask?.asrResult ?? linkedTaskStatus?.asrResult
-  const linkedCloneResult = linkedTaskStatus?.cloneTask?.cloneResult ?? linkedTaskStatus?.cloneResult
-  const activeAsrEval = result.asrEval ?? linkedAsrResult?.asr ?? null
+  const asrHistory = useMemo<AsrHistoryEntry[]>(() => {
+    const snapshots = [
+      ...(linkedTaskStatus?.asrTasks ?? []),
+      ...(linkedTaskStatus?.asrTask ? [linkedTaskStatus.asrTask] : []),
+    ]
+    const snapshotById = new Map<string, SubtaskStatusSnapshot>()
+    snapshots.forEach((snapshot) => {
+      if (snapshot.asrSubId) snapshotById.set(snapshot.asrSubId, snapshot)
+    })
+
+    const results = [
+      ...(result.asrResults ?? []),
+      ...snapshots.map((snapshot) => snapshot.asrResult).filter((item): item is AsrEvalResponse => Boolean(item)),
+      linkedTaskStatus?.asrResult,
+    ].filter((item): item is AsrEvalResponse => Boolean(item))
+    const unique = new Map<string, AsrHistoryEntry>()
+    results.forEach((item, index) => {
+      const key = item.asrSubId || `legacy-${item.createdAt || index}`
+      unique.set(key, { ...item, taskStatus: item.asrSubId ? snapshotById.get(item.asrSubId) : undefined })
+    })
+    snapshots.forEach((snapshot, index) => {
+      const asrSubId = snapshot.asrSubId ?? undefined
+      const key = asrSubId || `snapshot-${snapshot.createdAt || index}`
+      const current = unique.get(key)
+      const resultEntry = snapshot.asrResult?.asr ? snapshot.asrResult : current ?? snapshot.asrResult
+      unique.set(key, {
+        taskId: resultEntry?.taskId ?? result.taskId,
+        status: resultEntry?.status ?? String(snapshot.status ?? 'queued'),
+        asr: resultEntry?.asr,
+        asrSubId,
+        request: resultEntry?.request ?? snapshot.asrRequest ?? undefined,
+        createdAt: resultEntry?.createdAt ?? snapshot.createdAt,
+        taskStatus: snapshot,
+      })
+    })
+    return Array.from(unique.values()).sort((left, right) => String(left.taskStatus?.createdAt ?? left.createdAt ?? '').localeCompare(String(right.taskStatus?.createdAt ?? right.createdAt ?? '')))
+  }, [linkedTaskStatus, result.asrResults, result.taskId])
+  const cloneHistory = useMemo<CloneHistoryEntry[]>(() => {
+    const snapshots = [
+      ...(linkedTaskStatus?.cloneTasks ?? []),
+      ...(linkedTaskStatus?.cloneTask ? [linkedTaskStatus.cloneTask] : []),
+    ]
+    const snapshotBySubId = new Map<string, SubtaskStatusSnapshot>()
+    snapshots.forEach((snapshot) => {
+      if (snapshot.cloneSubId) snapshotBySubId.set(snapshot.cloneSubId, snapshot)
+    })
+    const candidates = [
+      ...(result.cloneResults ?? []),
+      ...snapshots.map((task) => task.cloneResult).filter((item): item is CloneVoiceResult => Boolean(item)),
+      linkedTaskStatus?.cloneResult,
+      cloneResult,
+    ].filter((item): item is CloneVoiceResult => Boolean(item?.cloneId || item?.cloneSubId))
+    const unique = new Map<string, CloneHistoryEntry>()
+    candidates.forEach((item, index) => {
+      const key = item.cloneSubId ? `sub:${item.cloneSubId}` : item.cloneId ? `clone:${item.cloneId}` : `legacy:${index}`
+      unique.set(key, {
+        key,
+        taskId: item.taskId || result.taskId,
+        cloneSubId: item.cloneSubId,
+        cloneId: item.cloneId || undefined,
+        status: item.status,
+        request: item.request,
+        result: item,
+        taskStatus: item.cloneSubId ? snapshotBySubId.get(item.cloneSubId) : undefined,
+        createdAt: item.cloneEval?.createdAt,
+      })
+    })
+    snapshots.forEach((snapshot, index) => {
+      const cloneSubId = snapshot.cloneSubId ?? undefined
+      const key = cloneSubId ? `sub:${cloneSubId}` : `snapshot:${snapshot.createdAt ?? index}`
+      const current = unique.get(key)
+      const snapshotResult = snapshot.cloneResult ?? current?.result
+      unique.set(key, {
+        key,
+        taskId: snapshotResult?.taskId ?? current?.taskId ?? result.taskId,
+        cloneSubId,
+        cloneId: snapshotResult?.cloneId || current?.cloneId,
+        status: String(snapshot.status ?? snapshotResult?.status ?? current?.status ?? 'queued'),
+        request: snapshot.cloneRequest ?? snapshotResult?.request ?? current?.request,
+        result: snapshotResult ?? current?.result,
+        taskStatus: snapshot,
+        createdAt: snapshot.createdAt ?? snapshotResult?.cloneEval?.createdAt ?? current?.createdAt,
+      })
+    })
+    return Array.from(unique.values()).sort((left, right) => String(left.createdAt ?? '').localeCompare(String(right.createdAt ?? '')))
+  }, [cloneResult, linkedTaskStatus, result.cloneResults, result.taskId])
+  const selectedAsrResult = selectedAsrSubId ? asrHistory.find((item) => item.asrSubId === selectedAsrSubId) : undefined
+  const latestCompletedAsrResult = [...asrHistory].reverse().find((item) => item.asr)
+  const activeAsrResult = selectedAsrSubId ? selectedAsrResult : latestCompletedAsrResult ?? asrHistory.at(-1)
+  const activeAsrEval = selectedAsrSubId ? selectedAsrResult?.asr ?? null : activeAsrResult?.asr ?? result.asrEval ?? null
   const originalText = activeAsrEval?.originalText ?? ''
   const referenceText = activeAsrEval?.referenceText ?? originalText
   const protectedText = activeAsrEval?.protectedText ?? ''
   const asrLevel = activeAsrEval?.metricLevel === 'word' || activeAsrEval?.metricLevel === 'char' ? activeAsrEval.metricLevel : chooseEditLevel(referenceText, protectedText)
   const asrEditStats = activeAsrEval && referenceText && protectedText ? computeEditMetrics(referenceText, protectedText, asrLevel) : null
-  const activeCloneResult = cloneResult ?? linkedCloneResult ?? result.cloneResults?.at(-1)
-  const activeCloneEval = activeCloneResult?.cloneEval ?? cloneResultToEval(activeCloneResult) ?? result.cloneEval ?? null
-  const cloneModel = activeCloneEval?.cloneModel ?? '未生成'
-  const speakerEvalModel = formatSpeakerEvalModel(
-    activeCloneEval?.speakerEvalModel
-      ?? result.metricSources?.['cloneEval.*']?.source
-      ?? result.metricSources?.['speaker.*']?.source
-      ?? activeCloneEval?.speakerModel
-      ?? 'ECAPA-TDNN',
-  )
+  const selectedCloneEntry = selectedCloneKey ? cloneHistory.find((item) => item.key === selectedCloneKey) : undefined
+  const latestCompletedCloneEntry = [...cloneHistory].reverse().find((item) => item.result)
+  const activeCloneEntry = selectedCloneKey ? selectedCloneEntry : latestCompletedCloneEntry
+  const activeCloneResult = activeCloneEntry?.result
+  const activeCloneEval = selectedCloneKey
+    ? activeCloneResult?.cloneEval ?? cloneResultToEval(activeCloneResult) ?? null
+    : activeCloneResult?.cloneEval ?? cloneResultToEval(activeCloneResult) ?? result.cloneEval ?? null
+  const completedCloneHistory = cloneHistory.map((item) => item.result).filter((item): item is CloneVoiceResult => Boolean(item))
   const compareTabs = [
     {
       key: 'protect',
-      label: '保护',
+      label: '语音保护结果',
       modelTitle: result.processingModel ?? result.generation?.source ?? '未生成',
     },
     {
-      key: 'asr',
-      label: 'ASR',
-      modelTitle: activeAsrEval?.model ?? activeAsrEval?.asrModel ?? result.asrModel ?? '未生成',
-    },
-    {
       key: 'clone',
-      label: '克隆',
-      modelTitle: `克隆 ${cloneModel} · 评估 ${speakerEvalModel}`,
+      label: '克隆测试结果',
+      modelTitle: '',
     },
   ] as const
   const activeModelTitle = compareTabs.find((tab) => tab.key === activePanel)?.modelTitle ?? '未生成'
+
+  const scrollToResult = (id: string) => {
+    window.requestAnimationFrame(() => document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
+  }
+
+  const openAsrHistoryResult = (asrSubId?: string) => {
+    if (asrSubId) setSelectedAsrSubId(asrSubId)
+    setActivePanel('clone')
+    scrollToResult('asr-result-detail')
+  }
+
+  const openCloneHistoryResult = (cloneKey: string) => {
+    setSelectedCloneKey(cloneKey)
+    setActivePanel('clone')
+    scrollToResult('clone-result-detail')
+  }
 
   useEffect(() => {
     return () => {
@@ -401,9 +648,8 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
   useEffect(() => {
     if (!runtimeConfig) return
     const timeoutId = window.setTimeout(() => {
-      setAsrModel((current) => (asrOptions.includes(current) ? current : runtimeConfig.defaults.semantic.asrModel || asrOptions[0]))
-      const nextModel = defaultCloneConfig?.backendValue || defaultCloneConfig?.model || ttsOptions[0] || 'tts_models/multilingual/multi-dataset/xtts_v2'
-      const nextModelOption = ttsModelOptions.find((option) => option.value === nextModel) ?? ttsModelOptions[0]
+      const nextModel = defaultCloneConfig?.backendValue || defaultCloneConfig?.model || ttsOptions[0] || ''
+      const nextModelOption = ttsModelOptions.find((option) => option.value === nextModel || option.backendValue === nextModel) ?? ttsModelOptions.find((option) => ttsOptions.includes(option.value)) ?? ttsModelOptions[0]
       const preferredLanguage = defaultCloneConfig?.uiPreferredLanguage || defaultCloneConfig?.language || 'zh-cn'
       const nextModelLanguages = nextModelOption?.languages?.length ? nextModelOption.languages : cloneLanguages
       const nextLanguage = nextModelLanguages.includes(preferredLanguage) ? preferredLanguage : nextModelLanguages[0] || 'en'
@@ -412,7 +658,7 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
         const currentModelOption = ttsModelOptions.find((option) => option.value === current.model)
         const currentLanguages = currentModelOption?.languages?.length ? currentModelOption.languages : cloneLanguages
         const currentLanguageSupported = currentLanguages.includes(current.language ?? '')
-        const model = currentModelOption && currentLanguageSupported ? current.model : nextModel
+        const model = currentModelOption && currentLanguageSupported && ttsOptions.includes(current.model) ? current.model : nextModelOption?.value ?? ttsOptions[0]
         const modelOption = ttsModelOptions.find((option) => option.value === model) ?? nextModelOption
         const modelLanguages = modelOption?.languages?.length ? modelOption.languages : cloneLanguages
         return {
@@ -424,11 +670,25 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
       })
     }, 0)
     return () => window.clearTimeout(timeoutId)
-  }, [asrOptions, cloneLanguages, cloneSpeeds, defaultCloneConfig, runtimeConfig, ttsModelOptions, ttsOptions])
+  }, [cloneLanguages, cloneSpeeds, defaultCloneConfig, runtimeConfig, ttsModelOptions, ttsOptions])
 
-  const submitAsrTest = async () => {
-    if (!asrOptions.includes(asrModel)) {
-      setAsrError('请选择后端支持的 ASR 模型。')
+  const changeAsrLanguage = (language: string) => {
+    setAsrLanguage(language)
+    setAsrModel(preferredAsrModel(asrOptions, language))
+  }
+
+  const changeCloneForm = (nextForm: CloneVoiceRequest) => {
+    if (normalizeEvaluationLanguage(nextForm.language) !== normalizeEvaluationLanguage(cloneForm.language)) {
+      const language = normalizeEvaluationLanguage(nextForm.language)
+      setAsrLanguage(language)
+      setAsrModel(preferredAsrModel(asrOptions, language))
+    }
+    setCloneForm(nextForm)
+  }
+
+  const submitAsrTest = async (modelOverride = effectiveAsrModel) => {
+    if (!asrValues.includes(modelOverride)) {
+      setAsrError('请选择当前可用的 ASR 模型。')
       setAsrModalOpen(true)
       return
     }
@@ -436,14 +696,16 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
       setAsrLoading(true)
       setAsrError(undefined)
       setAsrModalOpen(false)
-      setActivePanel('asr')
-      const response = await runAsrEval(result.taskId, { model: asrModel, referenceText: referenceText || originalText || result.asr.referenceText || result.asr.originalText || undefined })
-      const asr = response.asr ?? (await waitForAsrEvalResult(result.taskId))
+      setActivePanel('clone')
+      const response = await runAsrEval(result.taskId, { model: modelOverride, language: asrLanguage, referenceText: referenceText || originalText || result.asr.referenceText || result.asr.originalText || undefined })
+      if (response.asrSubId) setSelectedAsrSubId(response.asrSubId)
+      await refetchLinkedTaskStatus()
+      const asr = response.asr ?? (await waitForAsrEvalResult(result.taskId, response.asrSubId))
       await refetchLinkedTaskStatus()
       onAsrUpdated(asr)
-      pushToast({ kind: 'success', title: 'ASR 测试完成', description: asr.model ?? asrModel })
+      pushToast({ kind: 'success', title: 'ASR 测试完成', description: asr.model ?? modelOverride })
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'ASR 测试失败，请检查后端服务。'
+      const message = error instanceof Error ? error.message : 'ASR 测试失败，请检查服务状态。'
       setAsrError(message)
       setAsrModalOpen(true)
       pushToast({ kind: 'error', title: 'ASR 测试失败', description: message })
@@ -452,22 +714,32 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
     }
   }
 
-  const waitForAsrEvalResult = async (taskId: string) => {
+  const submitQuickAsrTest = async () => {
+    const model = preferredAsrModel(asrOptions, asrLanguage)
+    if (!model) {
+      setAsrError(`${asrLanguage === 'zh-cn' ? '中文' : '英文'}推荐 ASR 模型当前不可用。`)
+      return
+    }
+    setAsrModel(model)
+    await submitAsrTest(model)
+  }
+
+  const waitForAsrEvalResult = async (taskId: string, asrSubId?: string) => {
     for (let attempt = 0; attempt < 180; attempt += 1) {
       const status = await getTaskStatus(taskId)
-      const asrTask = status.asrTask
+      const asrTask = asrSubId ? status.asrTasks?.find((task) => task.asrSubId === asrSubId) : status.asrTask
       const asrResult = asrTask?.asrResult ?? status.asrResult
       const asrTaskStatus = asrTask?.status ?? (status.stage === 'asr_eval' ? status.status : undefined)
       if (asrResult?.asr) {
         const asrStatus = asrResult.asr.status
         if (asrStatus === 'unavailable' || asrStatus === 'failed' || asrStatus === 'error') {
-          throw new Error(asrResult.asr.error || 'ASR 测试失败，请检查后端模型或依赖。')
+          throw new Error(asrResult.asr.error || 'ASR 测试失败，请检查模型或依赖。')
         }
         return asrResult.asr
       }
       if (asrTaskStatus === 'failed' || asrTaskStatus === 'error') {
         const taskError = asrTask?.error ?? status.error
-        throw new Error(typeof taskError === 'string' ? taskError : asrTask?.message || status.message || 'ASR 测试失败，请检查后端服务。')
+        throw new Error(typeof taskError === 'string' ? taskError : asrTask?.message || status.message || 'ASR 测试失败，请检查服务状态。')
       }
       if (asrTaskStatus === 'completed' || asrTaskStatus === 'success') {
         const latest = await getTaskResult(taskId)
@@ -489,16 +761,20 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
     return objectUrl
   }
 
-  const validateCloneForm = () => {
-    if (!cloneForm.text.trim()) return '请输入用于语音克隆的文本。'
-    if (!ttsOptions.includes(cloneForm.model)) return '请选择后端支持的克隆模型。'
-    if (!cloneLanguages.includes(cloneForm.language ?? '')) return '请选择后端支持的克隆语言。'
-    if (!cloneSpeeds.includes(Number(cloneForm.speed))) return '请选择后端支持的克隆语速。'
+  const validateCloneRequest = (request: CloneVoiceRequest) => {
+    const modelOption = ttsModelOptions.find((option) => option.value === request.model)
+    const modelLanguages = modelOption?.languages?.length ? modelOption.languages : cloneLanguages
+    if (!request.text.trim()) return '请输入用于语音克隆的文本。'
+    if (!ttsOptions.includes(request.model) || !modelOption) return '请选择当前可用的克隆模型。'
+    if (modelOption.promptRequired && request.annotationSource !== 'asr' && !request.speakerPrompt?.trim()) return '该模型需要填写一条人工标注。'
+    if (modelOption.promptRequired && request.annotationSource === 'asr' && (!request.annotationAsrSubId || !request.originalSpeakerPrompt?.trim() || !request.protectedSpeakerPrompt?.trim())) return '请选择一条同时包含原始音频和保护音频转写的 ASR 标注。'
+    if (!modelLanguages.includes(request.language ?? '')) return '请选择当前模型支持的克隆语言。'
+    if (!cloneSpeeds.includes(Number(request.speed))) return '请选择当前支持的克隆语速。'
     return undefined
   }
 
-  const submitCloneTest = async () => {
-    const validationError = validateCloneForm()
+  const submitCloneTest = async (requestOverride = cloneForm) => {
+    const validationError = validateCloneRequest(requestOverride)
     if (validationError) {
       setCloneError(validationError)
       setCloneModalOpen(true)
@@ -511,16 +787,19 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
       setCloneTaskStatus(null)
       setCloneModalOpen(false)
       setActivePanel('clone')
-      const response = await cloneVoice(result.taskId, { ...cloneForm, text: cloneForm.text.trim() })
+      const response = await cloneVoice(result.taskId, { ...requestOverride, text: requestOverride.text.trim() })
+      if (response.cloneSubId) setSelectedCloneKey(`sub:${response.cloneSubId}`)
+      await refetchLinkedTaskStatus()
       const nextResult =
         (response.status === 'completed' || response.status === 'success') && getAudioSource(response.originalCloneAudio) && getAudioSource(response.protectedCloneAudio)
           ? response
-          : await waitForCloneResult(result.taskId)
+          : await waitForCloneResult(result.taskId, response.cloneSubId)
       setCloneResult(nextResult)
+      setSelectedCloneKey(nextResult.cloneSubId ? `sub:${nextResult.cloneSubId}` : `clone:${nextResult.cloneId}`)
       await refetchLinkedTaskStatus()
       pushToast({ kind: 'success', title: '语音克隆测试完成', description: nextResult.message ?? nextResult.cloneId })
     } catch (error) {
-      const message = error instanceof Error ? error.message : '语音克隆测试失败，请检查表单或后端服务。'
+      const message = error instanceof Error ? error.message : '语音克隆测试失败，请检查表单或服务状态。'
       setCloneError(message)
       setCloneModalOpen(true)
       pushToast({ kind: 'error', title: '语音克隆测试失败', description: message })
@@ -529,10 +808,49 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
     }
   }
 
-  const waitForCloneResult = async (taskId: string) => {
+  const submitQuickCloneTest = async () => {
+    const requestedLanguage = normalizeEvaluationLanguage(cloneForm.language)
+    const currentOption = ttsModelOptions.find((option) => option.value === cloneForm.model && isAvailableModel(option) && (option.languages?.includes(requestedLanguage) ?? true))
+    const modelOption = currentOption ?? ttsModelOptions.find((option) => isAvailableModel(option) && (option.languages?.includes(requestedLanguage) ?? true))
+    if (!modelOption) {
+      setCloneError(`当前没有支持${requestedLanguage === 'zh-cn' ? '中文' : '英文'}的一键克隆模型。`)
+      return
+    }
+
+    const latestAnnotation = [...asrHistory].reverse().find((item) => item.asrSubId && item.asr?.originalText?.trim() && item.asr?.protectedText?.trim())
+    const manualPrompt = cloneForm.speakerPrompt?.trim() || referenceText || originalText || result.asr.originalText || ''
+    const quickRequest: CloneVoiceRequest = {
+      ...cloneForm,
+      text: cloneForm.text.trim() || defaultCloneText,
+      model: modelOption.value,
+      language: requestedLanguage,
+      speed: cloneSpeeds.includes(Number(cloneForm.speed)) ? cloneForm.speed : 1,
+    }
+    if (modelOption.promptRequired && latestAnnotation) {
+      quickRequest.annotationSource = 'asr'
+      quickRequest.annotationAsrSubId = latestAnnotation.asrSubId
+      quickRequest.annotationAsrModel = latestAnnotation.asr?.model
+      quickRequest.annotationCreatedAt = latestAnnotation.createdAt ?? undefined
+      quickRequest.speakerPrompt = latestAnnotation.asr?.originalText ?? ''
+      quickRequest.originalSpeakerPrompt = latestAnnotation.asr?.originalText ?? ''
+      quickRequest.protectedSpeakerPrompt = latestAnnotation.asr?.protectedText ?? ''
+    } else if (modelOption.promptRequired) {
+      quickRequest.annotationSource = 'manual'
+      quickRequest.speakerPrompt = manualPrompt
+      quickRequest.originalSpeakerPrompt = undefined
+      quickRequest.protectedSpeakerPrompt = undefined
+      quickRequest.annotationAsrSubId = undefined
+      quickRequest.annotationAsrModel = undefined
+      quickRequest.annotationCreatedAt = undefined
+    }
+    setCloneForm(quickRequest)
+    await submitCloneTest(quickRequest)
+  }
+
+  const waitForCloneResult = async (taskId: string, cloneSubId?: string) => {
     for (let attempt = 0; attempt < 180; attempt += 1) {
       const status = await getTaskStatus(taskId)
-      const cloneTask = status.cloneTask
+      const cloneTask = cloneSubId ? status.cloneTasks?.find((task) => task.cloneSubId === cloneSubId) : status.cloneTask
       const cloneResult = cloneTask?.cloneResult ?? status.cloneResult
       const cloneTaskState = cloneTask?.status ?? (status.stage === 'downstream_tts_eval' ? status.status : undefined)
       if (cloneTask) {
@@ -542,17 +860,17 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
       }
       if (cloneResult) {
         const latest = await getTaskResult(taskId)
-        const latestClone = latest.cloneResults?.at(-1)
+        const latestClone = cloneSubId ? latest.cloneResults?.find((item) => item.cloneSubId === cloneSubId) : latest.cloneResults?.at(-1)
         if (latestClone) return latestClone
         return cloneResult
       }
       if (cloneTaskState === 'failed' || cloneTaskState === 'error') {
         const taskError = cloneTask?.error ?? status.error
-        throw new Error(typeof taskError === 'string' ? taskError : cloneTask?.message || status.message || '语音克隆测试失败，请检查后端服务。')
+        throw new Error(typeof taskError === 'string' ? taskError : cloneTask?.message || status.message || '语音克隆测试失败，请检查服务状态。')
       }
       if (cloneTaskState === 'completed' || cloneTaskState === 'success') {
         const latest = await getTaskResult(taskId)
-        const latestClone = latest.cloneResults?.at(-1)
+        const latestClone = cloneSubId ? latest.cloneResults?.find((item) => item.cloneSubId === cloneSubId) : latest.cloneResults?.at(-1)
         if (latestClone) return latestClone
       }
       await delay(1000)
@@ -562,7 +880,7 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
 
   return (
     <section className="ui-card h-full p-5">
-      <div className="grid grid-cols-[auto_minmax(180px,1fr)_auto] items-center gap-3 max-xl:grid-cols-1 max-xl:items-start">
+      <div className="relative flex min-h-9 items-center">
         <div className="flex flex-wrap items-center gap-3">
           <SectionTitle info>结果对比</SectionTitle>
           <div className="flex items-center gap-2">
@@ -573,19 +891,11 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
             ))}
           </div>
         </div>
-        <p className="min-w-0 truncate text-center text-xs font-black tracking-normal text-cyan-100/85 max-xl:text-left" title={activeModelTitle}>
-          {activeModelTitle}
-        </p>
-        <div className="flex items-center gap-2">
-          <button type="button" onClick={() => setCloneModalOpen(true)} className="inline-flex h-9 items-center gap-2 rounded-[7px] border border-cyan-300/18 bg-cyan-400/10 px-3 text-sm font-black text-cyan-100 hover:bg-cyan-400/16">
-            <TestTube2 className="h-4 w-4" />
-            语音克隆测试
-          </button>
-          <button type="button" onClick={() => setAsrModalOpen(true)} className="inline-flex h-9 items-center gap-2 rounded-[7px] border border-cyan-300/18 bg-cyan-400/10 px-3 text-sm font-black text-cyan-100 hover:bg-cyan-400/16">
-            {asrLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <TestTube2 className="h-4 w-4" />}
-            ASR 测试
-          </button>
-        </div>
+        {activePanel === 'protect' ? (
+          <p className="pointer-events-none absolute left-1/2 max-w-[34%] -translate-x-1/2 truncate text-center text-[14px] font-black tracking-[0.01em] text-cyan-100/90" title={activeModelTitle}>
+            {activeModelTitle}
+          </p>
+        ) : null}
       </div>
       <div className="mt-5">
         {activePanel === 'protect' ? (
@@ -596,14 +906,13 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
             linkedTaskStatus={linkedTaskStatus}
             asrEval={activeAsrEval}
             cloneEval={activeCloneEval}
+            asrHistory={asrHistory}
+            cloneHistory={completedCloneHistory}
             onProtectedPlayRequest={loadProtectedAudio}
           />
         ) : null}
-        {activePanel === 'asr' ? (
-          <AsrTab result={result} asrEval={activeAsrEval} editStats={asrEditStats} />
-        ) : null}
         {activePanel === 'clone' ? (
-          <CloneTab result={result} cloneEval={activeCloneEval} loading={cloneLoading} status={cloneTaskStatus} />
+          <CloneTab result={result} cloneResult={activeCloneResult} cloneEval={activeCloneEval} cloneHistory={cloneHistory} cloneBatches={linkedTaskStatus?.cloneBatches ?? []} selectedCloneKey={selectedCloneKey} onSelectClone={openCloneHistoryResult} onOpenAsr={openAsrHistoryResult} loading={cloneLoading} status={cloneTaskStatus} evaluationModel={evaluationModel} cloneModelOptions={ttsModelOptions} modelTypes={runtimeConfig?.modelTypes} asrEval={activeAsrEval} asrEditStats={asrEditStats} asrHistory={asrHistory} asrBatches={linkedTaskStatus?.asrBatches ?? []} selectedAsrSubId={selectedAsrSubId ?? activeAsrResult?.asrSubId} asrHistoryLimit={oneClickAsrLimit} cloneHistoryLimit={oneClickCloneLimit} />
         ) : null}
       </div>
       {cloneModalOpen ? (
@@ -612,22 +921,34 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
           error={cloneError}
           loading={cloneLoading}
           modelOptions={ttsModelOptions}
+          modelTypes={runtimeConfig?.modelTypes}
           languageOptions={cloneLanguages}
           speedOptions={cloneSpeeds}
-          onChange={setCloneForm}
+          asrAnnotations={asrHistory}
+          onChange={changeCloneForm}
           onClose={() => setCloneModalOpen(false)}
           onSubmit={() => void submitCloneTest()}
+          onQuickSubmit={() => void submitQuickCloneTest()}
+          onOpenAsr={() => {
+            setCloneModalOpen(false)
+            setActivePanel('clone')
+            setAsrModalOpen(true)
+          }}
         />
       ) : null}
       {asrModalOpen ? (
         <AsrEvalModal
-          model={asrModel}
+          model={effectiveAsrModel}
           error={asrError}
           loading={asrLoading}
           modelOptions={asrOptions}
+          modelTypes={runtimeConfig?.modelTypes}
+          language={asrLanguage}
+          onLanguageChange={changeAsrLanguage}
           onChange={setAsrModel}
           onClose={() => setAsrModalOpen(false)}
           onSubmit={() => void submitAsrTest()}
+          onQuickSubmit={() => void submitQuickAsrTest()}
         />
       ) : null}
     </section>
@@ -641,6 +962,8 @@ function ProtectTab({
   linkedTaskStatus,
   asrEval,
   cloneEval,
+  asrHistory,
+  cloneHistory,
   onProtectedPlayRequest,
 }: {
   result: TaskResult
@@ -649,6 +972,8 @@ function ProtectTab({
   linkedTaskStatus?: TaskStatusResponse
   asrEval?: AsrEval | null
   cloneEval?: CloneEval | null
+  asrHistory?: AsrEvalResponse[]
+  cloneHistory?: CloneVoiceResult[]
   onProtectedPlayRequest: () => Promise<string | undefined>
 }) {
   const perturbation = result.perturbation
@@ -664,19 +989,22 @@ function ProtectTab({
         <AudioCard title="保护音频（已防护）" audio={protectedAudio} color="#22c55e" green onPlayRequest={onProtectedPlayRequest} />
       </div>
       <div className="grid grid-cols-[minmax(360px,0.86fr)_minmax(520px,1.14fr)] items-stretch gap-5 max-xl:grid-cols-1">
-        <div className="relative min-h-0 max-xl:static">
-          <section className="absolute inset-0 flex min-h-0 flex-col overflow-hidden rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4 max-xl:static max-xl:h-auto">
+        <div className="min-h-0">
+          <section className="flex min-h-0 flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
             <SectionTitle>扰动与可听性分析</SectionTitle>
             <div className="mt-5 grid grid-cols-[repeat(auto-fit,minmax(170px,1fr))] gap-3">
-              <ScoreBox label={<span className="inline-flex items-center justify-center gap-0.5">扰动强度（<MathText formula="L_2" /> 范数）</span>} value={formatMetricValue(perturbation?.l2Norm ?? result.quality.l2Norm, 'loss')} />
-              <ScoreBox label="扰动上限利用率" value={formatMetricValue(epsilonUsageRate, 'percent')} />
-              <ScoreBox label="信噪比（SNR）" value={formatMetricValue(snr, 'db')} />
+              <ScoreBox label={<span className="inline-flex items-center justify-center gap-0.5">扰动强度</span>} value={formatMetricValue(perturbation?.l2Norm ?? result.quality.l2Norm, 'loss')} foot="整段音频的总体改动量，数值越小表示越接近原始音频。" />
+              <ScoreBox label="扰动上限利用率" value={formatMetricValue(epsilonUsageRate, 'percent')} foot="已使用的扰动预算比例，越接近 100% 表示越接近设定上限。" />
+              <ScoreBox label="信噪比（SNR）" value={formatMetricValue(snr, 'db')} foot="原始语音与扰动噪声的强弱比；数值越高，音频越接近原音。" />
             </div>
             <QualityPanel result={result} embedded />
-            <MetricGuide />
           </section>
         </div>
-        <PsychoacousticPanel result={result} />
+        <div className="relative min-h-0 max-xl:min-h-[296px]">
+          <div className="absolute inset-0 max-xl:static max-xl:h-[296px]">
+            <PsychoacousticPanel key={result.taskId} result={result} />
+          </div>
+        </div>
       </div>
       <div className="grid grid-cols-[minmax(0,1fr)_minmax(360px,0.72fr)] items-stretch gap-5 max-xl:grid-cols-1">
         <TrendPanel result={result} embedded />
@@ -684,7 +1012,7 @@ function ProtectTab({
           <div className="absolute inset-0 min-h-0 max-xl:static">
             <InsightPanel
               title="保护结果解读"
-              items={generateProtectionInsights(result, { linkedTaskStatus, asrEval, cloneEval })}
+              items={generateProtectionInsights(result, { linkedTaskStatus, asrEval, cloneEval, asrHistory, cloneHistory })}
               fillHeight
             />
           </div>
@@ -694,13 +1022,90 @@ function ProtectTab({
   )
 }
 
-function AsrTab({ result, asrEval, editStats }: { result: TaskResult; asrEval?: AsrEval | null; editStats: EditMetrics | null }) {
+function asrHistoryLifecycleStatus(item?: AsrHistoryEntry) {
+  return String(item?.taskStatus?.status ?? item?.status ?? item?.asr?.status ?? '').toLowerCase()
+}
+
+function asrHistoryFailureReason(item: AsrHistoryEntry) {
+  const snapshotError = item.taskStatus?.error
+  const snapshotMessage = typeof snapshotError === 'string' ? snapshotError : snapshotError?.message
+  return friendlyAsrFailure(item.asr?.error || item.asr?.reason || snapshotMessage || item.taskStatus?.message)
+}
+
+function asrHistoryProgress(item: AsrHistoryEntry) {
+  const status = asrHistoryLifecycleStatus(item)
+  const stored = optionalNumber(item.taskStatus?.progress)
+  const terminal = ['completed', 'success', 'failed', 'error', 'cancelled', 'available', 'computed', 'partial', 'unavailable'].includes(status)
+  return clamp(stored ?? (terminal || item.asr ? 1 : 0), 0, 1)
+}
+
+function asrHistoryStatusLabel(item: AsrHistoryEntry) {
+  const status = asrHistoryLifecycleStatus(item)
+  if (status === 'queued') return '等待中'
+  if (status === 'running') return '进行中'
+  if (status === 'failed' || status === 'error' || status === 'unavailable') return '失败'
+  if (status === 'cancelled') return '已取消'
+  return '已完成'
+}
+
+function cloneHistoryLifecycleStatus(item?: CloneHistoryEntry) {
+  return String(item?.taskStatus?.status ?? item?.status ?? item?.result?.status ?? '').toLowerCase()
+}
+
+function cloneHistoryFailureReason(item: CloneHistoryEntry) {
+  const snapshotError = item.taskStatus?.error
+  const snapshotMessage = typeof snapshotError === 'string' ? snapshotError : snapshotError?.message
+  return shortMetricReason(snapshotMessage || item.taskStatus?.message || item.result?.message || '克隆任务未生成可用结果。')
+}
+
+function cloneHistoryProgress(item: CloneHistoryEntry) {
+  const status = cloneHistoryLifecycleStatus(item)
+  const stored = optionalNumber(item.taskStatus?.progress)
+  const terminal = ['completed', 'success', 'failed', 'error', 'cancelled', 'available', 'computed', 'partial', 'unavailable'].includes(status)
+  return clamp(stored ?? (terminal || item.result ? 1 : 0), 0, 1)
+}
+
+function lifecycleStatusLabel(statusValue?: string) {
+  const status = String(statusValue ?? '').toLowerCase()
+  if (status === 'queued') return '等待中'
+  if (status === 'running') return '进行中'
+  if (status === 'partial_failed') return '部分失败'
+  if (status === 'failed' || status === 'error' || status === 'unavailable') return '失败'
+  if (status === 'cancelled') return '已取消'
+  return '已完成'
+}
+
+function progressTone(statusValue?: string) {
+  const status = String(statusValue ?? '').toLowerCase()
+  if (status === 'failed' || status === 'error' || status === 'unavailable' || status === 'partial_failed' || status === 'cancelled') {
+    return { fill: 'bg-rose-400', text: 'text-rose-300' }
+  }
+  if (status === 'running') return { fill: 'bg-amber-400', text: 'text-amber-300' }
+  if (status === 'queued') return { fill: 'bg-cyan-400', text: 'text-cyan-300' }
+  return { fill: 'bg-emerald-400', text: 'text-emerald-300' }
+}
+
+function batchElapsed(batch: EvaluationBatch) {
+  const stored = optionalNumber(batch.elapsedSec)
+  if (stored !== null) return stored
+  const childElapsed = batch.items.map((item) => optionalNumber(item.elapsedSec)).filter((value): value is number => value !== null)
+  return childElapsed.length ? Math.max(...childElapsed) : null
+}
+
+function AsrTab({ result, asrEval, editStats, history, batches = [], selectedAsrSubId, onSelect, onOpenBatch, historyLimit = 5 }: { result: TaskResult; asrEval?: AsrEval | null; editStats: EditMetrics | null; history: AsrHistoryEntry[]; batches?: EvaluationBatch[]; selectedAsrSubId?: string; onSelect: (asrSubId?: string) => void; onOpenBatch: (batch: EvaluationBatch) => void; historyLimit?: number }) {
+  const selectedHistory = selectedAsrSubId ? history.find((item) => item.asrSubId === selectedAsrSubId) : history.at(-1)
   if (!asrEval) {
+    const lifecycleStatus = asrHistoryLifecycleStatus(selectedHistory) || (selectedAsrSubId ? 'queued' : '')
+    const failed = lifecycleStatus === 'failed' || lifecycleStatus === 'error' || lifecycleStatus === 'unavailable'
+    const pending = lifecycleStatus === 'queued' || lifecycleStatus === 'running'
     return (
-      <EmptyState
-        title="未执行 ASR 测试"
-        text="ASR 评估属于可选下游测试，点击右上角“ASR 测试”后显示转写差异与语义链路指标。"
-      />
+      <div className="space-y-5">
+        <AsrHistoryPanel history={history} batches={batches} selectedAsrSubId={selectedAsrSubId} onSelect={onSelect} onOpenBatch={onOpenBatch} maxVisible={historyLimit} />
+        <EmptyState
+          title={failed ? 'ASR 测试失败' : pending ? lifecycleStatus === 'queued' ? 'ASR 测试等待中' : 'ASR 测试进行中' : '未执行 ASR 测试'}
+          text={failed && selectedHistory ? asrHistoryFailureReason(selectedHistory) : selectedHistory?.taskStatus?.message || (pending ? '任务状态会自动刷新，完成后显示完整转写与指标。' : 'ASR 评估属于可选下游测试，开始测试后显示转写差异与语义链路指标。')}
+        />
+      </div>
     )
   }
 
@@ -712,83 +1117,161 @@ function AsrTab({ result, asrEval, editStats }: { result: TaskResult; asrEval?: 
   const insertRate = asrEval.insertRate ?? editStats?.insertRate
   const wer = asrEval.wer ?? (editStats?.level === 'word' ? editStats.werOrCer : undefined)
   const cer = asrEval.cer ?? (editStats?.level === 'char' ? editStats.werOrCer : undefined)
-  const tokenDiff = asrEval.tokenChangeRate ?? asrEval.tokenErrorRate
-  const tokenUsesEditDistance = asrEval.tokenChangeRate == null && asrEval.tokenErrorRate != null
-  const tokenReason = tokenUsesEditDistance ? '使用 token edit distance；可能受 token 序列长度差异影响。' : metricReason(result, ['asrEval.tokenChangeRate', 'asrEval.tokenErrorRate'])
-  const semanticSourceInfo = metricSource(result, ['asrEval.semanticDrift'])
+  const sharedSemantic = result.semanticEval
+  const tokenDiff = sharedSemantic?.tokenChangeRate ?? sharedSemantic?.tokenErrorRate
+  const tokenUsesEditDistance = sharedSemantic?.tokenChangeRate == null && sharedSemantic?.tokenErrorRate != null
+  const textMetricLevel = asrEval.metricLevel ?? editStats?.level ?? 'word'
+  const tokenUnavailableReason = tokenDiff == null
+    ? sharedSemantic?.error || sharedSemantic?.reason || metricReason(result, ['semanticEval.tokenChangeRate', 'semanticEval.tokenErrorRate', 'asrEval.tokenChangeRate', 'asrEval.tokenErrorRate'])
+    : ''
+  const tokenFormulaText = tokenUsesEditDistance
+    ? '当前回退值为保护前后离散语音 Token 序列的编辑距离除以原始序列长度。'
+    : '后端使用语义 tokenizer 编码保护前后音频，在两侧较短序列长度内统计同位置离散语音 Token 不同的比例。'
+  const tokenFoot = `${tokenUnavailableReason ? `${tokenUnavailableReason}。` : ''}${tokenFormulaText}该指标不按 ASR 文本的字符或单词切分。`
+  const metricLevelFoot = textMetricLevel === 'char'
+    ? '中文按字/字符（char）作为 CER 与文本编辑操作的统计单位。'
+    : '英文按词（word）作为 WER 与文本编辑操作的统计单位。'
+  const semanticSourceInfo = metricSource(result, ['semanticEval.semanticDrift', 'asrEval.semanticDrift'])
   const semanticIsMfccProxy = String(semanticSourceInfo?.source ?? '').toLowerCase() === 'mfcc_proxy'
-  const semanticFoot = semanticIsMfccProxy ? 'MFCC proxy，仅代表声学特征漂移，不等同于 S3/HuBERT/Whisper 语义 encoder 漂移。' : undefined
-  const semanticCardLabel = semanticIsMfccProxy ? 'SD（MFCC 代理）' : 'SD（语义漂移）'
+  const semanticFoot = sharedSemantic?.semanticDrift == null
+    ? sharedSemantic?.error || sharedSemantic?.reason || metricReason(result, ['semanticEval.semanticDrift', 'asrEval.semanticDrift'])
+    : semanticIsMfccProxy
+      ? '1 − 平均余弦值；当前为 MFCC 声学特征代理，不等同于深度语义表示。'
+      : '1 − 多个语义编码器的平均加权余弦值，越高表示语义表示变化越大。'
   const semanticDetailLabel = semanticIsMfccProxy ? 'MFCC 代理漂移' : '语义表示漂移'
   const errorShares = asrErrorShares(asrEval, editStats)
+  const asrFailureReason = ['unavailable', 'failed', 'error'].includes(String(asrEval.status ?? '').toLowerCase())
+    ? friendlyAsrFailure(asrEval.error || asrEval.reason)
+    : null
 
   return (
     <div className="space-y-5">
+      <p className="text-center text-sm font-black text-cyan-100">ASR 标注 · {shortAsrModelName(asrEval.model)}</p>
+      <AsrHistoryPanel history={history} batches={batches} selectedAsrSubId={selectedAsrSubId} onSelect={onSelect} onOpenBatch={onOpenBatch} maxVisible={historyLimit} />
+      {asrFailureReason ? <MetricNotice text={`该次 ASR 转写失败：${asrFailureReason}`} /> : null}
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_288px_minmax(0,1fr)]">
         <TextBox title="参考文本 / 原始转写（ASR）" text={referenceText || '未生成'} foot="用于 WER/CER 与 diff 的参考文本" />
         <div className="grid grid-cols-2 content-center gap-3">
           <ScoreBox label="WER（词错率）" value={formatMetricValue(wer, 'percent')} red compact />
           <ScoreBox label="CER（字错率）" value={formatMetricValue(cer, 'percent')} red compact />
-          <ScoreBox label="Token 变化率" value={formatMetricValue(tokenDiff, 'percent')} foot={tokenDiff == null || tokenUsesEditDistance ? tokenReason : undefined} red compact />
-          <ScoreBox label={semanticCardLabel} value={formatMetricValue(asrEval.semanticDrift, 'number')} foot={semanticFoot} red compact />
           <ScoreBox label="IR（插入率）" value={formatMetricValue(insertRate, 'percent')} red compact />
           <ScoreBox label="SR（替换率）" value={formatMetricValue(substituteRate, 'percent')} red compact />
         </div>
         <TextBox title="保护音频转写（ASR）" text={protectedText || '未生成'} foot="红色为新增内容，绿色删除线为原文缺失内容" content={diffOps.length ? renderDiffOps(diffOps) : undefined} />
       </div>
       <div className="grid grid-cols-[1.05fr_0.95fr] gap-5 max-lg:grid-cols-1">
-        <MetricPanel title="语义链路分析">
-          <ScoreBox label={semanticDetailLabel} value={formatMetricValue(asrEval.semanticDrift, 'number')} foot={semanticFoot} />
-          <ScoreBox label="Token 变化率" value={formatMetricValue(tokenDiff, 'percent')} foot={tokenDiff == null || tokenUsesEditDistance ? tokenReason : undefined} />
-          <ScoreBox label="指标层级" value={asrEval.metricLevel ?? editStats?.level ?? '未生成'} />
+        <MetricPanel title="保护任务共享语义指标">
+          <ScoreBox label={semanticDetailLabel} value={formatMetricValue(sharedSemantic?.semanticDrift, 'number')} foot={semanticFoot} />
+          <ScoreBox label="Token 变化率" value={formatMetricValue(tokenDiff, 'percent')} foot={tokenFoot} />
+          <ScoreBox label="指标层级" value={textMetricLevel} foot={metricLevelFoot} />
         </MetricPanel>
         <RateBreakdown substituteShare={errorShares?.substituteShare} insertShare={errorShares?.insertShare} />
       </div>
-      <InsightPanel title="ASR 结果解读" items={generateAsrInsights(asrEval, editStats, result)} naturalHeight />
+      <InsightPanel title="ASR 结果解读" items={generateAsrInsights(asrEval, editStats)} naturalHeight />
     </div>
   )
 }
 
-function CloneTab({ result, cloneEval, loading, status }: { result: TaskResult; cloneEval?: CloneEval | null; loading: boolean; status: TaskStatusResponse | null }) {
-  if (loading) {
-    return (
+function CloneTab({ result, cloneResult, cloneEval, cloneHistory, cloneBatches, selectedCloneKey, onSelectClone, onOpenAsr, loading, status, evaluationModel, cloneModelOptions, modelTypes, asrEval, asrEditStats, asrHistory, asrBatches, selectedAsrSubId, asrHistoryLimit, cloneHistoryLimit }: { result: TaskResult; cloneResult?: CloneVoiceResult; cloneEval?: CloneEval | null; cloneHistory: CloneHistoryEntry[]; cloneBatches: EvaluationBatch[]; selectedCloneKey?: string; onSelectClone: (cloneKey: string) => void; onOpenAsr: (asrSubId?: string) => void; loading: boolean; status: TaskStatusResponse | null; evaluationModel: BackendSelectOption | null; cloneModelOptions: BackendSelectOption[]; modelTypes?: CapabilitiesResponse['modelTypes']; asrEval?: AsrEval | null; asrEditStats: EditMetrics | null; asrHistory: AsrHistoryEntry[]; asrBatches: EvaluationBatch[]; selectedAsrSubId?: string; asrHistoryLimit: number; cloneHistoryLimit: number }) {
+  const [manualAnnotation, setManualAnnotation] = useState<CloneHistoryEntry | null>(null)
+  const [fineTuneReport, setFineTuneReport] = useState<CloneHistoryEntry | null>(null)
+  const [informationModel, setInformationModel] = useState<BackendSelectOption | null>(null)
+  const [batchDetail, setBatchDetail] = useState<EvaluationBatch | null>(null)
+  const openBatch = (batch: EvaluationBatch) => {
+    setManualAnnotation(null)
+    setFineTuneReport(null)
+    setBatchDetail(batch)
+  }
+  const liveBatchDetail = batchDetail
+    ? (batchDetail.type === 'asr' ? asrBatches : cloneBatches).find((item) => item.batchId === batchDetail.batchId) ?? batchDetail
+    : null
+  const selectedCloneEntry = selectedCloneKey ? cloneHistory.find((item) => item.key === selectedCloneKey) : undefined
+  const selectedCloneStatus = String(selectedCloneEntry?.taskStatus?.status ?? selectedCloneEntry?.status ?? '').toLowerCase()
+  const selectedClonePending = selectedCloneStatus === 'queued' || selectedCloneStatus === 'running'
+  const selectedCloneFailed = ['failed', 'error', 'cancelled', 'unavailable'].includes(selectedCloneStatus)
+  const selectedCloneError = selectedCloneEntry ? cloneHistoryFailureReason(selectedCloneEntry) : null
+  const asrSection = asrEval || asrHistory.length || asrBatches.length || selectedAsrSubId ? (
+    <div id="asr-result-detail" className="scroll-mt-24">
+      <AsrTab result={result} asrEval={asrEval} editStats={asrEditStats} history={asrHistory} batches={asrBatches} selectedAsrSubId={selectedAsrSubId} onSelect={onOpenAsr} onOpenBatch={openBatch} historyLimit={asrHistoryLimit} />
+    </div>
+  ) : null
+  const cloneHistorySection = cloneHistory.length || cloneBatches.length ? (
+    <CloneHistoryPanel
+      history={cloneHistory}
+      batches={cloneBatches}
+      selectedCloneKey={selectedCloneKey}
+      onSelect={onSelectClone}
+      onOpenBatch={openBatch}
+      onOpenAsr={onOpenAsr}
+      onOpenManual={(item) => { setBatchDetail(null); setFineTuneReport(null); setManualAnnotation(item) }}
+      onOpenFineTune={(item) => { setBatchDetail(null); setManualAnnotation(null); setFineTuneReport(item) }}
+      maxVisible={cloneHistoryLimit}
+    />
+  ) : null
+  const showLoading = loading || selectedClonePending
+
+  let cloneDetail: ReactNode
+  if (showLoading) {
+    const liveStatus = selectedCloneEntry?.taskStatus ?? status
+    cloneDetail = (
       <div className="grid items-center gap-6 pl-1 lg:grid-cols-[minmax(0,1fr)_58px_minmax(0,1fr)]">
-        <LoadingCard title="克隆原语音" progress={status?.stage === 'downstream_tts_eval' ? status.progress : undefined} message={status?.stage === 'downstream_tts_eval' ? status.message : undefined} />
+        <LoadingCard title="克隆原语音" progress={optionalNumber(liveStatus?.progress) ?? undefined} message={liveStatus?.message ?? undefined} />
         <div className="compare-badge mx-auto grid h-12 w-12 place-items-center rounded-full border border-violet-300/28 bg-slate-950/70 text-[18px] font-black text-white">VS</div>
-        <LoadingCard title="克隆保护语音" progress={status?.stage === 'downstream_tts_eval' ? status.progress : undefined} message={status?.stage === 'downstream_tts_eval' ? status.message : undefined} />
+        <LoadingCard title="克隆保护语音" progress={optionalNumber(liveStatus?.progress) ?? undefined} message={liveStatus?.message ?? undefined} />
       </div>
     )
-  }
-
-  if (!cloneEval) {
-    return (
-      <EmptyState
-        title="未执行语音克隆测试"
-        text="语音克隆评估属于可选下游测试，可能耗时较长。点击右上角“语音克隆测试”后显示克隆音频与声纹相似度结果。"
-      />
+  } else if (selectedCloneFailed) {
+    cloneDetail = <EmptyState title={selectedCloneStatus === 'cancelled' ? '语音克隆测试已取消' : '语音克隆测试失败'} text={selectedCloneError || '该次克隆任务未生成可用结果。'} />
+  } else if (!cloneEval) {
+    cloneDetail = <EmptyState title="未执行语音克隆测试" text="请在防护工作台选择已完成的保护任务并开始语音克隆测试。" />
+  } else {
+    const cloneReason = cloneEval.reason ? shortMetricReason(cloneEval.reason) : metricReason(result, ['cloneEval.*'])
+    const cloneModelLabel = shortCloneModelName(cloneEval.cloneModel ?? cloneResult?.request.model)
+    const speakerModelLabel = evaluationModel?.label ?? shortCloneModelName(cloneEval.speakerEvalModel ?? cloneEval.speakerModel ?? undefined)
+    const cloneModelValue = cloneEval.cloneModel ?? cloneResult?.request.model
+    const cloneModelOption = cloneModelOptions.find((item) => item.value === cloneModelValue || item.backendValue === cloneModelValue) ?? null
+    const activeFineTuneEntry = selectedCloneEntry?.result?.fineTune ? selectedCloneEntry : cloneHistory.find((item) => item.result === cloneResult && item.result?.fineTune)
+    cloneDetail = (
+      <>
+        <div className="flex flex-wrap items-center justify-center gap-2 text-center text-sm font-black text-violet-100">
+          <span>TTS 克隆 · {cloneModelLabel}</span>
+          {cloneModelOption ? <ModelInfoButton model={cloneModelOption} onOpen={setInformationModel} /> : null}
+          <span>· 评估 {speakerModelLabel}</span>
+          {evaluationModel ? <ModelInfoButton model={evaluationModel} onOpen={setInformationModel} /> : null}
+          {activeFineTuneEntry ? <button type="button" onClick={() => setFineTuneReport(activeFineTuneEntry)} className="inline-flex h-7 items-center gap-1 rounded-[6px] border border-amber-300/18 px-2 text-[11px] font-black text-amber-200 hover:bg-amber-300/10"><Search className="h-3.5 w-3.5" />微调报告</button> : null}
+        </div>
+        <div id="clone-result-detail" className="scroll-mt-24 space-y-5">
+          {cloneReason ? <MetricNotice text={`克隆指标未生成原因：${cloneReason}`} /> : null}
+        <div className="grid items-center gap-6 pl-1 lg:grid-cols-[minmax(0,1fr)_58px_minmax(0,1fr)]">
+          {cloneEval.originalCloneAudio ? <AudioCard title="克隆原语音" audio={cloneEval.originalCloneAudio} color="#a78bfa" /> : <EmptyMetricCard title="克隆原语音" text="暂未生成克隆原语音" />}
+          <div className="compare-badge mx-auto grid h-12 w-12 place-items-center rounded-full border border-violet-300/28 bg-slate-950/70 text-[18px] font-black text-white">VS</div>
+          {cloneEval.protectedCloneAudio ? <AudioCard title="克隆保护语音" audio={cloneEval.protectedCloneAudio} color="#f59e0b" /> : <EmptyMetricCard title="克隆保护语音" text="暂未生成克隆保护语音" />}
+        </div>
+        <div className="grid items-stretch grid-cols-[minmax(420px,0.96fr)_minmax(520px,1.04fr)] gap-5 max-xl:grid-cols-1">
+          <CloneIdentityPanel cloneEval={cloneEval} evaluationModel={evaluationModel} />
+          <div className="relative min-h-0 max-xl:min-h-[330px]">
+            <div className="absolute inset-0 max-xl:static max-xl:h-[330px]">
+              <CloneVisualizationPanel result={result} cloneEval={cloneEval} />
+            </div>
+          </div>
+        </div>
+        <div className="grid grid-cols-1 gap-5">
+          <InsightPanel title="克隆结果解读" items={generateCloneInsights(cloneEval)} />
+        </div>
+        </div>
+      </>
     )
   }
-
-  const cloneReason = cloneEval.reason ? shortMetricReason(cloneEval.reason) : metricReason(result, ['cloneEval.*'])
 
   return (
     <div className="space-y-5">
-      {cloneReason ? <MetricNotice text={`克隆指标未生成原因：${cloneReason}`} /> : null}
-      <div className="grid items-center gap-6 pl-1 lg:grid-cols-[minmax(0,1fr)_58px_minmax(0,1fr)]">
-        {cloneEval.originalCloneAudio ? <AudioCard title="克隆原语音" audio={cloneEval.originalCloneAudio} color="#a78bfa" /> : <EmptyMetricCard title="克隆原语音" text="后端未返回克隆原语音" />}
-        <div className="compare-badge mx-auto grid h-12 w-12 place-items-center rounded-full border border-violet-300/28 bg-slate-950/70 text-[18px] font-black text-white">VS</div>
-        {cloneEval.protectedCloneAudio ? <AudioCard title="克隆保护语音" audio={cloneEval.protectedCloneAudio} color="#f59e0b" /> : <EmptyMetricCard title="克隆保护语音" text="后端未返回克隆保护语音" />}
-      </div>
-      <div className="grid items-stretch grid-cols-[minmax(420px,0.95fr)_minmax(520px,1.05fr)] gap-5 max-xl:grid-cols-1">
-        <div className="flex h-full flex-col gap-5">
-          <CloneIdentityPanel cloneEval={cloneEval} />
-          <CloneResultPanel cloneEval={cloneEval} />
-        </div>
-        <CloneVisualizationPanel result={result} cloneEval={cloneEval} />
-      </div>
-      <div className="grid grid-cols-1 gap-5">
-        <InsightPanel title="克隆结果解读" items={generateCloneInsights(cloneEval)} />
-      </div>
+      {asrSection}
+      {cloneHistorySection}
+      {cloneDetail}
+      <ManualAnnotationModal item={manualAnnotation} onClose={() => setManualAnnotation(null)} />
+      <FineTuneReportModal item={fineTuneReport} onClose={() => setFineTuneReport(null)} />
+      <BatchProgressModal batch={liveBatchDetail} onClose={() => setBatchDetail(null)} />
+      <ModelInformationModal model={informationModel} modelTypes={modelTypes} onClose={() => setInformationModel(null)} />
     </div>
   )
 }
@@ -807,7 +1290,7 @@ function LoadingCard({ title, progress, message }: { title: string; progress?: n
             <p className="mt-1 font-mono text-[10px] text-slate-400">{Math.round(progress * 100)}%</p>
           </div>
         ) : null}
-        {message ? <p className="mt-2 text-xs text-slate-400">{message}</p> : <p className="mt-2 text-xs text-slate-400">正在等待后端返回克隆音频...</p>}
+        {message ? <p className="mt-2 text-xs text-slate-400">{message}</p> : <p className="mt-2 text-xs text-slate-400">正在等待克隆音频...</p>}
       </div>
     </div>
   )
@@ -859,7 +1342,10 @@ function RateBreakdown({ substituteShare, insertShare }: { substituteShare?: num
   ] as const
   return (
     <section className="rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
-      <SectionTitle>错误类型占比</SectionTitle>
+      <div className="flex items-start justify-between gap-3">
+        <SectionTitle>错误类型占比</SectionTitle>
+        <MetricInfoButton title="错误类型占比">分别统计替换与插入在全部编辑错误中的占比，用于判断保护音频主要通过哪类文本变化干扰识别。</MetricInfoButton>
+      </div>
       <div className="mt-5 space-y-4">
         {rows.map(([label, value, color]) => {
           const numberValue = optionalNumber(value)
@@ -884,60 +1370,90 @@ function RateBreakdown({ substituteShare, insertShare }: { substituteShare?: num
   )
 }
 
-function CloneIdentityPanel({ cloneEval }: { cloneEval: CloneEval }) {
-  const cloneMetrics = cloneMetricDisplay(cloneEval)
-  const confidenceBefore = optionalNumber(cloneEval.cloneConfidenceBefore)
-  const confidenceAfter = optionalNumber(cloneEval.cloneConfidenceAfter)
-  const confidenceDropRate = optionalNumber(cloneEval.cloneConfidenceDropRate)
-  const hasCloneConfidence = confidenceBefore !== null || confidenceAfter !== null || confidenceDropRate !== null
+function CloneIdentityPanel({ cloneEval, evaluationModel }: { cloneEval: CloneEval; evaluationModel: BackendSelectOption | null }) {
+  const originalSimilarity = optionalNumber(cloneEval.originalSimilarity)
+  const protectedSimilarity = optionalNumber(cloneEval.protectedSimilarity)
+  const embeddingDistanceBefore = optionalNumber(cloneEval.embeddingDistanceBefore)
+  const embeddingDistance = optionalNumber(cloneEval.embeddingDistanceAfter)
+  const similarityDrop = computeAbsoluteDrop(cloneEval.originalSimilarity, cloneEval.protectedSimilarity)
+  const similarityDelta = similarityDrop === null ? null : Math.abs(similarityDrop)
+  const similarityDecreased = originalSimilarity !== null && protectedSimilarity !== null ? protectedSimilarity <= originalSimilarity : true
+  const embeddingDelta = embeddingDistanceBefore === null || embeddingDistance === null ? null : Math.abs(embeddingDistance - embeddingDistanceBefore)
+  const embeddingIncreased = embeddingDistanceBefore !== null && embeddingDistance !== null ? embeddingDistance >= embeddingDistanceBefore : true
+  const directSimilarity = optionalNumber(cloneEval.directSimilarity)
+  const directShift = directSimilarity === null ? null : 1 - directSimilarity
+  const defenseScore = computeCloneDefenseScore(cloneEval)
 
   return (
-    <section className="rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
-      <SectionTitle>声音身份特征链路分析</SectionTitle>
-      <div className="mt-5 grid grid-cols-[repeat(auto-fit,minmax(210px,1fr))] gap-3">
-        <DeltaStatCard
-          title="Speaker Similarity（范围 [-1, 1]，越低越好）"
-          before={cloneMetrics.similarityBefore}
-          after={cloneMetrics.similarityAfter}
-          delta={cloneMetrics.similarityDeltaText}
-          foot="ECAPA 余弦相似度，范围 [-1, 1]；保护后越低表示越不像原说话人"
+    <section className="flex flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
+      <div className="flex items-center justify-between gap-3">
+        <SectionTitle>声音身份特征链路分析</SectionTitle>
+        {evaluationModel ? <span className="text-xs font-bold text-cyan-200">{evaluationModel.label}</span> : null}
+      </div>
+      <div className="mt-4 grid min-h-0 grid-cols-2 gap-3 max-sm:grid-cols-1">
+        <IdentityTransformCard
+          title="说话人相似度"
+          before={formatCloneMetricNumber(originalSimilarity)}
+          after={formatCloneMetricNumber(protectedSimilarity)}
+          delta={similarityDelta}
+          changeLabel={similarityDecreased ? '下降' : '上升'}
+          foot={<div className="space-y-1"><p>比较原语音与保护前后两种克隆语音的声纹相似程度。</p><p>范围为 [-1, 1]，保护后越低越好。</p></div>}
+          tone={similarityDecreased ? 'green' : 'red'}
+        />
+        <IdentityTransformCard
+          title="声纹嵌入距离"
+          before={formatCloneMetricNumber(embeddingDistanceBefore)}
+          after={formatCloneMetricNumber(embeddingDistance)}
+          delta={embeddingDelta}
+          changeLabel={embeddingIncreased ? '增加' : '减少'}
+          foot={<div className="space-y-1"><p>用 1 减去克隆语音与原语音的声纹相似度。</p><p>范围为 [0, 2]，距离越大表示保护效果越好。</p></div>}
+          tone={embeddingIncreased ? 'red' : 'green'}
+        />
+        <IdentityValueCard
+          title="直接声纹偏移"
+          value={formatCloneMetricNumber(directShift)}
+          foot={<div className="space-y-1"><p>用 1 减去原语音与保护语音的声纹相似度。</p><p>范围为 [0, 2]，越大越好；它不直接比较克隆结果，因此只作为低权重参考。</p></div>}
           tone="green"
         />
-        <DeltaStatCard
-          title="Embedding 距离（范围 [0, 2]，越大越好）"
-          before={cloneMetrics.embeddingDistanceBefore}
-          after={cloneMetrics.embeddingDistanceAfter}
-          delta={cloneMetrics.embeddingDistanceDeltaText}
-          foot="cosine distance = 1 - similarity，范围 [0, 2]；大于 1 表示相似度已低于 0"
-          tone="red"
+        <IdentityValueCard
+          title="保护效果评估"
+          value={defenseScore === null ? '不可用' : `${defenseScore.toFixed(2)} 分`}
+          foot={<div className="space-y-1"><p>以保护后克隆语音的声纹距离为主要依据，并参考少量直接声纹偏移。两项经过归一化和软映射后得到 0–100 分，分数越高表示保护效果越好。</p></div>}
+          tone="green"
         />
-        {hasCloneConfidence ? (
-          <DeltaStatCard
-            title="克隆可置信度"
-            before={formatRatioPercent(confidenceBefore, { clampToUnit: true })}
-            after={formatRatioPercent(confidenceAfter, { clampToUnit: true })}
-            delta={`↓ ${formatRatioPercent(confidenceDropRate, { clampToUnit: true })}`}
-            foot="来源：校准后的 speaker verification probability model"
-            tone="green"
-          />
-        ) : null}
       </div>
     </section>
   )
 }
 
-function CloneResultPanel({ cloneEval }: { cloneEval: CloneEval }) {
-  const similarityDropAbs = computeAbsoluteDrop(cloneEval.originalSimilarity, cloneEval.protectedSimilarity)
-
+function IdentityTransformCard({ title, before, after, delta, changeLabel, foot, tone }: { title: string; before: string; after: string; delta: number | null; changeLabel: string; foot: ReactNode; tone: 'green' | 'red' }) {
   return (
-    <section className="rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
-      <SectionTitle>克隆防护结果</SectionTitle>
-      <div className="mt-5 grid grid-cols-[repeat(auto-fit,minmax(150px,1fr))] gap-3">
-        <ScoreBox label="原始克隆相似度" value={formatCloneMetricNumber(cloneEval.originalSimilarity)} />
-        <ScoreBox label="保护后克隆相似度" value={formatCloneMetricNumber(cloneEval.protectedSimilarity)} />
-        <ScoreBox label="相似度下降量" value={formatCloneMetricNumber(similarityDropAbs)} />
+    <div className="relative flex flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/22 px-4 py-5">
+      <div className="relative min-h-8">
+        <p className="absolute inset-x-0 top-1/2 -translate-y-1/2 px-9 text-center text-[14px] font-black leading-5 text-slate-100">{title}</p>
+        <div className="absolute right-0 top-1/2 -translate-y-1/2"><MetricInfoButton title={title}>{foot}</MetricInfoButton></div>
       </div>
-    </section>
+      <div className="my-auto grid grid-cols-[minmax(0,1fr)_30px_minmax(0,1fr)] items-center py-3 text-center font-mono text-[26px] font-black">
+        <span className="text-slate-200">{before}</span>
+        <span className="text-slate-500">→</span>
+        <span className={tone === 'green' ? 'text-emerald-300' : 'text-rose-300'}>{after}</span>
+      </div>
+      <div className={cn('mb-3 rounded-[6px] border py-1.5 text-center text-sm font-black', tone === 'green' ? 'border-emerald-300/18 bg-emerald-400/10 text-emerald-300' : 'border-red-300/18 bg-red-400/10 text-red-300')}>
+        {changeLabel} {delta === null ? '不可用' : delta.toFixed(2)}
+      </div>
+    </div>
+  )
+}
+
+function IdentityValueCard({ title, value, foot, tone }: { title: string; value: string; foot: ReactNode; tone: 'green' | 'red' }) {
+  return (
+    <div className="relative flex flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/22 px-4 py-5">
+      <div className="relative min-h-8">
+        <p className="absolute inset-x-0 top-1/2 -translate-y-1/2 px-9 text-center text-[14px] font-black leading-5 text-slate-100">{title}</p>
+        <div className="absolute right-0 top-1/2 -translate-y-1/2"><MetricInfoButton title={title}>{foot}</MetricInfoButton></div>
+      </div>
+      <p className={cn('my-auto py-5 text-center font-mono text-[34px] font-black', tone === 'green' ? 'text-emerald-300' : 'text-rose-300')}>{value}</p>
+    </div>
   )
 }
 
@@ -950,13 +1466,13 @@ function CloneVisualizationPanel({ result, cloneEval }: { result: TaskResult; cl
     <section className="flex h-full flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
       <div className="flex items-center justify-between gap-4">
         <SectionTitle>说话人防护雷达图</SectionTitle>
-        <span className="text-[10px] text-slate-500">由后端真实指标动态生成</span>
+        <MetricInfoButton title="说话人防护雷达图">将直接声纹偏移、相似度下降、嵌入距离增加和保护效果评估映射到统一的 0–100 分尺度；面积越大表示综合防护效果越明显。</MetricInfoButton>
       </div>
-      <div className="mt-5 min-h-[250px] flex-1 overflow-hidden rounded-[9px] border border-cyan-300/12 bg-slate-950/16 p-3">
+      <div className="mt-4 min-h-0 flex-1 overflow-hidden rounded-[9px] border border-cyan-300/12 bg-slate-950/16 p-2">
         {!displayRadar.length ? (
-          <ChartEmptyState text="后端未返回说话人防护雷达数据" />
+          <ChartEmptyState text="暂未生成说话人防护雷达数据" />
         ) : availableRadar.length < 3 ? (
-          <ChartEmptyState text="后端返回的可用雷达指标不足，至少需要 3 个真实指标" />
+          <ChartEmptyState text="可用雷达指标不足，至少需要 3 个真实指标" />
         ) : (
           <CloneRadarPreview radar={displayRadar} availableRadar={availableRadar} />
         )}
@@ -971,29 +1487,34 @@ function ChartEmptyState({ text }: { text: string }) {
 
 function normalizeCloneRadarForDisplay(radar: RadarPoint[], cloneEval: CloneEval) {
   const hasRealCloneConfidence = optionalNumber(cloneEval.cloneConfidenceDropRate) !== null
+  const defenseScore = computeCloneDefenseScore(cloneEval)
   return radar
     .filter((item) => hasRealCloneConfidence || !/置信|confidence/i.test(item.name))
-    .map((item) => ({
-      ...item,
-      name: normalizeCloneRadarName(item.name),
-    }))
+    .map((item) => {
+      const name = normalizeCloneRadarName(item.name)
+      return {
+        ...item,
+        name,
+        value: name === '保护效果评估' && defenseScore !== null ? defenseScore : item.value,
+      }
+    })
 }
 
 function normalizeCloneRadarName(name: string) {
   if (/直接|direct/i.test(name)) return '直接声纹偏移'
   if (/相似|similar/i.test(name)) return '相似度下降'
   if (/嵌入|embedding|距离/i.test(name)) return '嵌入距离增加'
-  if (/保护后|防护|protected/i.test(name)) return '保护后克隆防护'
+  if (/保护后|防护|protected/i.test(name)) return '保护效果评估'
   if (/置信|confidence/i.test(name)) return '克隆置信度下降'
   return name
 }
 
 function CloneRadarPreview({ radar, availableRadar }: { radar: RadarPoint[]; availableRadar: RadarPoint[] }) {
-  const width = 510
-  const height = 345
+  const width = 620
+  const height = 340
   const centerX = width / 2
   const centerY = height / 2
-  const radius = 102
+  const radius = 105
   const axisPoints = availableRadar.map((item, index) => {
     const angle = -Math.PI / 2 + (index / availableRadar.length) * Math.PI * 2
     const normalized = Math.max(0, Math.min(100, item.value ?? 0)) / 100
@@ -1004,8 +1525,8 @@ function CloneRadarPreview({ radar, availableRadar }: { radar: RadarPoint[]; ava
       axisY: centerY + Math.sin(angle) * radius,
       valueX: centerX + Math.cos(angle) * radius * normalized,
       valueY: centerY + Math.sin(angle) * radius * normalized,
-      labelX: centerX + Math.cos(angle) * (radius + 51),
-      labelY: centerY + Math.sin(angle) * (radius + 36),
+      labelX: centerX + Math.cos(angle) * (radius + 58),
+      labelY: centerY + Math.sin(angle) * (radius + 42),
     }
   })
   const polygon = axisPoints.map((point) => `${point.valueX.toFixed(1)},${point.valueY.toFixed(1)}`).join(' ')
@@ -1015,7 +1536,7 @@ function CloneRadarPreview({ radar, availableRadar }: { radar: RadarPoint[]; ava
   return (
     <div className="flex h-full flex-col">
       <div className="grid min-h-0 flex-1 place-items-center">
-        <svg viewBox={`0 0 ${width} ${height}`} className="h-[345px] w-full max-w-[840px]">
+        <svg viewBox={`0 0 ${width} ${height}`} className="h-full min-h-0 w-full max-w-none">
           {[0.25, 0.5, 0.75, 1].map((scale) => (
             <polygon
               key={scale}
@@ -1044,7 +1565,10 @@ function CloneRadarPreview({ radar, availableRadar }: { radar: RadarPoint[]; ava
       </div>
       {missingNames.length ? (
         <div className="overflow-hidden rounded-[9px] border border-cyan-300/12 bg-slate-950/16 p-4">
-          <p className="text-xs leading-5 text-slate-500">部分指标未生成：{missingNames.join('；')}</p>
+          <p className="text-xs font-bold text-slate-400">部分指标未生成</p>
+          <ul className="mt-1 space-y-1 text-xs leading-5 text-slate-500">
+            {missingNames.map((name) => <li key={name}>• {name}</li>)}
+          </ul>
         </div>
       ) : null}
     </div>
@@ -1056,44 +1580,71 @@ function AsrEvalModal({
   error,
   loading,
   modelOptions,
+  modelTypes,
+  language,
+  onLanguageChange,
   onChange,
   onClose,
   onSubmit,
+  onQuickSubmit,
 }: {
   model: string
   error?: string
   loading: boolean
-  modelOptions: string[]
+  modelOptions: BackendSelectOption[]
+  modelTypes?: CapabilitiesResponse['modelTypes']
+  language: string
+  onLanguageChange: (language: string) => void
   onChange: (model: string) => void
   onClose: () => void
   onSubmit: () => void
+  onQuickSubmit: () => void
 }) {
+  const [informationModel, setInformationModel] = useState<BackendSelectOption | null>(null)
   return (
     <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/68 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="ASR 测试表单">
-      <div className="ui-card w-full max-w-[460px] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.46)]">
+      <div className="ui-card max-h-[92vh] w-full max-w-[620px] overflow-y-auto !bg-[#061426] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.46)]">
         <div className="mb-4 flex items-center justify-between">
           <div>
             <h3 className="text-[20px] font-black text-white">ASR 测试</h3>
-            <p className="mt-1 text-xs text-slate-500">POST /api/tasks/{'{taskId}'}/asr-eval</p>
+            <p className="mt-1 text-xs text-slate-500">选择语言和识别模型后开始测试</p>
           </div>
           <button type="button" onClick={onClose} className="grid h-9 w-9 place-items-center rounded-full border border-cyan-300/14 bg-white/[0.035] text-slate-300 hover:text-white" aria-label="关闭 ASR 测试表单">
             <X className="h-4 w-4" />
           </button>
         </div>
-        <label className="text-sm font-bold text-slate-300">
-          ASR 模型
-          <select value={model} onChange={(event) => onChange(event.target.value)} className="mt-2 h-10 w-full rounded-[7px] border border-cyan-300/14 bg-slate-950/70 px-3 text-slate-100 outline-none focus:border-cyan-300">
-            {modelOptions.map((item) => (
-              <option key={item} value={item} className="bg-slate-950 text-slate-100">
-                {item}
-              </option>
-            ))}
-          </select>
-        </label>
+        <p className="text-sm font-bold text-slate-300">识别语言</p>
+        <div className="mt-2 mb-4 grid grid-cols-2 gap-2">
+          {[{ value: 'zh-cn', label: '中文' }, { value: 'en', label: 'English' }].map((item) => (
+            <button key={item.value} type="button" onClick={() => onLanguageChange(item.value)} className={cn('h-9 rounded-[7px] border px-3 text-sm font-black', language === item.value ? 'border-cyan-300 bg-cyan-400/14 text-cyan-100' : 'border-cyan-300/12 bg-slate-950/50 text-slate-400')}>
+              {item.label}
+            </button>
+          ))}
+        </div>
+        <p className="text-sm font-bold text-slate-300">选择 ASR 模型</p>
+        <div className="mt-2 grid max-h-[300px] gap-2 overflow-y-auto pr-1 sm:grid-cols-2">
+          {modelOptions.map((item) => {
+            const unavailable = item.status !== undefined && item.status !== 'available'
+            const selected = model === item.value
+            return (
+              <div key={item.value} className={cn('relative flex min-h-12 items-center rounded-[7px] border px-2 py-2', selected ? 'border-cyan-300 bg-cyan-400/12' : 'border-cyan-300/14 bg-slate-950/55', unavailable && 'opacity-65')}>
+                <button type="button" disabled={unavailable} onClick={() => onChange(item.value)} className={cn('min-w-0 flex-1 px-8 text-center text-sm font-bold', selected ? 'text-cyan-100' : 'text-slate-300', unavailable && 'cursor-not-allowed')}>
+                  <span className="block truncate">{item.label}</span>
+                  {unavailable ? <span className="mt-0.5 block truncate text-[10px] font-medium text-amber-200">{item.status}</span> : null}
+                </button>
+                <div className="absolute right-2 top-1/2 -translate-y-1/2"><ModelInfoButton model={item} onOpen={setInformationModel} /></div>
+              </div>
+            )
+          })}
+        </div>
         {error ? <p className="mt-4 rounded-[7px] border border-red-300/20 bg-red-400/10 px-3 py-2 text-sm text-red-100">{error}</p> : null}
         <div className="mt-5 flex justify-end gap-3">
           <button type="button" onClick={onClose} className="h-10 rounded-[7px] border border-cyan-300/14 bg-white/[0.035] px-4 text-sm font-bold text-slate-300">
             取消
+          </button>
+          <button type="button" onClick={onQuickSubmit} disabled={loading} className="inline-flex h-10 min-w-[116px] items-center justify-center gap-2 rounded-[7px] border border-cyan-300/22 bg-cyan-400/8 px-4 text-sm font-black text-cyan-100 hover:bg-cyan-400/14 disabled:opacity-60">
+            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+            一键测试
           </button>
           <button type="button" onClick={onSubmit} disabled={loading} className="cyan-button inline-flex h-10 min-w-[116px] items-center justify-center gap-2 rounded-[7px] px-4 text-sm font-black disabled:opacity-60">
             {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <TestTube2 className="h-4 w-4" />}
@@ -1101,7 +1652,313 @@ function AsrEvalModal({
           </button>
         </div>
       </div>
+      <ModelInformationModal model={informationModel} modelTypes={modelTypes} onClose={() => setInformationModel(null)} />
     </div>
+  )
+}
+
+function annotationSourceLabel(source?: CloneVoiceRequest['annotationSource']) {
+  return source === 'asr' ? 'ASR 标注' : '人工标注'
+}
+
+function shortCloneModelName(value?: string) {
+  const model = String(value ?? '')
+  if (/xtts[_:/-]?v?2/i.test(model)) return 'XTTS v2'
+  if (/xtts[_:/-]?v?1[._-]?1/i.test(model)) return 'XTTS v1.1'
+  if (/yourtts/i.test(model)) return 'YourTTS'
+  if (/cosyvoice/i.test(model)) return 'CosyVoice2-0.5B'
+  if (/gpt.?sovits/i.test(model)) return 'GPT-SoVITS'
+  return model.split('/').at(-1)?.replaceAll('_', ' ') || '—'
+}
+
+function shortAsrModelName(value?: string) {
+  const model = String(value ?? '')
+  const whisper = model.match(/whisper[:/_-]?([a-z0-9.-]+)/i)
+  if (whisper?.[1]) return `Whisper ${whisper[1][0].toUpperCase()}${whisper[1].slice(1)}`
+  if (/wav2vec/i.test(model)) return 'Wav2Vec2 Base'
+  if (/funasr|paraformer/i.test(model)) return 'Paraformer 中文'
+  return model.split('/').at(-1)?.replaceAll('_', ' ') || '未生成'
+}
+
+function cloneTypeLabel(value?: string) {
+  if (/gpt.?sovits/i.test(String(value ?? ''))) return '微调'
+  if (/cosyvoice/i.test(String(value ?? ''))) return 'LLM'
+  return '零样本'
+}
+
+function ModelInfoButton({ model, onOpen }: { model: BackendSelectOption; onOpen: (model: BackendSelectOption) => void }) {
+  return (
+    <button
+      type="button"
+      onClick={(event) => {
+        event.preventDefault()
+        event.stopPropagation()
+        onOpen(model)
+      }}
+      className="grid h-7 w-7 shrink-0 place-items-center rounded-[6px] border border-cyan-300/16 text-cyan-200 transition hover:border-cyan-300/32 hover:bg-cyan-300/10"
+      aria-label={`查看 ${model.label} 模型详情`}
+      title="查看模型详情"
+    >
+      <Search className="h-3.5 w-3.5" />
+    </button>
+  )
+}
+
+function AsrHistoryPanel({ history, batches, selectedAsrSubId, onSelect, onOpenBatch, maxVisible }: { history: AsrHistoryEntry[]; batches: EvaluationBatch[]; selectedAsrSubId?: string; onSelect: (asrSubId?: string) => void; onOpenBatch: (batch: EvaluationBatch) => void; maxVisible: number }) {
+  if (!history.length && !batches.length) return null
+  const rowCount = history.length + batches.length
+  return (
+    <section className="rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
+      <div className="flex flex-col items-center justify-center gap-1 text-center">
+        <SectionTitle>同一保护任务的 ASR 任务对比</SectionTitle>
+        <span className="text-xs text-slate-500">{batches.length ? `${batches.length} 个一键批次 · ` : ''}{history.length} 个模型子任务；点击批次查看最慢任务进度</span>
+      </div>
+      <div className="mt-4 overflow-auto" style={{ maxHeight: `${42 + Math.max(1, Math.min(rowCount, maxVisible + batches.length)) * 63}px` }}>
+        <table className="w-full min-w-[900px] table-fixed text-left text-xs text-slate-300">
+          <colgroup>
+            <col className="w-[18%]" />
+            <col className="w-[23%]" />
+            <col className="w-[9%]" />
+            <col className="w-[20%]" />
+            <col className="w-[12%]" />
+            <col className="w-[9%]" />
+            <col className="w-[9%]" />
+          </colgroup>
+          <thead className="sticky top-0 z-10 border-b border-cyan-300/12 bg-slate-950 text-[11px] text-slate-500">
+            <tr><th className="px-2 py-2 text-center">任务</th><th className="px-2 py-2 text-center">ASR 模型</th><th className="px-2 py-2 text-center">语言</th><th className="px-2 py-2 text-center">进度</th><th className="px-2 py-2 text-center">处理时长</th><th className="px-2 py-2 text-center">WER</th><th className="px-2 py-2 text-center">CER</th></tr>
+          </thead>
+          <tbody>
+            {batches.map((batch) => {
+              const progress = clamp(optionalNumber(batch.progress) ?? 0, 0, 1)
+              const progressPercent = Math.round(progress * 100)
+              const tone = progressTone(batch.status)
+              const elapsed = batchElapsed(batch)
+              return (
+                <tr key={batch.batchId} role="button" tabIndex={0} onClick={() => onOpenBatch(batch)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onOpenBatch(batch) } }} className="cursor-pointer border-b border-violet-300/14 bg-violet-400/[0.06] hover:bg-violet-400/[0.11] focus:outline-none focus:ring-1 focus:ring-inset focus:ring-violet-300/40">
+                  <td className="px-2 py-2 text-center font-mono text-violet-200" title={batch.batchId}><span className="block truncate">{batch.batchId}</span><span className="mt-1 block text-[10px] text-slate-500">{formatTaskTime(batch.createdAt)}</span></td>
+                  <td className="px-2 py-3 text-center font-black text-violet-100">全模型一键测试</td>
+                  <td className="px-2 py-3 text-center">全部</td>
+                  <td className="px-2 py-2" title="聚合进度取所有子任务中的最小值">
+                    <div className="history-progress-track mx-auto h-1.5 max-w-[110px] overflow-hidden rounded-full bg-slate-800"><div className={cn('h-full rounded-full transition-all duration-300', tone.fill)} style={{ width: `${progressPercent}%` }} /></div>
+                    <p className={cn('mt-1 text-center font-mono text-[10px] font-bold', tone.text)}>{progressPercent}% · {lifecycleStatusLabel(batch.status)}</p>
+                  </td>
+                  <td className="px-2 py-3 text-center font-mono">{elapsed !== null ? seconds(elapsed) : '—'}</td>
+                  <td className="px-2 py-3 text-center font-mono">—</td>
+                  <td className="px-2 py-3 text-center font-mono">—</td>
+                </tr>
+              )
+            })}
+            {history.map((item, index) => {
+              const evaluation = item.asr
+              const rowId = item.asrSubId ?? `legacy-asr-${index}`
+              const lifecycleStatus = asrHistoryLifecycleStatus(item)
+              const failed = ['unavailable', 'failed', 'error', 'cancelled'].includes(lifecycleStatus)
+              const failureReason = failed ? asrHistoryFailureReason(item) : null
+              const progressPercent = Math.round(asrHistoryProgress(item) * 100)
+              const statusLabel = asrHistoryStatusLabel(item)
+              const elapsedSec = optionalNumber(item.taskStatus?.elapsedSec)
+              const tone = progressTone(lifecycleStatus)
+              return (
+                <tr key={rowId} role="button" tabIndex={0} title={failureReason ?? item.taskStatus?.message ?? undefined} onClick={() => onSelect(item.asrSubId)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelect(item.asrSubId) } }} className={cn('cursor-pointer border-b border-cyan-300/8 last:border-0 hover:bg-cyan-300/[0.04] focus:outline-none focus:ring-1 focus:ring-inset focus:ring-cyan-300/35', selectedAsrSubId === item.asrSubId && 'bg-cyan-300/[0.08]', failed && 'bg-rose-400/[0.035]')}>
+                  <td className="px-2 py-2 text-center font-mono text-cyan-200" title={item.asrSubId ?? rowId}><span className="block truncate">#{index + 1} {item.asrSubId ?? '历史结果'}{failed ? <span className="ml-2 rounded-full bg-rose-400/12 px-1.5 py-0.5 font-sans text-[10px] font-black text-rose-300">失败</span> : null}</span><span className="mt-1 block text-[10px] text-slate-500">{formatTaskTime(item.taskStatus?.createdAt ?? item.createdAt ?? evaluation?.createdAt)}</span></td>
+                  <td className={cn('truncate px-2 py-3 text-center font-bold', failed ? 'text-rose-200' : 'text-slate-100')} title={evaluation?.model ?? item.request?.model}>{shortAsrModelName(evaluation?.model ?? item.request?.model)}</td>
+                  <td className="px-2 py-3 text-center">{evaluation?.language ?? item.request?.language ?? '—'}</td>
+                  <td className="px-2 py-2" title={item.taskStatus?.message ?? statusLabel}>
+                    <div className="history-progress-track mx-auto h-1.5 max-w-[110px] overflow-hidden rounded-full bg-slate-800"><div className={cn('h-full rounded-full transition-all duration-300', tone.fill)} style={{ width: `${progressPercent}%` }} /></div>
+                    <p className={cn('mt-1 text-center font-mono text-[10px] font-bold', tone.text)}>{progressPercent}% · {statusLabel}</p>
+                  </td>
+                  <td className="px-2 py-3 text-center font-mono">{elapsedSec !== null ? seconds(elapsedSec) : '—'}</td>
+                  <td className="px-2 py-3 text-center font-mono">{formatMetricValue(evaluation?.wer, 'percent')}</td>
+                  <td className="px-2 py-3 text-center font-mono">{formatMetricValue(evaluation?.cer, 'percent')}</td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  )
+}
+
+function CloneHistoryPanel({ history, batches, selectedCloneKey, onSelect, onOpenBatch, onOpenAsr, onOpenManual, onOpenFineTune, maxVisible }: { history: CloneHistoryEntry[]; batches: EvaluationBatch[]; selectedCloneKey?: string; onSelect: (cloneKey: string) => void; onOpenBatch: (batch: EvaluationBatch) => void; onOpenAsr: (asrSubId?: string) => void; onOpenManual: (item: CloneHistoryEntry) => void; onOpenFineTune: (item: CloneHistoryEntry) => void; maxVisible: number }) {
+  if (!history.length && !batches.length) return null
+  const rowCount = history.length + batches.length
+  return (
+    <section className="rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
+      <div className="flex flex-col items-center justify-center gap-1 text-center">
+        <SectionTitle>同一保护任务的克隆任务对比</SectionTitle>
+        <span className="text-xs text-slate-500">{batches.length ? `${batches.length} 个一键批次 · ` : ''}{history.length} 个克隆子任务；排队、运行、失败记录均会保留</span>
+      </div>
+      <div className="mt-4 overflow-auto" style={{ maxHeight: `${42 + Math.max(1, Math.min(rowCount, maxVisible + batches.length)) * 63}px` }}>
+        <table className="w-full min-w-[1280px] table-fixed text-left text-xs text-slate-300">
+          <colgroup>
+            <col className="w-[12%]" />
+            <col className="w-[8%]" />
+            <col className="w-[13%]" />
+            <col className="w-[9%]" />
+            <col className="w-[15%]" />
+            <col className="w-[8%]" />
+            <col className="w-[21%]" />
+            <col className="w-[7%]" />
+            <col className="w-[7%]" />
+          </colgroup>
+          <thead className="sticky top-0 z-10 border-b border-cyan-300/12 bg-slate-950 text-[11px] text-slate-500">
+            <tr><th className="px-2 py-2 text-center">任务</th><th className="px-2 py-2 text-center">克隆类型</th><th className="px-2 py-2 text-center">克隆模型</th><th className="px-2 py-2 text-center">标注来源</th><th className="px-2 py-2 text-center">进度</th><th className="px-2 py-2 text-center">处理时长</th><th className="px-2 py-2 text-center">参考标注</th><th className="px-2 py-2 text-center">原始相似度</th><th className="px-2 py-2 text-center">保护后相似度</th></tr>
+          </thead>
+          <tbody>
+            {batches.map((batch) => {
+              const progressPercent = Math.round(clamp(optionalNumber(batch.progress) ?? 0, 0, 1) * 100)
+              const tone = progressTone(batch.status)
+              const elapsed = batchElapsed(batch)
+              return (
+                <tr key={batch.batchId} role="button" tabIndex={0} onClick={() => onOpenBatch(batch)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onOpenBatch(batch) } }} className="cursor-pointer border-b border-violet-300/14 bg-violet-400/[0.06] hover:bg-violet-400/[0.11] focus:outline-none focus:ring-1 focus:ring-inset focus:ring-violet-300/40">
+                  <td className="px-2 py-2 text-center font-mono text-violet-200" title={batch.batchId}><span className="block truncate">{batch.batchId}</span><span className="mt-1 block text-[10px] text-slate-500">{formatTaskTime(batch.createdAt)}</span></td>
+                  <td className="px-2 py-3 text-center"><span className="rounded-full border border-violet-300/20 bg-violet-400/10 px-2 py-1 font-black text-violet-100">批次</span></td>
+                  <td className="px-2 py-3 text-center font-black text-violet-100">全模型一键测试</td>
+                  <td className="px-2 py-3 text-center">全部</td>
+                  <td className="px-2 py-2" title="聚合进度取所有子任务中的最小值">
+                    <div className="history-progress-track mx-auto h-1.5 max-w-[110px] overflow-hidden rounded-full bg-slate-800"><div className={cn('h-full rounded-full transition-all duration-300', tone.fill)} style={{ width: `${progressPercent}%` }} /></div>
+                    <p className={cn('mt-1 text-center font-mono text-[10px] font-bold', tone.text)}>{progressPercent}% · {lifecycleStatusLabel(batch.status)}</p>
+                  </td>
+                  <td className="px-2 py-3 text-center font-mono">{elapsed !== null ? seconds(elapsed) : '—'}</td>
+                  <td className="px-2 py-3 text-center text-slate-400">完成 {batch.completedCount}/{batch.totalCount} · 失败 {batch.failedCount}</td>
+                  <td className="px-2 py-3 text-center font-mono">—</td>
+                  <td className="px-2 py-3 text-center font-mono">—</td>
+                </tr>
+              )
+            })}
+            {history.map((item, index) => {
+              const request = item.request
+              const asrAnnotation = request?.annotationSource === 'asr'
+              const originalPrompt = request?.originalSpeakerPrompt ?? request?.speakerPrompt ?? ''
+              const protectedPrompt = request?.protectedSpeakerPrompt ?? ''
+              const lifecycleStatus = cloneHistoryLifecycleStatus(item)
+              const failed = ['unavailable', 'failed', 'error', 'cancelled'].includes(lifecycleStatus)
+              const progressPercent = Math.round(cloneHistoryProgress(item) * 100)
+              const tone = progressTone(lifecycleStatus)
+              const elapsed = optionalNumber(item.taskStatus?.elapsedSec)
+              const openAnnotation = () => {
+                if (!request) return
+                if (asrAnnotation) onOpenAsr(request.annotationAsrSubId)
+                else onOpenManual(item)
+              }
+              return (
+                <tr key={item.key} role="button" tabIndex={0} title={failed ? cloneHistoryFailureReason(item) : item.taskStatus?.message ?? undefined} onClick={() => onSelect(item.key)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelect(item.key) } }} className={cn('cursor-pointer border-b border-cyan-300/8 last:border-0 hover:bg-cyan-300/[0.04] focus:outline-none focus:ring-1 focus:ring-inset focus:ring-cyan-300/35', selectedCloneKey === item.key && 'bg-cyan-300/[0.08]', failed && 'bg-rose-400/[0.035]')}>
+                  <td className="px-2 py-2 text-center font-mono text-cyan-200" title={item.cloneSubId ?? item.cloneId ?? item.key}><span className="block truncate">#{index + 1} {item.cloneSubId ?? item.cloneId?.slice(0, 12) ?? '等待编号'}{failed ? <span className="ml-2 rounded-full bg-rose-400/12 px-1.5 py-0.5 font-sans text-[10px] font-black text-rose-300">失败</span> : null}</span><span className="mt-1 block text-[10px] text-slate-500">{formatTaskTime(item.taskStatus?.createdAt ?? item.createdAt)}</span></td>
+                  <td className="px-2 py-3 text-center">
+                    <span className="inline-flex items-center justify-center gap-1">
+                      <span className="rounded-full border border-cyan-300/18 bg-cyan-400/8 px-2 py-1 font-black text-cyan-100">{request?.model ? cloneTypeLabel(request.model) : '—'}</span>
+                      {item.result?.fineTune ? <button type="button" onClick={(event) => { event.stopPropagation(); onOpenFineTune(item) }} className="grid h-7 w-7 place-items-center rounded-[6px] border border-amber-300/18 text-amber-200 hover:bg-amber-300/10" aria-label="查看微调报告" title="查看微调报告"><Search className="h-3.5 w-3.5" /></button> : null}
+                    </span>
+                  </td>
+                  <td className={cn('truncate px-2 py-3 text-center font-bold', failed ? 'text-rose-200' : 'text-slate-100')} title={request?.model}>{shortCloneModelName(request?.model)}</td>
+                  <td className="px-2 py-3 text-center">
+                    {request ? <button type="button" onClick={(event) => { event.stopPropagation(); openAnnotation() }} className={cn('rounded-full border px-2 py-1 font-bold underline-offset-2 hover:underline', asrAnnotation ? 'border-violet-300/20 bg-violet-400/10 text-violet-200' : 'manual-annotation-chip border-emerald-400/30 bg-emerald-500/15 text-emerald-300')}>{annotationSourceLabel(request.annotationSource)}</button> : '—'}
+                  </td>
+                  <td className="px-2 py-2" title={item.taskStatus?.message ?? lifecycleStatusLabel(lifecycleStatus)}>
+                    <div className="history-progress-track mx-auto h-1.5 max-w-[110px] overflow-hidden rounded-full bg-slate-800"><div className={cn('h-full rounded-full transition-all duration-300', tone.fill)} style={{ width: `${progressPercent}%` }} /></div>
+                    <p className={cn('mt-1 text-center font-mono text-[10px] font-bold', tone.text)}>{progressPercent}% · {lifecycleStatusLabel(lifecycleStatus)}</p>
+                  </td>
+                  <td className="px-2 py-3 text-center font-mono">{elapsed !== null ? seconds(elapsed) : '—'}</td>
+                  <td className="px-2 py-2">
+                    {request ? <button type="button" onClick={(event) => { event.stopPropagation(); openAnnotation() }} className="block w-full rounded-[5px] px-1 py-1 text-left hover:bg-cyan-300/[0.05]">{asrAnnotation ? <span className="block space-y-0.5 leading-5"><span className="block truncate" title={originalPrompt}>原始：{originalPrompt || '—'}</span><span className="block truncate" title={protectedPrompt}>保护：{protectedPrompt || '—'}</span></span> : <span className="block truncate" title={originalPrompt}>{originalPrompt || '—'}</span>}</button> : <span className="block text-center text-slate-500">—</span>}
+                  </td>
+                  <td className="px-2 py-3 text-center font-mono">{formatCloneMetricNumber(item.result?.cloneEval?.originalSimilarity)}</td>
+                  <td className="px-2 py-3 text-center font-mono">{formatCloneMetricNumber(item.result?.cloneEval?.protectedSimilarity)}</td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  )
+}
+
+function ManualAnnotationModal({ item, onClose }: { item: CloneHistoryEntry | null; onClose: () => void }) {
+  useEffect(() => {
+    if (!item) return undefined
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [item, onClose])
+  if (!item) return null
+  const request = item.request
+  if (!request) return null
+  const text = request.speakerPrompt ?? request.originalSpeakerPrompt ?? ''
+  return createPortal(
+    <div className="fixed inset-0 z-[110] grid place-items-center bg-slate-950/72 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="人工标注详情" onClick={onClose}>
+      <div className="ui-card w-full max-w-[620px] !bg-[#061426] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.48)]" onClick={(event) => event.stopPropagation()}>
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h3 className="text-lg font-black text-white">人工标注详情</h3>
+            <p className="mt-1 font-mono text-xs text-slate-500">{item.cloneSubId ?? item.cloneId ?? item.key} · {request.model}</p>
+          </div>
+          <button type="button" onClick={onClose} className="grid h-9 w-9 shrink-0 place-items-center rounded-full border border-cyan-300/14 text-slate-300 hover:text-white" aria-label="关闭人工标注详情"><X className="h-4 w-4" /></button>
+        </div>
+        <div className="mt-4 rounded-[8px] border border-emerald-300/16 bg-emerald-400/[0.06] p-4">
+          <p className="text-xs font-black text-emerald-300">原始与保护参考音频共用这一条人工标注</p>
+          <p className="mt-3 whitespace-pre-wrap text-sm leading-7 text-slate-200">{text || '未填写人工标注'}</p>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  )
+}
+
+function FineTuneReportModal({ item, onClose }: { item: CloneHistoryEntry | null; onClose: () => void }) {
+  useEffect(() => {
+    if (!item?.result?.fineTune) return undefined
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [item, onClose])
+  const report = item?.result?.fineTune
+  if (!item || !report) return null
+  const rows = [
+    ['原始参考音频', report.original],
+    ['保护参考音频', report.protected],
+  ] as const
+  return createPortal(
+    <div className="fixed inset-0 z-[160] grid place-items-center bg-slate-950/80 px-4 py-8" role="dialog" aria-modal="true" aria-label="微调报告" onClick={onClose}>
+      <div className="ui-card max-h-full w-full max-w-[760px] overflow-y-auto !bg-[#061426] p-5 shadow-[0_28px_90px_rgba(0,0,0,0.62)]" onClick={(event) => event.stopPropagation()}>
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <p className="text-xs font-bold tracking-[0.12em] text-amber-300">现场微调报告</p>
+            <h3 className="mt-2 text-xl font-black text-white">{shortCloneModelName(report.model ?? item.request?.model)}</h3>
+            <p className="mt-1 font-mono text-xs text-slate-500">{item.cloneSubId ?? item.cloneId ?? item.key}{report.mode ? ` · ${report.mode}` : ''}</p>
+          </div>
+          <button type="button" onClick={onClose} className="grid h-9 w-9 shrink-0 place-items-center rounded-full border border-cyan-300/14 text-slate-300 hover:text-white" aria-label="关闭微调报告"><X className="h-4 w-4" /></button>
+        </div>
+        <div className="mt-5 grid gap-3 sm:grid-cols-2">
+          {rows.map(([label, evidence]) => (
+            <section key={label} className="rounded-[8px] border border-cyan-300/12 bg-slate-950 p-4">
+              <p className="text-sm font-black text-cyan-100">{label}</p>
+              <dl className="mt-3 grid grid-cols-[1fr_auto] gap-x-4 gap-y-2 text-xs">
+                <dt className="text-slate-500">参考音频时长</dt><dd className="font-mono text-slate-200">{formatMetricValue(evidence?.sourceDurationSec, 'seconds')}</dd>
+                <dt className="text-slate-500">训练音频时长</dt><dd className="font-mono text-slate-200">{formatMetricValue(evidence?.trainingDurationSec, 'seconds')}</dd>
+                <dt className="text-slate-500">文本预处理</dt><dd className="font-mono text-slate-200">{formatMetricValue(evidence?.textSec, 'seconds')}</dd>
+                <dt className="text-slate-500">HuBERT 特征</dt><dd className="font-mono text-slate-200">{formatMetricValue(evidence?.hubertSec, 'seconds')}</dd>
+                <dt className="text-slate-500">语义特征</dt><dd className="font-mono text-slate-200">{formatMetricValue(evidence?.semanticSec, 'seconds')}</dd>
+                <dt className="text-slate-500">GPT 训练</dt><dd className="font-mono text-slate-200">{formatMetricValue(evidence?.s1TrainSec, 'seconds')}</dd>
+                <dt className="text-slate-500">SoVITS 训练</dt><dd className="font-mono text-slate-200">{formatMetricValue(evidence?.s2TrainSec, 'seconds')}</dd>
+                <dt className="text-slate-500">推理耗时</dt><dd className="font-mono text-slate-200">{formatMetricValue(evidence?.inferenceWallSec, 'seconds')}</dd>
+                <dt className="text-slate-500">单侧总耗时</dt><dd className="font-mono font-black text-amber-200">{formatMetricValue(evidence?.totalWallSec, 'seconds')}</dd>
+              </dl>
+            </section>
+          ))}
+        </div>
+        <div className="mt-4 flex items-center justify-between rounded-[8px] border border-amber-300/14 bg-slate-950 px-4 py-3 text-sm">
+          <span className="font-bold text-slate-400">原始与保护两侧合计耗时</span>
+          <span className="font-mono font-black text-amber-200">{formatMetricValue(report.pairWallSec, 'seconds')}</span>
+        </div>
+      </div>
+    </div>,
+    document.body,
   )
 }
 
@@ -1110,29 +1967,60 @@ function CloneVoiceModal({
   error,
   loading,
   modelOptions,
+  modelTypes,
   languageOptions,
   speedOptions,
+  asrAnnotations,
   onChange,
   onClose,
   onSubmit,
+  onQuickSubmit,
+  onOpenAsr,
 }: {
   form: CloneVoiceRequest
   error?: string
   loading: boolean
   modelOptions: BackendSelectOption[]
+  modelTypes?: CapabilitiesResponse['modelTypes']
   languageOptions: string[]
   speedOptions: number[]
+  asrAnnotations: AsrEvalResponse[]
   onChange: (form: CloneVoiceRequest) => void
   onClose: () => void
   onSubmit: () => void
+  onQuickSubmit: () => void
+  onOpenAsr: () => void
 }) {
+  const [annotationSearch, setAnnotationSearch] = useState('')
+  const [informationModel, setInformationModel] = useState<BackendSelectOption | null>(null)
+  const visibleModels = modelOptions
+  const selectedModel = modelOptions.find((item) => item.value === form.model)
+  const reusableAsrAnnotations = asrAnnotations
+    .filter((item) => item.asrSubId && item.asr?.originalText?.trim() && item.asr?.protectedText?.trim())
+    .filter((item) => {
+      const query = annotationSearch.trim().toLowerCase()
+      if (!query) return true
+      return `${item.asr?.originalText ?? ''} ${item.asr?.protectedText ?? ''} ${item.asr?.model ?? ''} ${item.asrSubId ?? ''}`.toLowerCase().includes(query)
+    })
+    .slice()
+    .reverse()
+
+  const selectModel = (selected: BackendSelectOption) => {
+    const languages = selected.languages?.length ? selected.languages : languageOptions
+    onChange({
+      ...form,
+      model: selected.value,
+      language: languages.includes(form.language ?? '') ? form.language : languages[0],
+    })
+  }
+
   return (
     <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/68 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="语音克隆测试表单">
-      <div className="ui-card w-full max-w-[620px] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.46)]">
+      <div className="ui-card max-h-[92vh] w-full max-w-[620px] overflow-y-auto !bg-[#061426] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.46)]">
         <div className="mb-4 flex items-center justify-between">
           <div>
             <h3 className="text-[20px] font-black text-white">语音克隆测试</h3>
-            <p className="mt-1 text-xs text-slate-500">POST /api/tasks/{'{taskId}'}/clone-voice</p>
+            <p className="mt-1 text-xs text-slate-500">选择文本、模型和参考标注后开始测试</p>
           </div>
           <button type="button" onClick={onClose} className="grid h-9 w-9 place-items-center rounded-full border border-cyan-300/14 bg-white/[0.035] text-slate-300 hover:text-white" aria-label="关闭语音克隆测试表单">
             <X className="h-4 w-4" />
@@ -1146,29 +2034,26 @@ function CloneVoiceModal({
             className="mt-2 min-h-[126px] w-full resize-none rounded-[7px] border border-cyan-300/14 bg-slate-950/70 px-3 py-3 text-sm leading-6 text-slate-100 outline-none transition focus:border-cyan-300"
           />
         </label>
-        <div className="mt-4 grid grid-cols-[1fr_150px_120px] gap-3">
-          <label className="text-sm font-bold text-slate-300">
-            克隆模型
-            <select
-              value={form.model}
-              onChange={(event) => {
-                const model = event.target.value
-                const selected = modelOptions.find((item) => item.value === model)
-                const languages = selected?.languages?.length ? selected.languages : languageOptions
-                onChange({ ...form, model, language: languages.includes(form.language ?? '') ? form.language : languages[0] })
-              }}
-              className="mt-2 h-10 w-full rounded-[7px] border border-cyan-300/14 bg-slate-950/70 px-3 text-slate-100 outline-none focus:border-cyan-300"
-            >
-              {modelOptions.map((item) => (
-                <option key={item.value} value={item.value} className="bg-slate-950 text-slate-100">
-                  {item.label}
-                </option>
-              ))}
-            </select>
-          </label>
+        <p className="mt-4 text-sm font-bold text-slate-300">模型</p>
+        <div className="mt-2 grid max-h-[176px] gap-2 overflow-y-auto pr-1 sm:grid-cols-2">
+          {visibleModels.map((item) => {
+            const unavailable = item.status !== undefined && item.status !== 'available'
+            const selected = form.model === item.value
+            return (
+              <div key={item.value} className={cn('relative flex min-h-12 items-center rounded-[7px] border px-2 py-2', selected ? 'border-cyan-300 bg-cyan-400/12' : 'border-cyan-300/14 bg-slate-950/55', unavailable && 'opacity-65')}>
+                <button type="button" disabled={unavailable} onClick={() => selectModel(item)} className={cn('min-w-0 flex-1 px-8 text-center text-sm font-bold', selected ? 'text-cyan-100' : 'text-slate-300', unavailable && 'cursor-not-allowed')}>
+                  <span className="block truncate">{item.label}</span>
+                  {unavailable ? <span className="mt-0.5 block truncate text-[10px] font-medium text-amber-200">{item.status}</span> : null}
+                </button>
+                <div className="absolute right-2 top-1/2 -translate-y-1/2"><ModelInfoButton model={item} onOpen={setInformationModel} /></div>
+              </div>
+            )
+          })}
+        </div>
+        <div className="mt-4 grid grid-cols-[1fr_120px] gap-3">
           <label className="text-sm font-bold text-slate-300">
             语言
-            <select value={form.language ?? 'auto'} onChange={(event) => onChange({ ...form, language: event.target.value })} className="mt-2 h-10 w-full rounded-[7px] border border-cyan-300/14 bg-slate-950/70 px-3 text-slate-100 outline-none focus:border-cyan-300">
+            <select value={form.language ?? 'auto'} onChange={(event) => onChange({ ...form, language: event.target.value })} className="mt-2 h-10 w-full rounded-[7px] border border-cyan-300/14 bg-slate-950 px-3 text-slate-100 outline-none focus:border-cyan-300">
               {languageOptions.map((item) => (
                 <option key={item} value={item} className="bg-slate-950 text-slate-100">
                   {item}
@@ -1178,7 +2063,7 @@ function CloneVoiceModal({
           </label>
           <label className="text-sm font-bold text-slate-300">
             语速
-            <select value={String(form.speed ?? 1)} onChange={(event) => onChange({ ...form, speed: Number(event.target.value) })} className="mt-2 h-10 w-full rounded-[7px] border border-cyan-300/14 bg-slate-950/70 px-3 text-slate-100 outline-none focus:border-cyan-300">
+            <select value={String(form.speed ?? 1)} onChange={(event) => onChange({ ...form, speed: Number(event.target.value) })} className="mt-2 h-10 w-full rounded-[7px] border border-cyan-300/14 bg-slate-950 px-3 text-slate-100 outline-none focus:border-cyan-300">
               {speedOptions.map((item) => (
                 <option key={item} value={item} className="bg-slate-950 text-slate-100">
                   {item}
@@ -1187,14 +2072,55 @@ function CloneVoiceModal({
             </select>
           </label>
         </div>
-        <label className="mt-4 block text-sm font-bold text-slate-300">
-          模型补充参数
-          <input value={form.speakerPrompt ?? ''} onChange={(event) => onChange({ ...form, speakerPrompt: event.target.value })} className="mt-2 h-10 w-full rounded-[7px] border border-cyan-300/14 bg-slate-950/70 px-3 text-slate-100 outline-none focus:border-cyan-300" placeholder="可选：speaker prompt / speaker id / voice id" />
-        </label>
+        {selectedModel?.promptRequired ? (
+          <div className="mt-4 rounded-[7px] border border-cyan-300/14 bg-slate-950/35 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <p className="text-sm font-bold text-slate-300">参考音频标注（必填）</p>
+              <div className="flex gap-2">
+                {(['manual', 'asr'] as const).map((source) => (
+                  <button key={source} type="button" onClick={() => onChange({ ...form, annotationSource: source, annotationAsrSubId: source === 'manual' ? undefined : form.annotationAsrSubId, annotationAsrModel: source === 'manual' ? undefined : form.annotationAsrModel, originalSpeakerPrompt: source === 'manual' ? undefined : form.originalSpeakerPrompt, protectedSpeakerPrompt: source === 'manual' ? undefined : form.protectedSpeakerPrompt })} className={cn('h-8 rounded-[6px] border px-3 text-xs font-black', (form.annotationSource ?? 'manual') === source ? 'border-cyan-300 bg-cyan-400/14 text-cyan-100' : 'border-cyan-300/12 text-slate-400')}>{annotationSourceLabel(source)}</button>
+                ))}
+              </div>
+            </div>
+            <div className="mt-3 rounded-[6px] border border-cyan-300/10 bg-cyan-300/[0.035] px-3 py-2 text-[11px] leading-5 text-slate-400">
+              {(form.annotationSource ?? 'manual') === 'asr' ? (
+                <><p>• ASR 标注同时包含原始音频转写与保护音频转写。</p><p>• 克隆原语音使用原始转写。</p><p>• 克隆保护语音使用保护转写。</p></>
+              ) : (
+                <><p>• 人工标注只有一条文本。</p><p>• 原始参考音频与保护参考音频共同使用该文本。</p></>
+              )}
+            </div>
+            {(form.annotationSource ?? 'manual') === 'manual' ? (
+              <input value={form.speakerPrompt ?? ''} onChange={(event) => onChange({ ...form, speakerPrompt: event.target.value, originalSpeakerPrompt: undefined, protectedSpeakerPrompt: undefined, annotationSource: 'manual', annotationAsrSubId: undefined, annotationAsrModel: undefined, annotationCreatedAt: undefined })} className="mt-3 h-10 w-full rounded-[7px] border border-cyan-300/14 bg-slate-950/70 px-3 text-slate-100 outline-none focus:border-cyan-300" placeholder="输入一条人工核对后的参考音频文本" />
+            ) : reusableAsrAnnotations.length || annotationSearch ? (
+              <div className="mt-3">
+                <div className="relative">
+                  <Search className="absolute left-3 top-3 h-4 w-4 text-slate-500" />
+                  <input value={annotationSearch} onChange={(event) => setAnnotationSearch(event.target.value)} className="h-10 w-full rounded-[7px] border border-violet-300/14 bg-slate-950/70 pl-9 pr-3 text-slate-100 outline-none focus:border-violet-300" placeholder="搜索最近 ASR 文本、模型或保护任务" />
+                </div>
+                <div className="mt-2 max-h-[150px] space-y-2 overflow-y-auto pr-1">
+                  {reusableAsrAnnotations.map((item) => (
+                    <button key={item.asrSubId} type="button" onClick={() => onChange({ ...form, annotationSource: 'asr', annotationAsrSubId: item.asrSubId, annotationAsrModel: item.asr?.model, annotationCreatedAt: item.createdAt ?? undefined, speakerPrompt: item.asr?.originalText ?? '', originalSpeakerPrompt: item.asr?.originalText ?? '', protectedSpeakerPrompt: item.asr?.protectedText ?? '' })} className={cn('w-full rounded-[7px] border p-3 text-left', form.annotationAsrSubId === item.asrSubId ? 'border-violet-300 bg-violet-400/12' : 'border-violet-300/12 bg-slate-950/50 hover:bg-violet-400/[0.06]')}>
+                      <p className="truncate text-xs font-black text-violet-100">{item.asr?.model ?? 'ASR'} · {item.createdAt ?? item.asrSubId}</p>
+                      <p className="mt-1 truncate text-xs leading-5 text-slate-300">原始：{item.asr?.originalText}</p>
+                      <p className="truncate text-xs leading-5 text-slate-400">保护：{item.asr?.protectedText}</p>
+                    </button>
+                  ))}
+                  {!reusableAsrAnnotations.length ? <p className="py-3 text-center text-xs text-slate-500">没有匹配的 ASR 标注</p> : null}
+                </div>
+              </div>
+            ) : (
+              <button type="button" onClick={onOpenAsr} className="mt-3 w-full rounded-[7px] border border-dashed border-violet-300/25 bg-violet-400/[0.06] px-3 py-4 text-sm font-black text-violet-100 hover:bg-violet-400/10">当前没有 ASR 标注，先运行 ASR 测试</button>
+            )}
+          </div>
+        ) : null}
         {error ? <p className="mt-4 rounded-[7px] border border-red-300/20 bg-red-400/10 px-3 py-2 text-sm text-red-100">{error}</p> : null}
         <div className="mt-5 flex justify-end gap-3">
           <button type="button" onClick={onClose} className="h-10 rounded-[7px] border border-cyan-300/14 bg-white/[0.035] px-4 text-sm font-bold text-slate-300">
             取消
+          </button>
+          <button type="button" onClick={onQuickSubmit} disabled={loading} className="inline-flex h-10 min-w-[128px] items-center justify-center gap-2 rounded-[7px] border border-cyan-300/22 bg-cyan-400/8 px-4 text-sm font-black text-cyan-100 hover:bg-cyan-400/14 disabled:opacity-60">
+            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+            一键克隆
           </button>
           <button type="button" onClick={onSubmit} disabled={loading} className="cyan-button inline-flex h-10 min-w-[128px] items-center justify-center gap-2 rounded-[7px] px-4 text-sm font-black disabled:opacity-60">
             {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <TestTube2 className="h-4 w-4" />}
@@ -1202,6 +2128,7 @@ function CloneVoiceModal({
           </button>
         </div>
       </div>
+      <ModelInformationModal model={informationModel} modelTypes={modelTypes} onClose={() => setInformationModel(null)} />
     </div>
   )
 }
@@ -1245,7 +2172,7 @@ function AudioCard({
           src={src}
           title={title}
           filename={audio.filename}
-          disabledReason={green ? '点击播放时将从后端下载保护音频' : '暂无原始音频 URL'}
+          disabledReason={green ? '点击播放时将在线获取保护音频' : '暂无原始音频 URL'}
           downloadable={Boolean(src)}
           downloadFilename={audio.filename}
           onPlayRequest={onPlayRequest}
@@ -1253,7 +2180,7 @@ function AudioCard({
       </div>
       <div className="mt-3 flex flex-wrap gap-x-6 gap-y-2 border-t border-cyan-300/10 pt-3 pb-1 text-[12px] text-slate-400">
         <span>时长 {duration ? `${duration.toFixed(2)}s` : '待解析'}</span>
-        <span>采样率 {audio.sampleRate ? `${audio.sampleRate / 1000}kHz` : '待解析'}</span>
+        <span>采样率 {audio.sampleRate ? `${(audio.sampleRate / 1000).toFixed(2)}kHz` : '待解析'}</span>
         <span>声道 {audio.channels ?? '待解析'}</span>
         <span>格式 {audio.format}</span>
         <span>大小 {formatFileSize(audio.sizeBytes)}</span>
@@ -1264,13 +2191,78 @@ function AudioCard({
 
 function TextBox({ title, text, foot, content }: { title: string; text: string; foot: string; content?: ReactNode }) {
   return (
-    <div className="flex h-[226px] flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/18 p-4">
-      <h3 className="mb-3 whitespace-nowrap text-sm font-bold text-slate-300">{title}</h3>
-      <div className="min-h-[122px] overflow-y-auto rounded-[7px] border border-cyan-300/8 bg-slate-950/22 p-4 text-[13px] leading-6 text-slate-200">
+    <div className="flex h-full flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/18 p-4">
+      <div className="mb-3 flex items-start gap-2">
+        <h3 className="min-w-0 flex-1 whitespace-nowrap text-sm font-bold text-slate-300">{title}</h3>
+        <MetricInfoButton title={title}>{foot}</MetricInfoButton>
+      </div>
+      <div className="mb-3 h-[156px] shrink-0 overflow-y-auto rounded-[7px] border border-cyan-300/8 bg-slate-950/22 px-4 py-3 text-[13px] leading-6 text-slate-200">
         {content ?? text}
       </div>
-      <p className="mt-auto truncate pt-4 text-[12px] text-slate-500">{foot}</p>
     </div>
+  )
+}
+
+function BatchProgressModal({ batch, onClose }: { batch: EvaluationBatch | null; onClose: () => void }) {
+  useEffect(() => {
+    if (!batch) return undefined
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [batch, onClose])
+  if (!batch) return null
+  const progress = clamp(optionalNumber(batch.progress) ?? 0, 0, 1)
+  const progressPercent = Math.round(progress * 100)
+  const tone = progressTone(batch.status)
+  const title = batch.type === 'asr' ? '一键 ASR 测试进度' : '一键克隆测试进度'
+  return createPortal(
+    <div className="fixed inset-0 z-[150] grid place-items-center bg-slate-950/80 px-4 py-8 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label={title} onClick={onClose}>
+      <div className="ui-card flex max-h-full w-full max-w-[900px] flex-col overflow-hidden !bg-[#061426] p-5 shadow-[0_28px_90px_rgba(0,0,0,0.62)]" onClick={(event) => event.stopPropagation()}>
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h3 className="text-xl font-black text-white">{title}</h3>
+            <p className="mt-1 font-mono text-xs text-slate-500">{batch.batchId}</p>
+          </div>
+          <button type="button" onClick={onClose} className="grid h-9 w-9 place-items-center rounded-full border border-cyan-300/14 text-slate-300 hover:text-white" aria-label="关闭"><X className="h-4 w-4" /></button>
+        </div>
+        <div className="mt-5 rounded-[9px] border border-violet-300/16 bg-violet-400/[0.07] p-4">
+          <div className="flex flex-wrap items-center justify-between gap-3 text-sm">
+            <span className="font-black text-violet-100">整体 {progressPercent}% · {lifecycleStatusLabel(batch.status)}</span>
+            <span className="text-slate-400">完成 {batch.completedCount}/{batch.totalCount} · 失败 {batch.failedCount}</span>
+          </div>
+          <div className="history-progress-track mt-3 h-2 overflow-hidden rounded-full bg-slate-800"><div className={cn('h-full rounded-full transition-all duration-300', tone.fill)} style={{ width: `${progressPercent}%` }} /></div>
+          <p className="mt-2 text-xs text-slate-500">整体进度取全部预期子任务的最小有效进度；终态成功或失败均按 100% 参与计算。</p>
+        </div>
+        <div className="mt-4 min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
+          {batch.items.map((item) => {
+            const itemProgress = clamp(optionalNumber(item.progress) ?? 0, 0, 1)
+            const itemPercent = Math.round(itemProgress * 100)
+            const itemTone = progressTone(item.status)
+            const itemError = typeof item.error === 'string' ? item.error : item.error?.message
+            const modelLabel = item.modelName || (batch.type === 'asr' ? shortAsrModelName(item.model) : shortCloneModelName(item.model))
+            return (
+              <div key={item.batchItemId} className={cn('rounded-[8px] border p-3', ['failed', 'error', 'cancelled'].includes(String(item.status).toLowerCase()) ? 'border-rose-300/18 bg-rose-400/[0.05]' : 'border-cyan-300/10 bg-slate-950/24')}>
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="truncate font-black text-slate-100" title={item.model}>{modelLabel}</p>
+                    <p className="mt-0.5 text-[11px] text-slate-500">{item.modelType || (batch.type === 'asr' ? 'ASR' : 'TTS 克隆')}{item.annotationSource ? ` · ${annotationSourceLabel(item.annotationSource)}` : ''}</p>
+                  </div>
+                  <div className="shrink-0 text-right">
+                    <p className={cn('font-mono text-xs font-black', itemTone.text)}>{itemPercent}% · {lifecycleStatusLabel(item.status)}</p>
+                    <p className="mt-0.5 font-mono text-[10px] text-slate-500">{optionalNumber(item.elapsedSec) !== null ? seconds(optionalNumber(item.elapsedSec) as number) : '—'}</p>
+                  </div>
+                </div>
+                <div className="history-progress-track mt-2 h-1.5 overflow-hidden rounded-full bg-slate-800"><div className={cn('h-full rounded-full transition-all duration-300', itemTone.fill)} style={{ width: `${itemPercent}%` }} /></div>
+                <p className={cn('mt-2 truncate text-xs', itemError ? 'text-rose-300' : 'text-slate-400')} title={itemError || item.message || undefined}>{itemError || item.message || '等待后端更新任务阶段'}</p>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    </div>,
+    document.body,
   )
 }
 
@@ -1417,106 +2409,18 @@ function renderDiffOps(diffOps: DiffOp[]): ReactNode[] {
   return nodes
 }
 
-function ScoreBox({ label, value, red, compact, foot }: { label: ReactNode; value: string; red?: boolean; compact?: boolean; foot?: string }) {
+function ScoreBox({ label, value, red, compact, foot }: { label: ReactNode; value: string; red?: boolean; compact?: boolean; foot?: ReactNode }) {
   return (
-    <div className={cn('rounded-[9px] border border-cyan-300/12 bg-slate-950/16 text-center', compact ? 'min-h-[64px] p-2.5' : 'min-h-[82px] p-3')}>
-      <p className="mx-auto max-w-full text-[11px] leading-4 text-slate-400">{label}</p>
+    <div className={cn('relative rounded-[9px] border border-cyan-300/12 bg-slate-950/16 text-center', compact ? 'p-2.5' : 'p-3')}>
+      <div className={cn('relative', compact ? 'min-h-9' : 'min-h-8')}>
+        <p className={cn('absolute inset-x-0 top-1/2 line-clamp-2 -translate-y-1/2 break-words px-8 text-center font-black text-slate-300', compact ? 'text-[12px] leading-4' : 'text-[13px] leading-5')}>{label}</p>
+        {foot ? <div className="absolute right-0 top-1/2 -translate-y-1/2"><MetricInfoButton title={label}>{foot}</MetricInfoButton></div> : null}
+      </div>
       <div className="mt-2 grid justify-items-center">
         <span className={cn(compact ? 'text-[19px]' : 'text-[24px]', 'break-words font-black leading-none', red ? 'text-red-300' : 'text-cyan-300')}>
           {value}
         </span>
       </div>
-      {foot ? <p className="mt-1 line-clamp-2 text-[10px] leading-4 text-slate-500" title={foot}>{foot}</p> : null}
-    </div>
-  )
-}
-
-const metricGuideGridClass = 'grid grid-cols-[minmax(92px,0.8fr)_64px_minmax(110px,0.9fr)_minmax(0,1.8fr)] gap-x-3 max-md:grid-cols-[minmax(80px,0.8fr)_56px_minmax(92px,0.9fr)_minmax(0,1.6fr)] max-md:gap-x-2'
-
-function MetricGuide() {
-  const rows: Array<{ key: string; name: ReactNode; unit: string; range: string; description: string }> = [
-    {
-      key: 'l2',
-      name: <span className="inline-flex items-center gap-1"><MathText formula="L_2" /> 扰动强度</span>,
-      unit: '无量纲',
-      range: '≥ 0，随音频长度变化',
-      description: '整段音频的总体改动量，越小越接近原音。',
-    },
-    {
-      key: 'epsilon',
-      name: '扰动上限利用率',
-      unit: '%',
-      range: '0%～100%',
-      description: '已使用的扰动预算比例，越接近 100% 表示越接近设定上限。',
-    },
-    {
-      key: 'snr',
-      name: 'SNR',
-      unit: 'dB',
-      range: '无固定范围，可为负值',
-      description: '原始语音与扰动噪声的强弱比，数值越高，音频越接近原音。',
-    },
-    {
-      key: 'pesq',
-      name: 'PESQ',
-      unit: '分',
-      range: '约 -0.5～4.7',
-      description: '模拟人耳评价语音质量，分数越高，听感越好。',
-    },
-    {
-      key: 'stoi',
-      name: 'STOI',
-      unit: '无量纲',
-      range: '0～1',
-      description: '衡量语音是否容易听懂，越接近 1，可懂度越高。',
-    },
-    {
-      key: 'mos',
-      name: 'MOS（人工）',
-      unit: '分',
-      range: '1～5',
-      description: '人工试听给出的主观质量评分，分数越高，听感越好。',
-    },
-  ]
-
-  return (
-    <section className="mt-4 min-h-0 flex-1 overflow-x-hidden overflow-y-auto rounded-[8px] border border-cyan-300/12 bg-slate-950/16 max-xl:max-h-[248px] max-xl:flex-none" aria-labelledby="metric-guide-title">
-      <div className="min-w-0 pr-1">
-        <div className="px-3 pb-2 pt-3">
-          <h3 id="metric-guide-title" className="text-[13px] font-black text-slate-200">指标说明</h3>
-          <div className={cn(metricGuideGridClass, 'mt-2 text-[10px] leading-4 text-slate-500')}>
-            <span>指标</span>
-            <span>单位</span>
-            <span>参考范围</span>
-            <span>衡量内容</span>
-          </div>
-        </div>
-        <div className="border-t border-cyan-300/10">
-          {rows.map((row) => (
-            <div key={row.key} className={cn(metricGuideGridClass, 'border-b border-cyan-300/8 px-3 py-2.5 text-[11px] leading-5 last:border-b-0')}>
-              <span className="min-w-0 break-words font-bold text-slate-300">{row.name}</span>
-              <span className="whitespace-nowrap text-slate-400">{row.unit}</span>
-              <span className="min-w-0 break-words text-slate-400">{row.range}</span>
-              <span className="min-w-0 break-words text-slate-400">{row.description}</span>
-            </div>
-          ))}
-        </div>
-      </div>
-    </section>
-  )
-}
-
-function DeltaStatCard({ title, before, after, delta, foot, tone }: { title: string; before: string; after: string; delta: string; foot: string; tone: 'green' | 'red' }) {
-  return (
-    <div className="min-h-[180px] rounded-[9px] border border-cyan-300/12 bg-slate-950/16 p-4">
-      <h3 className="min-h-[40px] text-[13px] font-bold leading-5 text-slate-300">{title}</h3>
-      <div className="mt-3 grid grid-cols-[minmax(0,1fr)_28px_minmax(0,1fr)] items-center text-center text-[20px]">
-        <span className="min-w-0 break-words text-slate-200">{before}</span>
-        <span className="text-slate-400">→</span>
-        <span className="min-w-0 break-words text-emerald-300">{after}</span>
-      </div>
-      <div className={cn('mt-2 rounded-[5px] py-2 text-center font-black', tone === 'green' ? 'bg-emerald-400/14 text-emerald-300' : 'bg-red-400/12 text-red-300')}>{delta}</div>
-      <p className="mt-2 text-[11px] leading-4 text-slate-500">{foot}</p>
     </div>
   )
 }
@@ -1527,7 +2431,15 @@ function QualityPanel({ result, embedded }: { result: TaskResult; embedded?: boo
   const stoi = optionalNumber(result.protectionQuality?.stoi)
   const backendMos = optionalNumber(result.protectionQuality?.mos)
   const manualMosKey = `manual-mos:${result.taskId || 'current'}`
-  const [manualMos, setManualMos] = useState<number | null>(null)
+  const readManualMos = (key: string) => {
+    const saved = window.localStorage.getItem(key)
+    if (saved === null) return null
+    const value = Number(saved)
+    return Number.isFinite(value) ? clamp(value, 1, 5) : null
+  }
+  const [manualMosState, setManualMosState] = useState<{ key: string; value: number | null }>(() => ({ key: manualMosKey, value: readManualMos(manualMosKey) }))
+  const manualMos = manualMosState.key === manualMosKey ? manualMosState.value : readManualMos(manualMosKey)
+  const setManualMos = (value: number | null) => setManualMosState({ key: manualMosKey, value })
   const [editingMos, setEditingMos] = useState(false)
   const [mosDraft, setMosDraft] = useState('')
   const mos = backendMos ?? manualMos
@@ -1535,16 +2447,6 @@ function QualityPanel({ result, embedded }: { result: TaskResult; embedded?: boo
     pesq === null ? ['PESQ', metricReason(result, ['protectionQuality.pesq'])] : null,
     stoi === null ? ['STOI', metricReason(result, ['protectionQuality.stoi'])] : null,
   ].filter((item): item is [string, string] => Boolean(item?.[1]))
-
-  useEffect(() => {
-    const saved = window.localStorage.getItem(manualMosKey)
-    if (saved === null) {
-      setManualMos(null)
-      return
-    }
-    const value = Number(saved)
-    setManualMos(Number.isFinite(value) ? clamp(value, 1, 5) : null)
-  }, [manualMosKey])
 
   const startMosEdit = () => {
     if (backendMos !== null) return
@@ -1575,11 +2477,11 @@ function QualityPanel({ result, embedded }: { result: TaskResult; embedded?: boo
     <section className={cn(embedded ? 'mt-5' : 'ui-card p-5')}>
       <SectionTitle>感知质量评估</SectionTitle>
       <div className="mt-5 grid grid-cols-[repeat(auto-fit,minmax(132px,1fr))] gap-3">
-        <QualityMetric label="SNR（信噪比）" value={formatMetricValue(snr, 'db')} tag={snr === null ? '未生成' : 'computed'} tone="green" />
-        <QualityMetric label="PESQ" value={formatMetricValue(pesq, 'number')} tag={pesq === null ? '未生成' : 'perception'} tone="blue" />
-        <QualityMetric label="STOI" value={formatMetricValue(stoi, 'number')} tag={stoi === null ? '未生成' : 'perception'} tone="blue" />
+        <QualityMetric label="SNR" value={formatMetricValue(snr, 'db')} tag={snr === null ? '未生成' : '信噪比'} tone="green" foot="原始语音与扰动噪声的强弱比；数值越高，音频越接近原音。" />
+        <QualityMetric label="PESQ" value={formatMetricValue(pesq, 'number')} tag={pesq === null ? '未生成' : '听感质量'} tone="blue" foot="模拟人耳评价语音质量，分数越高表示听感越好。" />
+        <QualityMetric label="STOI" value={formatMetricValue(stoi, 'number')} tag={stoi === null ? '未生成' : '可懂度'} tone="blue" foot="衡量语音是否容易听懂，越接近 1 表示可懂度越高。" />
         <QualityMetric
-          label="MOS（人工）"
+          label="人工MOS"
           value={
             editingMos ? (
               <input
@@ -1609,6 +2511,7 @@ function QualityPanel({ result, embedded }: { result: TaskResult; embedded?: boo
           tag={backendMos === null ? (manualMos === null ? '点击输入' : '人工反馈') : 'perception'}
           title={backendMos === null ? '点击输入 1-5 分人工 MOS' : undefined}
           tone="orange"
+          foot="人工试听给出的主观质量评分，范围为 1–5 分；分数越高表示听感越好。"
         />
       </div>
       {missingReasons.length ? (
@@ -1644,18 +2547,6 @@ function PsychoacousticPanel({ result }: { result: TaskResult }) {
         : '当前显示指定时间附近的单帧心理声学曲线。'
       : '该图为 STFT 时频结果沿时间帧取平均后的频率维曲线。'
 
-  useEffect(() => {
-    setPsychoMode('mean')
-    setSelectedTimeSec(null)
-    setActualTimeSec(null)
-    setFrameIndex(null)
-    setSliceData(null)
-    setTimeDialogOpen(false)
-    setTimeDraft('')
-    setSliceError(null)
-    setModeMenuOpen(false)
-  }, [result.taskId])
-
   const restoreMeanMode = () => {
     setPsychoMode('mean')
     setSelectedTimeSec(null)
@@ -1676,7 +2567,7 @@ function PsychoacousticPanel({ result }: { result: TaskResult }) {
   const confirmFrameTime = async () => {
     const duration = optionalNumber(audioDurationSec)
     if (duration === null) {
-      setSliceError('后端未返回音频时长，暂无法指定时间帧。')
+      setSliceError('暂未获取音频时长，无法指定时间帧。')
       return
     }
     const timeValue = Number(timeDraft)
@@ -1705,9 +2596,12 @@ function PsychoacousticPanel({ result }: { result: TaskResult }) {
 
   return (
     <>
-      <section className="flex min-h-[296px] flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
+      <section className="flex h-full min-h-0 flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
         <div className="flex items-center justify-between gap-4 max-md:flex-wrap">
-          <SectionTitle>心理声学阈值分析</SectionTitle>
+          <div className="flex items-center gap-2">
+            <SectionTitle>心理声学阈值分析</SectionTitle>
+            <MetricInfoButton title="心理声学阈值分析">{modeDescription}</MetricInfoButton>
+          </div>
           <div className="flex min-w-[180px] flex-1 justify-center">
             <PsychoacousticModeDropdown label={modeLabel} open={modeMenuOpen} onToggle={() => setModeMenuOpen((open) => !open)} onMean={restoreMeanMode} onFrame={openFrameDialog} />
           </div>
@@ -1723,16 +2617,15 @@ function PsychoacousticPanel({ result }: { result: TaskResult }) {
           </div>
         </div>
         <div className="mt-5 min-h-0 flex-1 overflow-hidden rounded-[9px] border border-cyan-300/12 bg-slate-950/16 px-4 py-3">
-          <LineChart result={result} large pointsOverride={chartPoints} />
+          <LineChart key={`${result.taskId}:${psychoMode}:${frameIndex ?? 'mean'}:${chartPoints.length}`} result={result} large pointsOverride={chartPoints} />
         </div>
-        <p className="mt-3 text-[11px] leading-5 text-slate-500">{modeDescription}</p>
         {sliceError && !timeDialogOpen ? <p className="mt-2 text-[11px] text-rose-300">{sliceError}</p> : null}
       </section>
 
       {timeDialogOpen ? (
         <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/68 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="选择心理声学分析时间点">
           <form
-            className="ui-card w-full max-w-[440px] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.46)]"
+            className="ui-card w-full max-w-[440px] !bg-[#061426] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.46)]"
             onSubmit={(event) => {
               event.preventDefault()
               void confirmFrameTime()
@@ -1796,7 +2689,7 @@ function PsychoacousticModeDropdown({ label, open, onToggle, onMean, onFrame }: 
         <ChevronDown className={cn('h-3.5 w-3.5 transition', open && 'rotate-180')} />
       </button>
       {open ? (
-        <div className="absolute left-1/2 top-11 z-20 w-[180px] -translate-x-1/2 rounded-[8px] border border-cyan-300/18 bg-slate-950/95 p-1 shadow-[0_18px_45px_rgba(0,0,0,0.42)]" role="menu">
+        <div className="absolute left-1/2 top-11 z-20 w-[180px] -translate-x-1/2 rounded-[8px] border border-cyan-300/18 bg-slate-950 p-1 shadow-[0_18px_45px_rgba(0,0,0,0.42)]" role="menu">
           <button type="button" onClick={onMean} className="block h-9 w-full rounded-[6px] px-3 text-left text-[12px] font-bold text-slate-200 hover:bg-cyan-300/[0.08] hover:text-cyan-100" role="menuitem">
             t 平均聚合
           </button>
@@ -1809,10 +2702,10 @@ function PsychoacousticModeDropdown({ label, open, onToggle, onMean, onFrame }: 
   )
 }
 
-function QualityMetric({ label, value, tag, tone, onClick, title }: { label: string; value: ReactNode; tag: string; tone: 'green' | 'blue' | 'orange'; onClick?: () => void; title?: string }) {
+function QualityMetric({ label, value, tag, tone, onClick, title, foot }: { label: string; value: ReactNode; tag: string; tone: 'green' | 'blue' | 'orange'; onClick?: () => void; title?: string; foot?: ReactNode }) {
   return (
     <div
-      className={cn('h-[86px] rounded-[9px] border border-cyan-300/12 bg-slate-950/16 p-3 text-center', onClick && 'cursor-pointer transition hover:border-orange-300/28 hover:bg-orange-300/[0.04]')}
+      className={cn('relative rounded-[9px] border border-cyan-300/12 bg-slate-950/16 px-3 py-3.5 text-center', onClick && 'cursor-pointer transition hover:border-orange-300/28 hover:bg-orange-300/[0.04]')}
       onClick={onClick}
       onKeyDown={(event) => {
         if (!onClick) return
@@ -1825,7 +2718,10 @@ function QualityMetric({ label, value, tag, tone, onClick, title }: { label: str
       tabIndex={onClick ? 0 : undefined}
       title={title}
     >
-      <p className="whitespace-nowrap text-[11px] text-slate-400">{label}</p>
+      <div className="relative min-h-7">
+        <p className="absolute inset-x-0 top-1/2 -translate-y-1/2 truncate px-8 text-center text-[12px] font-black text-slate-300">{label}</p>
+        {foot ? <div className="absolute right-0 top-1/2 -translate-y-1/2"><MetricInfoButton title={label}>{foot}</MetricInfoButton></div> : null}
+      </div>
       <div className={cn('mt-1 flex h-6 items-center justify-center text-[20px] font-black leading-none', tone === 'green' && 'text-emerald-300', tone === 'blue' && 'text-cyan-300', tone === 'orange' && 'text-orange-300')}>{value}</div>
       <span className={cn('mt-1.5 inline-block rounded px-3 py-0.5 text-[11px] font-bold', tone === 'green' && 'bg-emerald-400/14 text-emerald-300', tone === 'blue' && 'bg-cyan-400/14 text-cyan-300', tone === 'orange' && 'bg-orange-400/14 text-orange-300')}>{tag}</span>
     </div>
@@ -1846,7 +2742,7 @@ const lossDefinitions: LossDefinition[] = [
   },
   { key: 'Lsem', formula: 'L_{\\mathrm{sem}}', label: '语义保护目标', description: '语义链路保护目标', colorClass: 'bg-emerald-300' },
   { key: 'Lpsy', formula: 'L_{\\mathrm{psy}}', label: '心理声学目标', description: '心理声学保真目标', colorClass: 'bg-amber-300' },
-  { key: 'L2', formula: 'L_2', altFormula: '\\lVert\\delta\\rVert_2', label: '扰动能量约束', description: '扰动范数约束', colorClass: 'bg-violet-300' },
+  { key: 'L2', formula: 'L_2', label: '扰动能量约束', description: '扰动范数约束', colorClass: 'bg-violet-300' },
   { key: 'total', formula: 'L_{\\mathrm{total}}', label: '总优化目标', description: '加权总损失', colorClass: 'bg-rose-300' },
 ]
 
@@ -1878,7 +2774,7 @@ function TrendPanel({ result, embedded }: { result: TaskResult; embedded?: boole
               </div>
             ) : (
               <div className="grid min-h-[210px] flex-1 place-items-center rounded-[6px] border border-dashed border-cyan-300/14 bg-slate-950/16 px-5 text-center text-[12px] leading-5 text-slate-400">
-                后端未记录逐步优化损失，当前仅可在详细数据中查看最终 loss。
+                暂未记录逐步优化损失，当前仅可在详细数据中查看最终 loss。
               </div>
             )}
           </div>
@@ -1894,13 +2790,12 @@ function TrendPanel({ result, embedded }: { result: TaskResult; embedded?: boole
                 </p>
                 <p className="text-[13px] font-black text-white">{formatLossNumber(lossFinalValue(lossFinal, loss))}</p>
               </div>
-              <p className="mt-1 text-[10px] text-slate-500">{loss.description}</p>
             </div>
           ))}
           <div className="rounded-[7px] border border-cyan-300/12 bg-slate-950/20 px-5 py-5">
             <div className="flex items-center justify-between gap-4">
               <p className="text-[11px] font-bold text-slate-400">平均每次迭代耗时</p>
-              <p className="text-[14px] font-black text-cyan-200">{avgIterationSec === null ? '未生成' : `${avgIterationSec.toFixed(3)} s / step`}</p>
+              <p className="text-[14px] font-black text-cyan-200">{avgIterationSec === null ? '未生成' : `${avgIterationSec.toFixed(2)} s / step`}</p>
             </div>
             <div className="mt-3 flex items-center justify-between gap-4 border-t border-cyan-300/10 pt-3">
               <p className="text-[11px] font-bold text-slate-400">总共迭代步数</p>
@@ -1913,7 +2808,7 @@ function TrendPanel({ result, embedded }: { result: TaskResult; embedded?: boole
         <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-500">
           {missingLosses.map((loss) => (
             <span key={loss.key}>
-              <MathText formula={loss.formula} className="align-[-1px]" />：后端未返回
+              <MathText formula={loss.formula} className="align-[-1px]" />：暂未生成
             </span>
           ))}
         </div>
@@ -1970,7 +2865,7 @@ function RichMathText({ text }: { text: string }) {
 
 function taskInfoRows(result: TaskResult): Array<[string, string]> {
   return [
-    ['任务 ID', result.taskId],
+    ['保护任务', result.taskId],
     ['提交时间', result.submittedAt ?? result.createdAt ?? result.originalAudio.uploadedAt ?? '-'],
     ['完成时间', result.completedAt ?? '-'],
     ['处理耗时', typeof result.elapsedSec === 'number' ? formatElapsed(result.elapsedSec) : '-'],
@@ -1986,11 +2881,11 @@ function taskInfoRows(result: TaskResult): Array<[string, string]> {
 function TaskInfoModal({ result, onClose }: { result: TaskResult; onClose: () => void }) {
   return (
     <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/68 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="任务信息">
-      <div className="ui-card w-full max-w-[560px] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.46)]">
+      <div className="ui-card w-full max-w-[560px] !bg-[#061426] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.46)]">
         <div className="mb-4 flex items-center justify-between gap-4">
           <div>
             <h3 className="text-[20px] font-black text-white">任务信息</h3>
-            <p className="mt-1 text-xs text-slate-500">GET /api/tasks/{'{taskId}'}/details</p>
+            <p className="mt-1 text-xs text-slate-500">查看本次保护任务的完整配置与状态</p>
           </div>
           <button type="button" onClick={onClose} className="grid h-9 w-9 place-items-center rounded-full border border-cyan-300/14 bg-white/[0.035] text-slate-300 hover:text-white" aria-label="关闭任务信息">
             <X className="h-4 w-4" />
@@ -2013,25 +2908,11 @@ function DownloadModal({ result, onClose }: { result: TaskResult; onClose: () =>
   const navigate = useNavigate()
   const pushToast = useAppStore((state) => state.pushToast)
 
-  const runDownload = async (kind: 'audio' | 'report' | 'zip') => {
+  const runDownload = async () => {
     try {
-      let blob: Blob
-      let filename: string
-
-      if (kind === 'audio') {
-        const file = await downloadProtectedAudio(result.taskId)
-        blob = file.blob
-        filename = file.filename
-      } else if (kind === 'report') {
-        blob = await exportReport(result.taskId)
-        filename = `${result.taskId}-report.pdf`
-      } else {
-        blob = await downloadEvidenceZip(result.taskId)
-        filename = `${result.taskId}-evidence.zip`
-      }
-
-      downloadBlob(blob, filename)
-      pushToast({ kind: 'success', title: '下载已开始', description: filename })
+      const file = await downloadProtectedAudio(result.taskId)
+      downloadBlob(file.blob, file.filename)
+      pushToast({ kind: 'success', title: '下载已开始', description: file.filename })
     } catch (error) {
       pushToast({ kind: 'error', title: '导出暂不可用', description: error instanceof Error ? error.message : '请稍后重试。' })
     }
@@ -2039,7 +2920,7 @@ function DownloadModal({ result, onClose }: { result: TaskResult; onClose: () =>
 
   return (
     <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/68 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="下载与导出">
-      <div className="ui-card w-full max-w-[520px] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.46)]">
+      <div className="ui-card w-full max-w-[520px] !bg-[#061426] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.46)]">
         <div className="mb-5 flex items-center justify-between gap-4">
           <div>
             <h3 className="text-[20px] font-black text-white">{result.verdict || '防护结果已生成'}</h3>
@@ -2049,24 +2930,17 @@ function DownloadModal({ result, onClose }: { result: TaskResult; onClose: () =>
             <X className="h-4 w-4" />
           </button>
         </div>
-        <button onClick={() => void runDownload('audio')} className="cyan-button flex h-12 w-full items-center justify-center gap-2 rounded-[8px] text-[16px] font-black">
+        <button onClick={() => void runDownload()} className="cyan-button flex h-12 w-full items-center justify-center gap-2 rounded-[8px] text-[16px] font-black">
           <Download className="h-4 w-4" />
           下载保护音频
         </button>
-        {['导出评估报告（PDF）', '下载完整证据链（ZIP）', '重新执行任务'].map((item, index) => (
-          <button
-            key={item}
-            onClick={() => {
-              if (index === 0) void runDownload('report')
-              if (index === 1) void runDownload('zip')
-              if (index === 2) navigate('/workspace')
-            }}
-            className="mt-4 flex h-12 w-full items-center justify-center gap-2 rounded-[8px] border border-cyan-300/12 bg-white/[0.035] text-[16px] font-bold text-slate-300"
-          >
-            {index === 0 ? <FileText className="h-4 w-4" /> : index === 1 ? <FileArchive className="h-4 w-4" /> : <RefreshCw className="h-4 w-4" />}
-            {item}
-          </button>
-        ))}
+        <button
+          onClick={() => navigate('/workspace')}
+          className="mt-4 flex h-12 w-full items-center justify-center gap-2 rounded-[8px] border border-cyan-300/12 bg-white/[0.035] text-[16px] font-bold text-slate-300"
+        >
+          <RefreshCw className="h-4 w-4" />
+          重新执行任务
+        </button>
       </div>
     </div>
   )
@@ -2075,38 +2949,52 @@ function DownloadModal({ result, onClose }: { result: TaskResult; onClose: () =>
 function formatFileSize(bytes: number) {
   if (!Number.isFinite(bytes) || bytes <= 0) return '未生成'
   if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(2)}MB`
-  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)}KB`
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(2)}KB`
   return `${bytes}B`
 }
 
 function formatMetricValue(value: unknown, type: 'percent' | 'db' | 'seconds' | 'loss' | 'bytes' | 'number') {
   const numberValue = optionalNumber(value)
   if (numberValue === null) return '未生成'
-  if (type === 'percent') return `${(numberValue <= 1 ? numberValue * 100 : numberValue).toFixed(1)}%`
-  if (type === 'db') return `${numberValue.toFixed(1)} dB`
-  if (type === 'seconds') return `${numberValue.toFixed(3)} s`
+  if (type === 'percent') return `${(numberValue <= 1 ? numberValue * 100 : numberValue).toFixed(2)}%`
+  if (type === 'db') return `${numberValue.toFixed(2)} dB`
+  if (type === 'seconds') return `${numberValue.toFixed(2)} s`
   if (type === 'loss') return formatLossNumber(numberValue)
   if (type === 'bytes') return formatFileSize(numberValue)
-  return numberValue.toFixed(3).replace(/\.?0+$/, '')
+  return numberValue.toFixed(2)
+}
+
+function friendlyAsrFailure(reason?: string | null) {
+  const value = String(reason || '').trim()
+  if (!value) return '模型未返回可用转写文本，请重新测试。'
+  if (/cannot import name ['"]pipeline['"].*transformers/i.test(value)) return 'Wav2Vec2 运行环境初始化失败；该条历史任务没有产生转写文本，请重新测试。'
+  if (/out of memory|cuda.*memory/i.test(value)) return '显存不足，模型未能完成转写，请稍后重新测试。'
+  if (/missing|not found|no such file/i.test(value)) return '模型文件不完整或不可用，请检查模型部署后重新测试。'
+  return value.split('\n')[0]
 }
 
 function formatRatioPercent(value: unknown, options?: { clampToUnit?: boolean }) {
   const numberValue = optionalNumber(value)
   if (numberValue === null) return '未生成'
   const normalized = options?.clampToUnit ? clamp(numberValue, 0, 1) : numberValue
-  return `${(normalized * 100).toFixed(1)}%`
+  return `${(normalized * 100).toFixed(2)}%`
 }
 
 function formatRadarScore(value: unknown) {
   const numberValue = optionalNumber(value)
   if (numberValue === null) return '未生成'
-  return `${clamp(numberValue, 0, 100).toFixed(1)} 分`
+  return `${clamp(numberValue, 0, 100).toFixed(2)} 分`
 }
 
-function formatSpeakerEvalModel(value: unknown) {
-  const label = typeof value === 'string' && value.trim() ? value.trim() : 'ECAPA-TDNN'
-  if (label === 'speechbrain/spkrec-ecapa-voxceleb' || /spkrec-ecapa-voxceleb/i.test(label)) return 'ECAPA-TDNN'
-  return label
+function formatTaskTime(value?: string | null) {
+  if (!value) return '时间未记录'
+  const dotted = value.trim().match(/^(\d{4})\.(\d{1,2})\.(\d{1,2})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/)
+  const date = dotted
+    ? new Date(Number(dotted[1]), Number(dotted[2]) - 1, Number(dotted[3]), Number(dotted[4] ?? 0), Number(dotted[5] ?? 0), Number(dotted[6] ?? 0))
+    : new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  const pad = (input: number) => String(input).padStart(2, '0')
+  return `${date.getFullYear()}.${date.getMonth() + 1}.${date.getDate()} ${date.getHours()}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
 
 function optionalNumber(value: unknown) {
@@ -2119,7 +3007,8 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value))
 }
 
-function metricSource(result: TaskResult, keys: string[]) {
+function metricSource(result: TaskResult | null | undefined, keys: string[]) {
+  if (!result) return undefined
   for (const key of keys) {
     const source = result.metricSources?.[key]
     if (source) return source
@@ -2127,7 +3016,7 @@ function metricSource(result: TaskResult, keys: string[]) {
   return undefined
 }
 
-function metricReason(result: TaskResult, keys: string[]) {
+function metricReason(result: TaskResult | null | undefined, keys: string[]) {
   const reason = metricSource(result, keys)?.reason
   return reason ? shortMetricReason(reason) : ''
 }
@@ -2148,9 +3037,7 @@ function shortMetricReason(reason: string) {
 function formatLossNumber(value: unknown) {
   const numberValue = optionalNumber(value)
   if (numberValue === null) return '未生成'
-  const abs = Math.abs(numberValue)
-  if (abs > 0 && (abs < 0.001 || abs >= 10000)) return numberValue.toExponential(3)
-  return numberValue.toFixed(6).replace(/\.?0+$/, '')
+  return numberValue.toFixed(2)
 }
 
 function finalLossFromTrend(points: LossTrendPoint[]): LossFinal | undefined {
@@ -2244,95 +3131,125 @@ type ProtectionEvaluationContext = {
   linkedTaskStatus?: TaskStatusResponse
   asrEval?: AsrEval | null
   cloneEval?: CloneEval | null
+  asrHistory?: AsrEvalResponse[]
+  cloneHistory?: CloneVoiceResult[]
 }
 
-function linkedAsrTuningAdvice({ linkedTaskStatus, asrEval }: ProtectionEvaluationContext) {
-  const task = linkedTaskStatus?.asrTask
-  const status = task?.status ?? (linkedTaskStatus?.stage === 'asr_eval' ? linkedTaskStatus.status : undefined)
-  const linkedResult = task?.asrResult ?? linkedTaskStatus?.asrResult
-  const evaluation = linkedResult?.asr ?? asrEval
-  const hasTask = Boolean(task || linkedResult || evaluation)
+function averageAvailable(values: Array<number | null>) {
+  const available = values.filter((value): value is number => value !== null && Number.isFinite(value))
+  return available.length ? available.reduce((sum, value) => sum + value, 0) / available.length : null
+}
 
-  if (!hasTask) {
+function linkedAsrTuningAdvice({ linkedTaskStatus, asrEval, asrHistory }: ProtectionEvaluationContext) {
+  const tasks = [...(linkedTaskStatus?.asrTasks ?? []), ...(linkedTaskStatus?.asrTask ? [linkedTaskStatus.asrTask] : [])]
+  const linkedResult = tasks.find((item) => item.asrResult?.asr)?.asrResult ?? linkedTaskStatus?.asrResult
+  const historyEvaluations = (asrHistory ?? [])
+    .map((item) => item.asr)
+    .filter((item): item is AsrEval => Boolean(item) && !['unavailable', 'failed', 'error'].includes(String(item?.status ?? '')))
+  const fallbackEvaluation = linkedResult?.asr ?? asrEval
+  const evaluations = historyEvaluations.length
+    ? historyEvaluations
+    : fallbackEvaluation && !['unavailable', 'failed', 'error'].includes(String(fallbackEvaluation.status ?? ''))
+      ? [fallbackEvaluation]
+      : []
+  const hasTask = Boolean(tasks.length || linkedResult || asrEval)
+
+  if (!hasTask && !evaluations.length) {
     return '调参建议（ASR 联动）：暂未生成对应 ASR 任务，请先点击右上角“ASR 测试”完成识别评估。'
   }
-  if (status === 'queued' || status === 'running') {
+  if (!evaluations.length && tasks.some((item) => item.status === 'queued' || item.status === 'running')) {
     return '调参建议（ASR 联动）：对应 ASR 任务正在执行，完成后将根据 WER/CER 自动判断是否需要提高 \\(\\lambda_{\\mathrm{sem}}\\)。'
   }
-  if (status === 'failed' || status === 'error') {
+  if (!evaluations.length && tasks.some((item) => item.status === 'failed' || item.status === 'error')) {
     return '调参建议（ASR 联动）：对应 ASR 任务执行失败，请先重新运行 ASR 测试，再根据真实 WER/CER 调整语义权重。'
   }
-  if (status === 'cancelled') {
+  if (!evaluations.length && tasks.some((item) => item.status === 'cancelled')) {
     return '调参建议（ASR 联动）：对应 ASR 任务已取消，请先重新运行 ASR 测试。'
   }
-  if (!evaluation || ['unavailable', 'failed', 'error'].includes(String(evaluation.status ?? ''))) {
+  if (!evaluations.length) {
     return '调参建议（ASR 联动）：对应 ASR 任务暂未返回可用评估结果，请检查 ASR 模型后重试。'
   }
 
-  const level =
-    evaluation.metricLevel === 'word' || evaluation.metricLevel === 'char'
+  const metrics = evaluations.map((evaluation) => {
+    const level = evaluation.metricLevel === 'word' || evaluation.metricLevel === 'char'
       ? evaluation.metricLevel
       : chooseEditLevel(evaluation.referenceText ?? evaluation.originalText ?? '', evaluation.protectedText ?? '')
-  const wer = optionalNumber(evaluation.wer)
-  const cer = optionalNumber(evaluation.cer)
-  const metric = level === 'char' ? cer ?? wer : wer ?? cer
-  const metricName = level === 'char' && cer !== null ? 'CER' : wer !== null ? 'WER' : 'CER'
+    const wer = optionalNumber(evaluation.wer)
+    const cer = optionalNumber(evaluation.cer)
+    return {
+      name: level === 'char' && cer !== null ? 'CER' : wer !== null ? 'WER' : 'CER',
+      value: level === 'char' ? cer ?? wer : wer ?? cer,
+    }
+  }).filter((item): item is { name: string; value: number } => item.value !== null)
+  const metric = averageAvailable(metrics.map((item) => item.value))
+  const metricNames = new Set(metrics.map((item) => item.name))
+  const metricName = metricNames.size === 1 ? metrics[0]?.name ?? 'WER/CER' : 'WER/CER 识别错误率'
   if (metric === null) {
-    return '调参建议（ASR 联动）：对应 ASR 任务已完成，但未返回可用 WER/CER，暂不据此调整 \\(\\lambda_{\\mathrm{sem}}\\)。'
+    return '调参建议（ASR 平均联动）：现有 ASR 任务均未返回可用 WER/CER，暂不据此调整 \\(\\lambda_{\\mathrm{sem}}\\)。'
   }
 
   const metricText = formatRatioPercent(metric)
+  const sampleText = `基于 ${metrics.length} 次可用 ASR 结果，平均 ${metricName} 为 ${metricText}`
   if (metric < asrWeakDisruptionThreshold) {
-    return `调参建议（ASR 联动）：保护后 ${metricName} 为 ${metricText}，语义干扰较弱；建议提高 \\(\\lambda_{\\mathrm{sem}}\\) 后重新保护并复测。`
+    return `调参建议（ASR 平均联动）：${sampleText}，整体语义干扰较弱；建议提高 \\(\\lambda_{\\mathrm{sem}}\\) 后重新保护并复测。`
   }
   if (metric < asrStrongDisruptionThreshold) {
-    return `调参建议（ASR 联动）：保护后 ${metricName} 为 ${metricText}，语义干扰已有一定效果；若优先阻断语义链路，可小幅提高 \\(\\lambda_{\\mathrm{sem}}\\)。`
+    return `调参建议（ASR 平均联动）：${sampleText}，整体语义干扰已有一定效果；若优先阻断语义链路，可小幅提高 \\(\\lambda_{\\mathrm{sem}}\\)。`
   }
-  return `调参建议（ASR 联动）：保护后 ${metricName} 为 ${metricText}，语义干扰效果较明显，当前可保持 \\(\\lambda_{\\mathrm{sem}}\\)。`
+  return `调参建议（ASR 平均联动）：${sampleText}，整体语义干扰效果较明显，当前可保持 \\(\\lambda_{\\mathrm{sem}}\\)。`
 }
 
-function linkedCloneTuningAdvice({ linkedTaskStatus, cloneEval }: ProtectionEvaluationContext) {
-  const task = linkedTaskStatus?.cloneTask
-  const status = task?.status ?? (linkedTaskStatus?.stage === 'downstream_tts_eval' ? linkedTaskStatus.status : undefined)
-  const linkedResult = task?.cloneResult ?? linkedTaskStatus?.cloneResult
-  const evaluation = linkedResult?.cloneEval ?? cloneResultToEval(linkedResult ?? undefined) ?? cloneEval
-  const hasTask = Boolean(task || linkedResult || evaluation)
+function linkedCloneTuningAdvice({ linkedTaskStatus, cloneEval, cloneHistory }: ProtectionEvaluationContext) {
+  const tasks = [...(linkedTaskStatus?.cloneTasks ?? []), ...(linkedTaskStatus?.cloneTask ? [linkedTaskStatus.cloneTask] : [])]
+  const linkedResult = tasks.find((item) => item.cloneResult?.cloneEval)?.cloneResult ?? linkedTaskStatus?.cloneResult
+  const historyEvaluations = (cloneHistory ?? [])
+    .map((item) => item.cloneEval ?? cloneResultToEval(item))
+    .filter((item): item is CloneEval => Boolean(item) && !['unavailable', 'failed', 'error'].includes(String(item?.status ?? '')))
+  const fallbackEvaluation = linkedResult?.cloneEval ?? cloneResultToEval(linkedResult ?? undefined) ?? cloneEval
+  const evaluations = historyEvaluations.length
+    ? historyEvaluations
+    : fallbackEvaluation && !['unavailable', 'failed', 'error'].includes(String(fallbackEvaluation.status ?? ''))
+      ? [fallbackEvaluation]
+      : []
+  const hasTask = Boolean(tasks.length || linkedResult || cloneEval)
 
-  if (!hasTask) {
+  if (!hasTask && !evaluations.length) {
     return '调参建议（克隆联动）：暂未生成对应克隆任务，请先点击右上角“语音克隆测试”完成声音身份评估。'
   }
-  if (status === 'queued' || status === 'running') {
+  if (!evaluations.length && tasks.some((item) => item.status === 'queued' || item.status === 'running')) {
     return '调参建议（克隆联动）：对应克隆任务正在执行，完成后将根据保护后声纹相似度自动判断是否需要提高 \\(\\lambda_{\\mathrm{id}}\\)。'
   }
-  if (status === 'failed' || status === 'error') {
+  if (!evaluations.length && tasks.some((item) => item.status === 'failed' || item.status === 'error')) {
     return '调参建议（克隆联动）：对应克隆任务执行失败，请先重新运行语音克隆测试，再根据真实声纹相似度调整身份权重。'
   }
-  if (status === 'cancelled') {
+  if (!evaluations.length && tasks.some((item) => item.status === 'cancelled')) {
     return '调参建议（克隆联动）：对应克隆任务已取消，请先重新运行语音克隆测试。'
   }
-  if (!evaluation || ['unavailable', 'failed', 'error'].includes(String(evaluation.status ?? ''))) {
+  if (!evaluations.length) {
     return '调参建议（克隆联动）：对应克隆任务暂未返回可用声音身份评估，请检查克隆或说话人模型后重试。'
   }
 
-  const originalSimilarity = optionalNumber(evaluation.originalSimilarity)
-  const protectedSimilarity = optionalNumber(evaluation.protectedSimilarity)
-  const similarityDropRate = optionalNumber(evaluation.similarityDropRate)
+  const validEvaluations = evaluations.filter((evaluation) => optionalNumber(evaluation.protectedSimilarity) !== null)
+  const originalSimilarity = averageAvailable(validEvaluations.map((evaluation) => optionalNumber(evaluation.originalSimilarity)))
+  const protectedSimilarity = averageAvailable(validEvaluations.map((evaluation) => optionalNumber(evaluation.protectedSimilarity)))
+  const similarityDropRate = averageAvailable(validEvaluations.map((evaluation) => optionalNumber(evaluation.similarityDropRate)))
   if (protectedSimilarity === null) {
-    return '调参建议（克隆联动）：对应克隆任务已完成，但未返回保护后声纹相似度，暂不据此调整 \\(\\lambda_{\\mathrm{id}}\\)。'
+    return '调参建议（克隆平均联动）：现有克隆任务均未返回保护后声纹相似度，暂不据此调整 \\(\\lambda_{\\mathrm{id}}\\)。'
   }
 
-  const similarityText = protectedSimilarity.toFixed(3)
-  const dropText = similarityDropRate === null ? '' : `，较原始克隆下降 ${formatRatioPercent(similarityDropRate)}`
+  const similarityText = protectedSimilarity.toFixed(2)
+  const sampleText = `基于 ${validEvaluations.length} 次可用克隆结果，保护后声纹相似度平均值为 ${similarityText}`
+  const dropText = similarityDropRate === null ? '' : `，相对原始克隆的平均下降幅度为 ${formatRatioPercent(similarityDropRate)}`
   if (originalSimilarity !== null && originalSimilarity < speakerSameIdentityThreshold) {
-    return `调参建议（克隆联动）：原始音频克隆的声纹相似度为 ${originalSimilarity.toFixed(3)}，本次克隆基线偏弱；建议先更换克隆模型或样本复测，暂不据此调整 \\(\\lambda_{\\mathrm{id}}\\)。`
+    return `调参建议（克隆平均联动）：基于 ${validEvaluations.length} 次可用克隆结果，原始克隆声纹相似度平均值为 ${originalSimilarity.toFixed(2)}，整体克隆基线偏弱；建议先更换克隆模型或样本复测，暂不据此调整 \\(\\lambda_{\\mathrm{id}}\\)。`
   }
   if (protectedSimilarity >= speakerHighSimilarityThreshold) {
-    return `调参建议（克隆联动）：保护后克隆声纹相似度为 ${similarityText}${dropText}，声音身份残留较高；建议提高 \\(\\lambda_{\\mathrm{id}}\\) 后重新保护并复测。`
+    return `调参建议（克隆平均联动）：${sampleText}${dropText}，整体声音身份残留较高；建议提高 \\(\\lambda_{\\mathrm{id}}\\) 后重新保护并复测。`
   }
   if (protectedSimilarity >= speakerSameIdentityThreshold) {
-    return `调参建议（克隆联动）：保护后克隆声纹相似度为 ${similarityText}${dropText}，仍有一定声音身份特征残留；建议小幅提高 \\(\\lambda_{\\mathrm{id}}\\)。`
+    return `调参建议（克隆平均联动）：${sampleText}${dropText}，整体仍有一定声音身份特征残留；建议小幅提高 \\(\\lambda_{\\mathrm{id}}\\)。`
   }
-  return `调参建议（克隆联动）：保护后克隆声纹相似度为 ${similarityText}${dropText}，声音身份相似度已明显降低，当前可保持 \\(\\lambda_{\\mathrm{id}}\\)。`
+  return `调参建议（克隆平均联动）：${sampleText}${dropText}，整体声音身份相似度已明显降低，当前可保持 \\(\\lambda_{\\mathrm{id}}\\)。`
 }
 
 function generateProtectionInsights(result: TaskResult, evaluationContext: ProtectionEvaluationContext = {}) {
@@ -2372,7 +3289,7 @@ function generateProtectionInsights(result: TaskResult, evaluationContext: Prote
   }
   if (stoi !== null) {
     const level = stoi >= 0.9 ? '语音可懂度良好' : stoi >= 0.75 ? '语音可懂度中等' : '语音可懂度较弱'
-    qualityNotes.push(`STOI 为 ${stoi.toFixed(3)}，${level}。`)
+    qualityNotes.push(`STOI 为 ${stoi.toFixed(2)}，${level}。`)
   }
   items.push(`听感质量：${qualityNotes.length ? qualityNotes.join('') : '该指标尚未完成评估。'}`)
   items.push(`心理声学保真：${lossTrendText('Lpsy', trends.Lpsy.direction)}`)
@@ -2398,25 +3315,14 @@ function generateProtectionInsights(result: TaskResult, evaluationContext: Prote
   return items
 }
 
-function generateAsrInsights(asrEval: AsrEval, editStats: EditMetrics | null, result: TaskResult) {
+function generateAsrInsights(asrEval: AsrEval, editStats: EditMetrics | null) {
   const wer = optionalNumber(asrEval.wer) ?? (editStats?.level === 'word' ? editStats.werOrCer : null)
   const cer = optionalNumber(asrEval.cer) ?? (editStats?.level === 'char' ? editStats.werOrCer : null)
   const insertRate = optionalNumber(asrEval.insertRate) ?? editStats?.insertRate ?? null
-  const tokenChangeRate = optionalNumber(asrEval.tokenChangeRate)
-  const semanticDrift = optionalNumber(asrEval.semanticDrift)
-  const tokenSource = metricSource(result, ['asrEval.tokenChangeRate'])
-  const semanticSource = metricSource(result, ['asrEval.semanticDrift'])?.source
-  const semanticSourceKey = String(semanticSource ?? '').toLowerCase()
   const items: string[] = []
   if ((wer ?? 0) >= 0.3 || (cer ?? 0) >= 0.3) items.push('WER/CER 较高，ASR 识别受到干扰。')
   if ((insertRate ?? 0) >= 0.2) items.push('插入率较高，句子结构稳定性下降。')
-  if ((tokenChangeRate ?? 0) >= 0.2 && tokenSource?.status === 'available') items.push('语音 tokenizer 序列发生明显变化。')
-  if (semanticDrift !== null && semanticSourceKey === 'mfcc_proxy') {
-    items.push(`MFCC 代理漂移${semanticDrift >= 0.2 ? '较大' : '较小'}，仅反映声学特征变化。`)
-  } else if ((semanticDrift ?? 0) >= 0.2 && semanticSource === 'SemanticEncoderEnsemble') {
-    items.push(`语义漂移为 ${semanticDrift?.toFixed(3)}，语义 encoder 表示发生偏移。`)
-  }
-  if (items.length === 0) items.push('ASR 指标不足或变化较小，当前仅展示后端返回值与文本级 diff，不推断 token 或语义指标。')
+  if (items.length === 0) items.push('ASR 文本级错误率较低或指标不足；任务级 Token 变化率与语义漂移在共享语义指标区域单独展示。')
   return items
 }
 
@@ -2477,11 +3383,8 @@ function LineChart({ result, large, pointsOverride }: { result: TaskResult; larg
   const maxStart = Math.max(0, points.length - windowSize)
   const start = Math.min(windowStart, maxStart)
   const visiblePoints = large && points.length > windowSize ? points.slice(start, start + windowSize) : points
-  useEffect(() => {
-    setWindowStart(0)
-  }, [points.length])
   if (points.length === 0) {
-    return <div className="grid h-full place-items-center text-xs text-slate-500">后端未返回心理声学频谱数据</div>
+    return <div className="grid h-full place-items-center text-xs text-slate-500">暂未生成心理声学频谱数据</div>
   }
   const values = visiblePoints.flatMap((p) => [p.maskingThreshold, p.perturbation].filter((value): value is number => typeof value === 'number' && Number.isFinite(value)))
   const max = Math.max(...values, 1)
@@ -2512,7 +3415,7 @@ function LineChart({ result, large, pointsOverride }: { result: TaskResult; larg
         <polyline points={toPoints('perturbation')} fill="none" stroke="#fcd34d" strokeWidth="2" />
         {visiblePoints.filter((_, index) => index % labelEvery === 0).map((point, labelIndex) => (
           <text key={`${point.frequency}-${labelIndex}`} x={labelIndex * labelEvery * (width / Math.max(1, visiblePoints.length - 1))} y={height - 4} fontSize={large ? '11' : '9'} fill="#64748b">
-            {point.frequency >= 1000 ? `${Math.round(point.frequency / 1000)}k` : Math.round(point.frequency)}
+            {formatFrequency(point.frequency)}
           </text>
         ))}
       </svg>
@@ -2538,6 +3441,6 @@ function LineChart({ result, large, pointsOverride }: { result: TaskResult; larg
 function formatFrequency(value: unknown) {
   const hz = optionalNumber(value)
   if (hz === null) return '-'
-  if (hz >= 1000) return `${(hz / 1000).toFixed(hz >= 10000 ? 0 : 1)}k`
-  return `${Math.round(hz)}`
+  if (hz >= 1000) return `${(hz / 1000).toFixed(2)}k`
+  return hz.toFixed(2)
 }
