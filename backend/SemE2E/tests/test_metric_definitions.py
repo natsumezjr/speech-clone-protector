@@ -746,6 +746,9 @@ class MetricDefinitionsTest(unittest.TestCase):
         self.assertEqual(response["cloneEval"]["originalSimilarity"], 0.9)
         self.assertEqual(response["cloneEval"]["protectedSimilarity"], 0.3)
         self.assertEqual(response["cloneEval"]["similarityDropRate"], 2 / 3)
+        self.assertIsNone(response["request"]["annotationSource"])
+        self.assertIsNone(response["request"]["speakerPrompt"])
+        self.assertIsNone(response["request"]["annotationAsrSubId"])
         self.assertEqual(stored_result["details"]["cloneEval"]["originalSimilarity"], 0.9)
         self.assertEqual(stored_result["summary"]["metricSources"]["cloneEval.*"]["source"], "fake_speaker")
 

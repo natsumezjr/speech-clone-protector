@@ -40,6 +40,7 @@ from result_adapter import (
     new_file_id,
     runtime_config,
     supported_tts_languages,
+    tts_model_requires_prompt,
 )
 from result_schema import utc_now_iso
 
@@ -214,7 +215,7 @@ class CloneVoiceRequest(BaseModel):
     language: str | None = "auto"
     speed: float | None = 1.0
     speakerPrompt: str | None = None
-    annotationSource: str | None = "manual"
+    annotationSource: str | None = None
     annotationAsrSubId: str | None = None
     batchId: str | None = None
     batchItemId: str | None = None
@@ -839,8 +840,26 @@ def validate_clone_config(payload: CloneVoiceRequest, req_id: str, task_id: str)
     return None
 
 
+def _clear_clone_annotation_fields(payload: dict[str, Any]) -> None:
+    payload.update(
+        {
+            "annotationSource": None,
+            "speakerPrompt": None,
+            "originalSpeakerPrompt": None,
+            "protectedSpeakerPrompt": None,
+            "annotationAsrSubId": None,
+            "annotationAsrModel": None,
+            "annotationCreatedAt": None,
+        }
+    )
+
+
 def resolve_clone_annotation(task_id: str, payload: CloneVoiceRequest, req_id: str) -> tuple[dict[str, Any] | None, JSONResponse | None]:
     resolved = payload.model_dump()
+    if not tts_model_requires_prompt(payload.model):
+        _clear_clone_annotation_fields(resolved)
+        return resolved, None
+
     annotation_source = str(payload.annotationSource or "manual").strip().lower()
     if annotation_source not in {"manual", "asr"}:
         return None, structured_error(
@@ -2443,6 +2462,8 @@ def create_evaluation_batch(task_id: str, payload: EvaluationBatchRequest) -> JS
             )
         seen_item_ids.add(batch_item_id)
         item = dict(raw_item)
+        if batch_type == "clone" and not tts_model_requires_prompt(str(item.get("model") or "")):
+            _clear_clone_annotation_fields(item)
         item.update(
             {
                 "batchId": batch_id,

@@ -520,6 +520,14 @@ def supported_tts_languages(model: str | None) -> list[str]:
     return []
 
 
+def tts_model_requires_prompt(model: str | None) -> bool:
+    backend_value = normalize_tts_model(model)
+    for item in SUPPORTED_TTS_MODELS:
+        if str(item["backendValue"]).lower() == backend_value.lower():
+            return bool(item.get("promptRequired"))
+    return False
+
+
 def _checkpoint_status() -> dict[str, Any]:
     whisper_cache_dir = Path(os.getenv("WHISPER_CACHE_DIR", Path.home() / ".cache" / "whisper"))
     required = {
@@ -2261,7 +2269,7 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
             "speakerPrompt": prompt_text or None,
             "originalSpeakerPrompt": original_prompt_text or None,
             "protectedSpeakerPrompt": protected_prompt_text or None,
-            "annotationSource": payload.get("annotationSource") or "manual",
+            "annotationSource": payload.get("annotationSource"),
             "annotationAsrSubId": payload.get("annotationAsrSubId"),
             "annotationAsrModel": payload.get("annotationAsrModel"),
             "annotationCreatedAt": payload.get("annotationCreatedAt"),

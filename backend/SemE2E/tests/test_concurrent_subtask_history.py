@@ -50,6 +50,48 @@ def minimal_result(task_id: str) -> dict[str, object]:
 
 
 class ConcurrentSubtaskHistoryTest(unittest.TestCase):
+    def test_xtts_clone_annotation_defaults_to_none_and_clears_irrelevant_fields(self) -> None:
+        payload = api_server.CloneVoiceRequest(
+            text="clone text",
+            model="xtts-v2",
+            language="en",
+            speakerPrompt="must be ignored",
+            annotationSource="asr",
+            annotationAsrSubId="asr_must_be_ignored",
+        )
+
+        resolved, error = api_server.resolve_clone_annotation("task_xtts", payload, "req_test")
+
+        self.assertIsNone(error)
+        self.assertIsNotNone(resolved)
+        self.assertIsNone(api_server.CloneVoiceRequest(text="clone text", model="xtts-v2").annotationSource)
+        self.assertIsNone(resolved["annotationSource"])
+        self.assertIsNone(resolved["speakerPrompt"])
+        self.assertIsNone(resolved["originalSpeakerPrompt"])
+        self.assertIsNone(resolved["protectedSpeakerPrompt"])
+        self.assertIsNone(resolved["annotationAsrSubId"])
+        self.assertIsNone(resolved["annotationAsrModel"])
+        self.assertIsNone(resolved["annotationCreatedAt"])
+
+    def test_prompt_required_clone_models_default_to_manual_annotation(self) -> None:
+        for model in ("cosyvoice2:0.5b", "gpt-sovits:finetune"):
+            with self.subTest(model=model):
+                payload = api_server.CloneVoiceRequest(
+                    text="clone text",
+                    model=model,
+                    language="zh-cn",
+                    speakerPrompt="manual transcript",
+                )
+
+                resolved, error = api_server.resolve_clone_annotation("task_manual", payload, "req_test")
+
+                self.assertIsNone(error)
+                self.assertIsNotNone(resolved)
+                self.assertEqual(resolved["annotationSource"], "manual")
+                self.assertEqual(resolved["speakerPrompt"], "manual transcript")
+                self.assertEqual(resolved["originalSpeakerPrompt"], "manual transcript")
+                self.assertEqual(resolved["protectedSpeakerPrompt"], "manual transcript")
+
     def test_evaluation_batch_persists_expected_items_and_fixed_label(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             task_root = Path(tmp)
@@ -85,6 +127,54 @@ class ConcurrentSubtaskHistoryTest(unittest.TestCase):
             self.assertTrue(batch["updatedAt"])
             self.assertEqual([item["batchItemId"] for item in batch["items"]], ["tiny", "base"])
             self.assertTrue(all(item["status"] == "queued" and item["progress"] == 0.0 for item in batch["items"]))
+
+    def test_clone_batch_clears_annotations_for_models_without_required_prompts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp)
+            task_id = "task_clone_annotation_batch"
+            task_dir = task_root / task_id
+            task_dir.mkdir(parents=True)
+            (task_dir / "result.json").write_text(json.dumps(minimal_result(task_id), ensure_ascii=False), encoding="utf-8")
+            request = api_server.EvaluationBatchRequest(
+                batchId="batch_clone_annotations",
+                type="clone",
+                items=[
+                    {
+                        "batchItemId": "xtts",
+                        "model": "xtts-v2",
+                        "annotationSource": "manual",
+                        "speakerPrompt": "legacy manual prompt",
+                        "annotationAsrSubId": "legacy_xtts_asr",
+                    },
+                    {
+                        "batchItemId": "yourtts",
+                        "model": "your-tts",
+                        "annotationSource": "asr",
+                        "speakerPrompt": "legacy ASR prompt",
+                        "annotationAsrSubId": "legacy_yourtts_asr",
+                    },
+                    {
+                        "batchItemId": "cosy",
+                        "model": "cosyvoice2:0.5b",
+                        "annotationSource": "manual",
+                        "speakerPrompt": "required prompt",
+                    },
+                ],
+            )
+
+            with mock.patch.object(api_server, "TASK_DIR", task_root):
+                response = api_server.create_evaluation_batch(task_id, request)
+                status = api_server.read_task_status(task_id)
+
+            self.assertEqual(response.status_code, 200)
+            items = {item["batchItemId"]: item for item in status["cloneBatches"][0]["items"]}
+            for item_id in ("xtts", "yourtts"):
+                self.assertIsNone(items[item_id]["annotationSource"])
+                self.assertIsNone(items[item_id]["speakerPrompt"])
+                self.assertIsNone(items[item_id]["annotationAsrSubId"])
+                self.assertIsNone(items[item_id]["annotationAsrModel"])
+            self.assertEqual(items["cosy"]["annotationSource"], "manual")
+            self.assertEqual(items["cosy"]["speakerPrompt"], "required prompt")
 
     def test_batch_subtasks_merge_concurrently_and_aggregate_min_progress(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -385,24 +475,27 @@ class ConcurrentSubtaskHistoryTest(unittest.TestCase):
             ]
             (task_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
 
-            payload = api_server.CloneVoiceRequest(
-                text="测试克隆",
-                model="cosyvoice2:0.5b",
-                language="zh-cn",
-                speakerPrompt="",
-                annotationSource="asr",
-                annotationAsrSubId="asr_old",
-            )
-            with mock.patch.object(api_server, "TASK_DIR", task_root), mock.patch.object(result_adapter, "TASK_DIR", task_root):
-                resolved, error = api_server.resolve_clone_annotation(task_id, payload, "req_test")
+            for model in ("cosyvoice2:0.5b", "gpt-sovits:finetune"):
+                with self.subTest(model=model):
+                    payload = api_server.CloneVoiceRequest(
+                        text="测试克隆",
+                        model=model,
+                        language="zh-cn",
+                        speakerPrompt="",
+                        annotationSource="asr",
+                        annotationAsrSubId="asr_old",
+                    )
+                    with mock.patch.object(api_server, "TASK_DIR", task_root), mock.patch.object(result_adapter, "TASK_DIR", task_root):
+                        resolved, error = api_server.resolve_clone_annotation(task_id, payload, "req_test")
 
-            self.assertIsNone(error)
-            self.assertIsNotNone(resolved)
-            self.assertEqual(resolved["speakerPrompt"], "人工前的旧转写")
-            self.assertEqual(resolved["originalSpeakerPrompt"], "人工前的旧转写")
-            self.assertEqual(resolved["protectedSpeakerPrompt"], "保护后的旧转写")
-            self.assertEqual(resolved["annotationAsrSubId"], "asr_old")
-            self.assertEqual(resolved["annotationAsrModel"], "whisper:tiny")
+                    self.assertIsNone(error)
+                    self.assertIsNotNone(resolved)
+                    self.assertEqual(resolved["annotationSource"], "asr")
+                    self.assertEqual(resolved["speakerPrompt"], "人工前的旧转写")
+                    self.assertEqual(resolved["originalSpeakerPrompt"], "人工前的旧转写")
+                    self.assertEqual(resolved["protectedSpeakerPrompt"], "保护后的旧转写")
+                    self.assertEqual(resolved["annotationAsrSubId"], "asr_old")
+                    self.assertEqual(resolved["annotationAsrModel"], "whisper:tiny")
 
     def test_clone_annotation_rejects_asr_result_without_both_transcripts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

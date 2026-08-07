@@ -429,7 +429,7 @@ function normalizeCloneResult(payload: unknown): CloneVoiceResult {
       speakerPrompt: typeof request.speakerPrompt === 'string' ? request.speakerPrompt : undefined,
       originalSpeakerPrompt: typeof request.originalSpeakerPrompt === 'string' ? request.originalSpeakerPrompt : undefined,
       protectedSpeakerPrompt: typeof request.protectedSpeakerPrompt === 'string' ? request.protectedSpeakerPrompt : undefined,
-      annotationSource: request.annotationSource === 'asr' ? 'asr' : 'manual',
+      annotationSource: request.annotationSource === 'asr' ? 'asr' : request.annotationSource === 'manual' ? 'manual' : undefined,
       annotationAsrSubId: typeof request.annotationAsrSubId === 'string' ? request.annotationAsrSubId : undefined,
       annotationAsrModel: typeof request.annotationAsrModel === 'string' ? request.annotationAsrModel : undefined,
       annotationCreatedAt: typeof request.annotationCreatedAt === 'string' ? request.annotationCreatedAt : undefined,

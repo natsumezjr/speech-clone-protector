@@ -263,7 +263,9 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
       pushToast({ kind: 'error', title: '请填写测试文本', description: '测试文本不能为空。' })
       return
     }
-    if (cloneDialogMode === 'all' && !manualAnnotation.trim()) {
+    const models = dialogMode === 'single' && effectiveClone ? [effectiveClone] : availableClone
+    const needsPromptAnnotation = models.some((model) => model.promptRequired)
+    if (cloneDialogMode === 'all' && needsPromptAnnotation && !manualAnnotation.trim()) {
       pushToast({ kind: 'error', title: '请填写人工标注', description: '全模型克隆会同时比较人工标注与自动标注。' })
       return
     }
@@ -271,26 +273,31 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
     try {
       setCloneRunning(true)
       setCloneDialogMode(null)
-      const medium = defaultAsrModel(asrModels, 'en')
-      if (!medium) throw new Error('英文 Whisper Medium 当前不可用。')
-      const asrQueued = await runAsrEval(cloneTaskId, { model: medium.value, language: 'en' })
-      if (!asrQueued.asrSubId) throw new Error('自动标注任务未返回有效编号。')
-      const annotation: AsrEvalResponse = await waitForAsr(cloneTaskId, asrQueued.asrSubId)
-      const evaluatedAsr = annotation.asr
-      if (!evaluatedAsr) throw new Error('自动标注未返回识别结果。')
-      const originalText = evaluatedAsr.originalText?.trim() ?? ''
-      const protectedText = evaluatedAsr.protectedText?.trim() ?? ''
-      if (!originalText || !protectedText) throw new Error('自动标注未同时生成原始音频和保护音频文本。')
+      let annotation: AsrEvalResponse | null = null
+      if (needsPromptAnnotation) {
+        const medium = defaultAsrModel(asrModels, 'en')
+        if (!medium) throw new Error('英文 Whisper Medium 当前不可用。')
+        const asrQueued = await runAsrEval(cloneTaskId, { model: medium.value, language: 'en' })
+        if (!asrQueued.asrSubId) throw new Error('自动标注任务未返回有效编号。')
+        annotation = await waitForAsr(cloneTaskId, asrQueued.asrSubId)
+        const evaluatedAsr = annotation.asr
+        const originalText = evaluatedAsr?.originalText?.trim() ?? ''
+        const protectedText = evaluatedAsr?.protectedText?.trim() ?? ''
+        if (!evaluatedAsr || !originalText || !protectedText) throw new Error('自动标注未同时生成原始音频和保护音频文本。')
+      }
 
-      const models = dialogMode === 'single' && effectiveClone ? [effectiveClone] : availableClone
       const requests: CloneVoiceRequest[] = []
       models.forEach((model) => {
         const base = { text: cloneText.trim(), model: model.value, language: 'en', speed: 1 }
         if (model.promptRequired) {
+          const evaluatedAsr = annotation?.asr
+          const originalText = evaluatedAsr?.originalText?.trim() ?? ''
+          const protectedText = evaluatedAsr?.protectedText?.trim() ?? ''
+          if (!annotation?.asrSubId || !evaluatedAsr || !originalText || !protectedText) throw new Error('提示词模型缺少可用的自动标注。')
           if (manualAnnotation.trim()) requests.push({ ...base, annotationSource: 'manual', speakerPrompt: manualAnnotation.trim() })
           requests.push({ ...base, annotationSource: 'asr', annotationAsrSubId: annotation.asrSubId, annotationAsrModel: evaluatedAsr.model, annotationCreatedAt: annotation.createdAt ?? undefined, speakerPrompt: originalText, originalSpeakerPrompt: originalText, protectedSpeakerPrompt: protectedText })
         } else {
-          requests.push({ ...base, annotationSource: 'manual', speakerPrompt: manualAnnotation.trim() || originalText })
+          requests.push(base)
         }
       })
       const batchId = dialogMode === 'all' ? evaluationBatchId('clone') : undefined
@@ -299,7 +306,7 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
         model: request.model,
         modelName: shortModelName(request.model),
         modelType: (models.find((model) => model.value === request.model)?.type ?? []).join(' / ') || undefined,
-        annotationSource: request.annotationSource,
+        ...(request.annotationSource ? { annotationSource: request.annotationSource } : {}),
       }))
       if (batchId) {
         await createEvaluationBatch(cloneTaskId, { batchId, type: 'clone', items: batchItems })

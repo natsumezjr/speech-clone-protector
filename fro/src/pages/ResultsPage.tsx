@@ -440,7 +440,6 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
     language: initialEvaluationLanguage,
     speed: 1,
     speakerPrompt: result.asr.originalText || '',
-    annotationSource: 'manual',
   })
   const { data: capabilities } = useCapabilitiesQuery()
   const { data: linkedTaskStatus, refetch: refetchLinkedTaskStatus } = useQuery({
@@ -774,7 +773,9 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
   }
 
   const submitCloneTest = async (requestOverride = cloneForm) => {
-    const validationError = validateCloneRequest(requestOverride)
+    const modelOption = ttsModelOptions.find((option) => option.value === requestOverride.model)
+    const request = normalizeCloneAnnotationRequest(requestOverride, modelOption)
+    const validationError = validateCloneRequest(request)
     if (validationError) {
       setCloneError(validationError)
       setCloneModalOpen(true)
@@ -787,7 +788,7 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
       setCloneTaskStatus(null)
       setCloneModalOpen(false)
       setActivePanel('clone')
-      const response = await cloneVoice(result.taskId, { ...requestOverride, text: requestOverride.text.trim() })
+      const response = await cloneVoice(result.taskId, { ...request, text: request.text.trim() })
       if (response.cloneSubId) setSelectedCloneKey(`sub:${response.cloneSubId}`)
       await refetchLinkedTaskStatus()
       const nextResult =
@@ -843,8 +844,9 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
       quickRequest.annotationAsrModel = undefined
       quickRequest.annotationCreatedAt = undefined
     }
-    setCloneForm(quickRequest)
-    await submitCloneTest(quickRequest)
+    const normalizedQuickRequest = normalizeCloneAnnotationRequest(quickRequest, modelOption)
+    setCloneForm(normalizedQuickRequest)
+    await submitCloneTest(normalizedQuickRequest)
   }
 
   const waitForCloneResult = async (taskId: string, cloneSubId?: string) => {
@@ -1199,6 +1201,7 @@ function CloneTab({ result, cloneResult, cloneEval, cloneHistory, cloneBatches, 
     <CloneHistoryPanel
       history={cloneHistory}
       batches={cloneBatches}
+      modelOptions={cloneModelOptions}
       selectedCloneKey={selectedCloneKey}
       onSelect={onSelectClone}
       onOpenBatch={openBatch}
@@ -1270,7 +1273,7 @@ function CloneTab({ result, cloneResult, cloneEval, cloneHistory, cloneBatches, 
       {cloneDetail}
       <ManualAnnotationModal item={manualAnnotation} onClose={() => setManualAnnotation(null)} />
       <FineTuneReportModal item={fineTuneReport} onClose={() => setFineTuneReport(null)} />
-      <BatchProgressModal batch={liveBatchDetail} onClose={() => setBatchDetail(null)} />
+      <BatchProgressModal batch={liveBatchDetail} cloneModelOptions={cloneModelOptions} onClose={() => setBatchDetail(null)} />
       <ModelInformationModal model={informationModel} modelTypes={modelTypes} onClose={() => setInformationModel(null)} />
     </div>
   )
@@ -1657,8 +1660,39 @@ function AsrEvalModal({
   )
 }
 
-function annotationSourceLabel(source?: CloneVoiceRequest['annotationSource']) {
-  return source === 'asr' ? 'ASR 标注' : '人工标注'
+function annotationSourceLabel(source?: CloneVoiceRequest['annotationSource'] | null) {
+  if (source === 'asr') return 'ASR 标注'
+  if (source === 'manual') return '人工标注'
+  return '—'
+}
+
+function normalizeCloneAnnotationRequest(request: CloneVoiceRequest, modelOption?: BackendSelectOption) {
+  if (!modelOption?.promptRequired) {
+    return {
+      ...request,
+      annotationSource: undefined,
+      annotationAsrSubId: undefined,
+      annotationAsrModel: undefined,
+      annotationCreatedAt: undefined,
+      speakerPrompt: undefined,
+      originalSpeakerPrompt: undefined,
+      protectedSpeakerPrompt: undefined,
+    }
+  }
+  if (request.annotationSource === 'asr') return request
+  return {
+    ...request,
+    annotationSource: 'manual' as const,
+    annotationAsrSubId: undefined,
+    annotationAsrModel: undefined,
+    annotationCreatedAt: undefined,
+    originalSpeakerPrompt: undefined,
+    protectedSpeakerPrompt: undefined,
+  }
+}
+
+function cloneModelOption(modelOptions: BackendSelectOption[], model?: string) {
+  return modelOptions.find((option) => option.value === model || option.backendValue === model)
 }
 
 function shortCloneModelName(value?: string) {
@@ -1780,7 +1814,7 @@ function AsrHistoryPanel({ history, batches, selectedAsrSubId, onSelect, onOpenB
   )
 }
 
-function CloneHistoryPanel({ history, batches, selectedCloneKey, onSelect, onOpenBatch, onOpenAsr, onOpenManual, onOpenFineTune, maxVisible }: { history: CloneHistoryEntry[]; batches: EvaluationBatch[]; selectedCloneKey?: string; onSelect: (cloneKey: string) => void; onOpenBatch: (batch: EvaluationBatch) => void; onOpenAsr: (asrSubId?: string) => void; onOpenManual: (item: CloneHistoryEntry) => void; onOpenFineTune: (item: CloneHistoryEntry) => void; maxVisible: number }) {
+function CloneHistoryPanel({ history, batches, modelOptions, selectedCloneKey, onSelect, onOpenBatch, onOpenAsr, onOpenManual, onOpenFineTune, maxVisible }: { history: CloneHistoryEntry[]; batches: EvaluationBatch[]; modelOptions: BackendSelectOption[]; selectedCloneKey?: string; onSelect: (cloneKey: string) => void; onOpenBatch: (batch: EvaluationBatch) => void; onOpenAsr: (asrSubId?: string) => void; onOpenManual: (item: CloneHistoryEntry) => void; onOpenFineTune: (item: CloneHistoryEntry) => void; maxVisible: number }) {
   if (!history.length && !batches.length) return null
   const rowCount = history.length + batches.length
   return (
@@ -1815,13 +1849,13 @@ function CloneHistoryPanel({ history, batches, selectedCloneKey, onSelect, onOpe
                   <td className="px-2 py-2 text-center font-mono text-violet-200" title={batch.batchId}><span className="block truncate">{batch.batchId}</span><span className="mt-1 block text-[10px] text-slate-500">{formatTaskTime(batch.createdAt)}</span></td>
                   <td className="px-2 py-3 text-center"><span className="rounded-full border border-violet-300/20 bg-violet-400/10 px-2 py-1 font-black text-violet-100">批次</span></td>
                   <td className="px-2 py-3 text-center font-black text-violet-100">全模型一键测试</td>
-                  <td className="px-2 py-3 text-center">全部</td>
+                  <td className="px-2 py-3 text-center">—</td>
                   <td className="px-2 py-2" title="聚合进度取所有子任务中的最小值">
                     <div className="history-progress-track mx-auto h-1.5 max-w-[110px] overflow-hidden rounded-full bg-slate-800"><div className={cn('h-full rounded-full transition-all duration-300', tone.fill)} style={{ width: `${progressPercent}%` }} /></div>
                     <p className={cn('mt-1 text-center font-mono text-[10px] font-bold', tone.text)}>{progressPercent}% · {lifecycleStatusLabel(batch.status)}</p>
                   </td>
                   <td className="px-2 py-3 text-center font-mono">{elapsed !== null ? seconds(elapsed) : '—'}</td>
-                  <td className="px-2 py-3 text-center text-slate-400">完成 {batch.completedCount}/{batch.totalCount} · 失败 {batch.failedCount}</td>
+                  <td className="px-2 py-3 text-center text-slate-500">—</td>
                   <td className="px-2 py-3 text-center font-mono">—</td>
                   <td className="px-2 py-3 text-center font-mono">—</td>
                 </tr>
@@ -1829,7 +1863,10 @@ function CloneHistoryPanel({ history, batches, selectedCloneKey, onSelect, onOpe
             })}
             {history.map((item, index) => {
               const request = item.request
-              const asrAnnotation = request?.annotationSource === 'asr'
+              const promptRequired = cloneModelOption(modelOptions, request?.model)?.promptRequired === true
+              const annotationSource = promptRequired ? request?.annotationSource : undefined
+              const hasAnnotation = annotationSource === 'manual' || annotationSource === 'asr'
+              const asrAnnotation = annotationSource === 'asr'
               const originalPrompt = request?.originalSpeakerPrompt ?? request?.speakerPrompt ?? ''
               const protectedPrompt = request?.protectedSpeakerPrompt ?? ''
               const lifecycleStatus = cloneHistoryLifecycleStatus(item)
@@ -1838,7 +1875,7 @@ function CloneHistoryPanel({ history, batches, selectedCloneKey, onSelect, onOpe
               const tone = progressTone(lifecycleStatus)
               const elapsed = optionalNumber(item.taskStatus?.elapsedSec)
               const openAnnotation = () => {
-                if (!request) return
+                if (!request || !hasAnnotation) return
                 if (asrAnnotation) onOpenAsr(request.annotationAsrSubId)
                 else onOpenManual(item)
               }
@@ -1853,7 +1890,7 @@ function CloneHistoryPanel({ history, batches, selectedCloneKey, onSelect, onOpe
                   </td>
                   <td className={cn('truncate px-2 py-3 text-center font-bold', failed ? 'text-rose-200' : 'text-slate-100')} title={request?.model}>{shortCloneModelName(request?.model)}</td>
                   <td className="px-2 py-3 text-center">
-                    {request ? <button type="button" onClick={(event) => { event.stopPropagation(); openAnnotation() }} className={cn('rounded-full border px-2 py-1 font-bold underline-offset-2 hover:underline', asrAnnotation ? 'border-violet-300/20 bg-violet-400/10 text-violet-200' : 'manual-annotation-chip border-emerald-400/30 bg-emerald-500/15 text-emerald-300')}>{annotationSourceLabel(request.annotationSource)}</button> : '—'}
+                    {hasAnnotation ? <button type="button" onClick={(event) => { event.stopPropagation(); openAnnotation() }} className={cn('rounded-full border px-2 py-1 font-bold underline-offset-2 hover:underline', asrAnnotation ? 'border-violet-300/20 bg-violet-400/10 text-violet-200' : 'manual-annotation-chip border-emerald-400/30 bg-emerald-500/15 text-emerald-300')}>{annotationSourceLabel(annotationSource)}</button> : '—'}
                   </td>
                   <td className="px-2 py-2" title={item.taskStatus?.message ?? lifecycleStatusLabel(lifecycleStatus)}>
                     <div className="history-progress-track mx-auto h-1.5 max-w-[110px] overflow-hidden rounded-full bg-slate-800"><div className={cn('h-full rounded-full transition-all duration-300', tone.fill)} style={{ width: `${progressPercent}%` }} /></div>
@@ -1861,7 +1898,7 @@ function CloneHistoryPanel({ history, batches, selectedCloneKey, onSelect, onOpe
                   </td>
                   <td className="px-2 py-3 text-center font-mono">{elapsed !== null ? seconds(elapsed) : '—'}</td>
                   <td className="px-2 py-2">
-                    {request ? <button type="button" onClick={(event) => { event.stopPropagation(); openAnnotation() }} className="block w-full rounded-[5px] px-1 py-1 text-left hover:bg-cyan-300/[0.05]">{asrAnnotation ? <span className="block space-y-0.5 leading-5"><span className="block truncate" title={originalPrompt}>原始：{originalPrompt || '—'}</span><span className="block truncate" title={protectedPrompt}>保护：{protectedPrompt || '—'}</span></span> : <span className="block truncate" title={originalPrompt}>{originalPrompt || '—'}</span>}</button> : <span className="block text-center text-slate-500">—</span>}
+                    {hasAnnotation ? <button type="button" onClick={(event) => { event.stopPropagation(); openAnnotation() }} className="block w-full rounded-[5px] px-1 py-1 text-left hover:bg-cyan-300/[0.05]">{asrAnnotation ? <span className="block space-y-0.5 leading-5"><span className="block truncate" title={originalPrompt}>原始：{originalPrompt || '—'}</span><span className="block truncate" title={protectedPrompt}>保护：{protectedPrompt || '—'}</span></span> : <span className="block truncate" title={originalPrompt}>{originalPrompt || '—'}</span>}</button> : <span className="block text-center text-slate-500">—</span>}
                   </td>
                   <td className="px-2 py-3 text-center font-mono">{formatCloneMetricNumber(item.result?.cloneEval?.originalSimilarity)}</td>
                   <td className="px-2 py-3 text-center font-mono">{formatCloneMetricNumber(item.result?.cloneEval?.protectedSimilarity)}</td>
@@ -2007,11 +2044,11 @@ function CloneVoiceModal({
 
   const selectModel = (selected: BackendSelectOption) => {
     const languages = selected.languages?.length ? selected.languages : languageOptions
-    onChange({
+    onChange(normalizeCloneAnnotationRequest({
       ...form,
       model: selected.value,
       language: languages.includes(form.language ?? '') ? form.language : languages[0],
-    })
+    }, selected))
   }
 
   return (
@@ -2020,7 +2057,7 @@ function CloneVoiceModal({
         <div className="mb-4 flex items-center justify-between">
           <div>
             <h3 className="text-[20px] font-black text-white">语音克隆测试</h3>
-            <p className="mt-1 text-xs text-slate-500">选择文本、模型和参考标注后开始测试</p>
+            <p className="mt-1 text-xs text-slate-500">选择文本和模型{selectedModel?.promptRequired ? '，并提供参考标注' : ''}后开始测试</p>
           </div>
           <button type="button" onClick={onClose} className="grid h-9 w-9 place-items-center rounded-full border border-cyan-300/14 bg-white/[0.035] text-slate-300 hover:text-white" aria-label="关闭语音克隆测试表单">
             <X className="h-4 w-4" />
@@ -2203,7 +2240,7 @@ function TextBox({ title, text, foot, content }: { title: string; text: string; 
   )
 }
 
-function BatchProgressModal({ batch, onClose }: { batch: EvaluationBatch | null; onClose: () => void }) {
+function BatchProgressModal({ batch, cloneModelOptions, onClose }: { batch: EvaluationBatch | null; cloneModelOptions: BackendSelectOption[]; onClose: () => void }) {
   useEffect(() => {
     if (!batch) return undefined
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -2242,12 +2279,13 @@ function BatchProgressModal({ batch, onClose }: { batch: EvaluationBatch | null;
             const itemTone = progressTone(item.status)
             const itemError = typeof item.error === 'string' ? item.error : item.error?.message
             const modelLabel = item.modelName || (batch.type === 'asr' ? shortAsrModelName(item.model) : shortCloneModelName(item.model))
+            const showAnnotationSource = batch.type === 'clone' && cloneModelOption(cloneModelOptions, item.model)?.promptRequired === true && Boolean(item.annotationSource)
             return (
               <div key={item.batchItemId} className={cn('rounded-[8px] border p-3', ['failed', 'error', 'cancelled'].includes(String(item.status).toLowerCase()) ? 'border-rose-300/18 bg-rose-400/[0.05]' : 'border-cyan-300/10 bg-slate-950/24')}>
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="min-w-0">
                     <p className="truncate font-black text-slate-100" title={item.model}>{modelLabel}</p>
-                    <p className="mt-0.5 text-[11px] text-slate-500">{item.modelType || (batch.type === 'asr' ? 'ASR' : 'TTS 克隆')}{item.annotationSource ? ` · ${annotationSourceLabel(item.annotationSource)}` : ''}</p>
+                    <p className="mt-0.5 text-[11px] text-slate-500">{item.modelType || (batch.type === 'asr' ? 'ASR' : 'TTS 克隆')}{showAnnotationSource ? ` · ${annotationSourceLabel(item.annotationSource)}` : ''}</p>
                   </div>
                   <div className="shrink-0 text-right">
                     <p className={cn('font-mono text-xs font-black', itemTone.text)}>{itemPercent}% · {lifecycleStatusLabel(item.status)}</p>
