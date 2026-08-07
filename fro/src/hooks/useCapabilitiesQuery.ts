@@ -10,9 +10,15 @@ export function useCapabilitiesQuery() {
     queryFn: getCapabilities,
     staleTime: 30_000,
     gcTime: 5 * 60_000,
+    refetchInterval: (query) => {
+      const cache = query.state.data?.cache
+      return cache?.refreshRequested || cache?.refreshing ? 1_000 : 30_000
+    },
+    refetchIntervalInBackground: true,
     refetchOnMount: 'always',
     refetchOnReconnect: true,
     refetchOnWindowFocus: true,
+    structuralSharing: true,
     retry: 1,
   })
 }
