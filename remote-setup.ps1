@@ -169,6 +169,7 @@ if ss -ltn 2>/dev/null | grep -q ":$port "; then
   exit 22
 fi
 
+printf '1\n' > "$project/seme2e-runtime/capabilities-refresh.flag"
 cd "$backend"
 SEME2E_RUNTIME_DIR="$project/seme2e-runtime" \
 SEME2E_API_REAL_GUARD=1 \

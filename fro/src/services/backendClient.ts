@@ -2,7 +2,7 @@ import axios from 'axios'
 import { apiBaseUrl } from '@/config/runtime'
 import type { ApiClient } from '@/types/api'
 import type { AudioFileMeta } from '@/types/audio'
-import type { ApiErrorPayload, AsrEvalRequest, AsrEvalResponse, CloneVoiceRequest, CloneVoiceResult, CreateEvaluationBatchRequest, EvaluationBatch, HistoryTask, ProtectionTaskRequest, PsychoacousticSliceResponse, TaskDetailsResponse, TaskResult, TaskStatusResponse } from '@/types/task'
+import type { ApiErrorPayload, AsrEvalRequest, AsrEvalResponse, CapabilitiesResponse, CloneVoiceRequest, CloneVoiceResult, CreateEvaluationBatchRequest, EvaluationBatch, HistoryTask, ProtectionTaskRequest, PsychoacousticSliceResponse, TaskDetailsResponse, TaskResult, TaskStatusResponse } from '@/types/task'
 import { formatStructuredApiError } from '@/utils/apiError'
 
 const http = axios.create({
@@ -754,8 +754,17 @@ function normalizeHistoryTask(payload: unknown): HistoryTask {
 
 export const backendClient: ApiClient = {
   async getCapabilities() {
-    const response = await http.get('/api/capabilities')
-    return response.data
+    const [capabilitiesResponse, configResponse] = await Promise.all([
+      http.get('/api/capabilities'),
+      http.get('/api/config'),
+    ])
+    const capabilities = asRecord(capabilitiesResponse.data)
+    const configEnvelope = asRecord(configResponse.data)
+    return {
+      ...capabilities,
+      modelTypes: configEnvelope.modelTypes ?? capabilities.modelTypes,
+      config: configEnvelope.config ?? capabilities.config,
+    } as unknown as CapabilitiesResponse
   },
   async uploadFile(file: File): Promise<AudioFileMeta> {
     const form = new FormData()

@@ -1319,6 +1319,12 @@ def health() -> dict[str, Any]:
 @app.get("/api/capabilities")
 def capabilities() -> dict[str, Any]:
     payload = cached_capabilities()
+    # Model/checkpoint probing is intentionally cached on disk, but form
+    # defaults are cheap configuration and must never be held back by an old
+    # capability snapshot after a backend deployment.
+    config_payload = runtime_config()
+    payload["config"] = config_payload
+    payload["modelTypes"] = config_payload.get("modelTypes", payload.get("modelTypes", {}))
     payload["time"] = utc_now_iso()
     payload["version"] = "sem-e2e-api-0.1"
     return payload

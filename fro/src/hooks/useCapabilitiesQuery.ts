@@ -8,11 +8,11 @@ export function useCapabilitiesQuery() {
   return useQuery({
     queryKey: capabilitiesQueryKey,
     queryFn: getCapabilities,
-    staleTime: Number.POSITIVE_INFINITY,
-    gcTime: Number.POSITIVE_INFINITY,
-    refetchOnMount: false,
-    refetchOnReconnect: false,
-    refetchOnWindowFocus: false,
+    staleTime: 30_000,
+    gcTime: 5 * 60_000,
+    refetchOnMount: 'always',
+    refetchOnReconnect: true,
+    refetchOnWindowFocus: true,
     retry: 1,
   })
 }

@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 import result_adapter
 from result_adapter import runtime_config
 import metric_definitions
+import api_server
 
 
 class ModelCapabilitiesTest(unittest.TestCase):
@@ -95,6 +96,29 @@ class ModelCapabilitiesTest(unittest.TestCase):
         self.assertEqual(evaluation[0]["value"], "speechbrain/spkrec-ecapa-voxceleb")
         self.assertIn("evaluation_model", evaluation[0]["type"])
         self.assertNotEqual(evaluation[0]["branch"], "timbre")
+
+    def test_capabilities_overlay_fresh_runtime_config_on_cached_probe(self) -> None:
+        cached = {
+            "ok": True,
+            "modelTypes": {"asr": [{"value": "old"}]},
+            "config": {"defaults": {"optimization": {"steps": 100}}},
+            "cache": {"hit": True, "revision": 1},
+        }
+        fresh = {
+            "modelTypes": {"asr": [{"value": "generative_asr"}]},
+            "defaults": {"optimization": {"steps": 200}},
+        }
+
+        with patch.object(api_server, "cached_capabilities", return_value=cached), patch.object(
+            api_server,
+            "runtime_config",
+            return_value=fresh,
+        ):
+            payload = api_server.capabilities()
+
+        self.assertEqual(payload["config"]["defaults"]["optimization"]["steps"], 200)
+        self.assertEqual(payload["modelTypes"], fresh["modelTypes"])
+        self.assertEqual(payload["cache"]["revision"], 1)
 
     def test_hugging_face_model_ids_resolve_to_project_checkpoints(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
