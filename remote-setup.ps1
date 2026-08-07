@@ -98,9 +98,17 @@ function Stop-LocalProjectProcesses {
 function Get-RemoteHealth {
   param([string]$SshPath)
 
-  $healthCommand = "curl --fail --silent --show-error --max-time 10 http://127.0.0.1:${BackendPort}/api/health"
-  $raw = (& $SshPath -o BatchMode=yes -o ConnectTimeout=15 $SshHost $healthCommand 2>$null | Out-String).Trim()
-  if ($LASTEXITCODE -ne 0 -or -not $raw) {
+  $healthCommand = "curl --fail --silent --max-time 10 http://127.0.0.1:${BackendPort}/api/health 2>/dev/null"
+  $previousErrorActionPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = "Continue"
+    $raw = (& $SshPath -o BatchMode=yes -o ConnectTimeout=15 $SshHost $healthCommand 2>$null | Out-String).Trim()
+    $sshExitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+  }
+
+  if ($sshExitCode -ne 0 -or -not $raw) {
     return $null
   }
 

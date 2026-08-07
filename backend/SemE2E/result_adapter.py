@@ -195,10 +195,61 @@ FORMAL_SEMANTIC_ENCODERS = ["S3", "HuBERT", "Whisper", "MFCC"]
 FORMAL_TIMBRE_ENCODERS = ["VITS", "GPT-SoVITS", "MFCC", "WavLM", "CosyVoice"]
 FORMAL_ASR_MODEL = "openai/whisper-small"
 FORMAL_TTS_BACKEND = "tts_models/multilingual/multi-dataset/xtts_v2"
+MODEL_TYPES = {
+    "tts": [
+        {
+            "value": "zero_shot",
+            "name": "零样本克隆",
+            "information": "只需短参考语音即可直接复刻目标声音，代表低门槛、即时式语音克隆风险。",
+        },
+        {
+            "value": "fine_tuning",
+            "name": "微调式克隆",
+            "information": "收集多条目标语音并进一步训练模型，使其稳定学习目标声音，代表公开语音被长期收集后的训练式滥用风险。",
+        },
+        {
+            "value": "llm_based",
+            "name": "LLM 语音克隆",
+            "information": "利用 Speech Tokenizer 与语言模型进行语音建模，代表当前语音 Token 化和大模型驱动的新型克隆链路。",
+        },
+    ],
+    "asr": [
+        {"value": "generative_asr", "name": "通用生成式 ASR", "information": "通过生成式解码得到识别文本的通用语音识别路线。"},
+        {"value": "ctc_asr", "name": "CTC 语音识别", "information": "使用 CTC 对齐完成语音到文本映射的识别路线。"},
+        {"value": "self_supervised_asr", "name": "自监督语音识别", "information": "基于自监督预训练语音表示构建的识别路线。"},
+        {"value": "non_autoregressive_asr", "name": "非自回归 ASR", "information": "不依赖逐字自回归生成的高效语音识别路线。"},
+        {"value": "chinese_asr", "name": "中文语音识别", "information": "针对中文语音识别场景训练或优化的模型。"},
+    ],
+    "semantic": [
+        {"value": "speech_tokenizer", "name": "语音 Tokenizer", "information": "将连续语音转换为模型可处理的语音表示或离散 Token。"},
+        {"value": "semantic_encoder", "name": "语义编码器", "information": "提取语音内容与发音相关的高层表示。"},
+        {"value": "llm_frontend", "name": "语音大模型前端", "information": "位于原始语音与语音大模型之间的前端表示模块。"},
+        {"value": "self_supervised_representation", "name": "自监督语音表示", "information": "从大规模无标注语音中学习的通用表示。"},
+        {"value": "asr_encoder", "name": "ASR 编码器", "information": "语音识别模型在生成文本之前使用的编码前端。"},
+        {"value": "acoustic_feature", "name": "声学特征", "information": "描述基础频谱、发音和音色结构的声学表示。"},
+    ],
+    "identity": [
+        {"value": "tts_encoder", "name": "TTS 编码器", "information": "语音合成系统用于提取音色或声音条件的编码模块。"},
+        {"value": "voice_identity_encoder", "name": "声音身份编码器", "information": "提取说话人身份与音色信息的编码模块。"},
+        {"value": "clone_encoder", "name": "克隆系统编码器", "information": "语音克隆系统用于提取参考声音条件的编码模块。"},
+        {"value": "fine_tuning_related", "name": "微调相关编码器", "information": "训练式语音克隆在数据适配或微调过程中使用的声音表示模块。"},
+        {"value": "acoustic_feature", "name": "声学特征", "information": "描述基础频谱、发音和音色结构的声学表示。"},
+        {"value": "self_supervised_representation", "name": "自监督语音表示", "information": "从大规模无标注语音中学习的通用表示。"},
+        {"value": "speaker_encoder", "name": "说话人编码器", "information": "将语音转换为可比较的说话人身份表示。"},
+        {"value": "speaker_verification", "name": "说话人验证", "information": "用于比较两段语音是否来自同一说话人的模型。"},
+    ],
+    "evaluation": [
+        {"value": "speaker_verification", "name": "说话人验证", "information": "用于比较两段语音是否来自同一说话人的模型。"},
+        {"value": "evaluation_model", "name": "独立评估模型", "information": "只用于结果评价，不参与 VoiceShield 扰动生成。"},
+    ],
+}
 SUPPORTED_TTS_MODELS = [
     {
         "label": "XTTS-v2",
+        "name": "XTTS-v2",
         "value": "XTTS-v2",
+        "type": ["zero_shot"],
+        "information": "仅需短参考语音和目标文本即可生成相似声音，是 VoiceShield 用于验证低门槛零样本克隆风险的主要后端。",
         "backendValue": "tts_models/multilingual/multi-dataset/xtts_v2",
         "cacheName": "tts_models--multilingual--multi-dataset--xtts_v2",
         "aliases": ["default", "xtts", "xtts-v2", "xtts_v2", "coquitts:xtts_v2"],
@@ -207,7 +258,10 @@ SUPPORTED_TTS_MODELS = [
     },
     {
         "label": "XTTS-v1.1",
+        "name": "XTTS-v1.1",
         "value": "XTTS-v1.1",
+        "type": ["zero_shot"],
+        "information": "XTTS 的早期跨语言零样本克隆版本，用于验证保护效果能否迁移到同系列的不同模型版本。",
         "backendValue": "tts_models/multilingual/multi-dataset/xtts_v1.1",
         "cacheName": "tts_models--multilingual--multi-dataset--xtts_v1.1",
         "aliases": ["xtts-v1.1", "xtts_v1.1", "xtts-v1", "xtts_v1", "coquitts:xtts_v1.1"],
@@ -216,7 +270,10 @@ SUPPORTED_TTS_MODELS = [
     },
     {
         "label": "YourTTS",
+        "name": "YourTTS",
         "value": "YourTTS",
+        "type": ["zero_shot"],
+        "information": "面向少量参考语音的跨说话人合成模型，用于补充验证传统零样本语音克隆路径。",
         "backendValue": "tts_models/multilingual/multi-dataset/your_tts",
         "cacheName": "tts_models--multilingual--multi-dataset--your_tts",
         "aliases": ["your-tts", "your_tts", "coquitts:your_tts"],
