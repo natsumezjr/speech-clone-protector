@@ -535,6 +535,7 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
     return Array.from(unique.values()).sort((left, right) => String(left.taskStatus?.createdAt ?? left.createdAt ?? '').localeCompare(String(right.taskStatus?.createdAt ?? right.createdAt ?? '')))
   }, [linkedTaskStatus, result.asrResults, result.taskId])
   const cloneHistory = useMemo<CloneHistoryEntry[]>(() => {
+    const persistedCloneResults = result.cloneResults ?? []
     const snapshots = [
       ...(linkedTaskStatus?.cloneTasks ?? []),
       ...(linkedTaskStatus?.cloneTask ? [linkedTaskStatus.cloneTask] : []),
@@ -568,7 +569,12 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
       const cloneSubId = snapshot.cloneSubId ?? undefined
       const key = cloneSubId ? `sub:${cloneSubId}` : `snapshot:${snapshot.createdAt ?? index}`
       const current = unique.get(key)
-      const snapshotResult = snapshot.cloneResult ?? current?.result
+      const persistedResult = cloneSubId
+        ? persistedCloneResults.find((item) => item.cloneSubId === cloneSubId)
+        : snapshot.cloneResult?.cloneId
+          ? persistedCloneResults.find((item) => item.cloneId === snapshot.cloneResult?.cloneId)
+          : undefined
+      const snapshotResult = persistedResult ?? snapshot.cloneResult ?? current?.result
       unique.set(key, {
         key,
         taskId: snapshotResult?.taskId ?? current?.taskId ?? result.taskId,
@@ -1747,12 +1753,14 @@ function CloneCoreMetricCards({ cloneEval }: { cloneEval: CloneEval }) {
         tone="amber"
         info={(
           <MetricFormulaContent
-            description="针对当前选中的单个克隆结果，比较两段克隆音频的 DNSMOS 语音质量评分。"
+            description="先比较两段克隆音频的 DNSMOS 语音质量评分，再结合原始克隆能力以及已有的身份、语义保护效果，判断质量下降在当前结果中的必要程度。"
             formulas={[
               'r_q=\\max\\!\\left(0,\\frac{q^0-q^1}{q^0-1}\\right)',
-              'S_{\\mathrm{clone\\_quality}}=\\Phi(r_q;r_{90}^{q})',
+              'S_q^{\\mathrm{raw}}=\\Phi(r_q;r_{90}^{q})',
+              '\\rho_q=\\max\\!\\left(1-w^{\\mathrm{id}},1-\\frac{\\min(S_{\\mathrm{id}},S_{\\mathrm{sem}})}{100}\\right)',
+              'S_{\\mathrm{clone\\_quality}}=(1-\\rho_q)\\times100+\\rho_q S_q^{\\mathrm{raw}}',
             ]}
-            note="分数越高，表示保护后克隆音频的听感质量下降越明显。"
+            note="身份和语义已得到充分保护时，不再要求额外破坏听感；原始克隆能力较弱或其他保护不足时，实际质量下降仍保持较高参考价值。"
           />
         )}
       />

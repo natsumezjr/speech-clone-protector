@@ -521,6 +521,8 @@ function normalizeCloneEval(value: unknown): TaskResult['cloneEval'] {
     cleanCloneQualityMos: metricNumber(['cleanCloneQualityMos', 'clean_clone_quality_mos']),
     protectedCloneQualityMos: metricNumber(['protectedCloneQualityMos', 'protected_clone_quality_mos']),
     cloneQualityDropRate: metricNumber(['cloneQualityDropRate', 'clone_quality_drop_rate']),
+    cloneQualityRawScore: metricNumber(['cloneQualityRawScore', 'clone_quality_raw_score']),
+    cloneQualityRelevance: metricNumber(['cloneQualityRelevance', 'clone_quality_relevance']),
     cloneQualityScore: metricNumber(['cloneQualityScore', 'clone_quality_score']),
     qualityBaselineWeight: metricNumber(['qualityBaselineWeight', 'quality_baseline_weight']),
     cloneQualityModel: metricString(['cloneQualityModel', 'clone_quality_model']),

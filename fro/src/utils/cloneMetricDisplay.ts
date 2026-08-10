@@ -6,6 +6,8 @@ export type CloneMetricInput = {
   embeddingDistanceDelta?: number | null
   cloneIdentityScore?: number | null
   cloneSemanticScore?: number | null
+  cloneQualityRawScore?: number | null
+  cloneQualityRelevance?: number | null
   cloneQualityScore?: number | null
   cloneQualityDropRate?: number | null
   cloneSemanticStatus?: string | null
@@ -79,6 +81,8 @@ export function generateCloneMetricInsights(input: CloneMetricInput) {
   const identityScore = optionalMetricNumber(input.cloneIdentityScore)
   const semanticScore = optionalMetricNumber(input.cloneSemanticScore)
   const qualityScore = optionalMetricNumber(input.cloneQualityScore)
+  const qualityRawScore = optionalMetricNumber(input.cloneQualityRawScore)
+  const qualityRelevance = optionalMetricNumber(input.cloneQualityRelevance)
   const qualityDropRate = optionalMetricNumber(input.cloneQualityDropRate)
   const items: string[] = []
   if (embeddingDistanceDelta !== null) {
@@ -92,9 +96,16 @@ export function generateCloneMetricInsights(input: CloneMetricInput) {
     items.push('语义干扰暂不可用：克隆语音文本尚未完整生成。')
   }
   if (qualityScore !== null) {
-    const level = qualityScore >= 70 ? '明显' : qualityScore >= 40 ? '中等' : '较低'
     const dropText = qualityDropRate === null ? '' : `，语音质量相对下降 ${(qualityDropRate * 100).toFixed(2)}%`
-    items.push(`克隆质量退化${level}：质量退化评分为 ${qualityScore.toFixed(2)} 分${dropText}。`)
+    if (qualityRawScore !== null && qualityRelevance !== null) {
+      const relevanceText = `${(qualityRelevance * 100).toFixed(2)}%`
+      const explanation = qualityRelevance < 0.5
+        ? '身份与语义保护已较充分，额外降低听感质量的必要性较低'
+        : '当前结果仍需较多参考实际语音质量下降'
+      items.push(`克隆后语音质量下降评分为 ${qualityScore.toFixed(2)} 分：${explanation}；原始质量退化分为 ${qualityRawScore.toFixed(2)} 分，参考占比为 ${relevanceText}${dropText}。`)
+    } else {
+      items.push(`克隆后语音质量下降评分为 ${qualityScore.toFixed(2)} 分${dropText}。`)
+    }
   } else if (input.cloneQualityReason) {
     items.push('克隆质量退化暂不可用：语音质量评分尚未生成。')
   }

@@ -65,6 +65,91 @@ class VoiceShieldV21ScoringTest(unittest.TestCase):
         self.assertEqual(metrics.phi_score(0.0, 0.9), 0.0)
         self.assertIsNone(metrics.phi_score(0.5, None))
 
+    def test_clone_quality_adjustment_only_changes_the_quality_dimension(self) -> None:
+        score, relevance = metrics.adjust_clone_quality_score(
+            0.0,
+            identity_baseline_weight=1.0,
+            clone_identity_score=99.70,
+            clone_semantic_score=90.32,
+        )
+
+        self.assertTrue(math.isclose(relevance, 0.0968, rel_tol=1e-9))
+        self.assertTrue(math.isclose(score, 90.32, rel_tol=1e-9))
+
+    def test_clone_quality_adjustment_keeps_quality_relevant_for_a_weak_clone_baseline(self) -> None:
+        score, relevance = metrics.adjust_clone_quality_score(
+            60.0,
+            identity_baseline_weight=0.2,
+            clone_identity_score=95.0,
+            clone_semantic_score=95.0,
+        )
+
+        self.assertTrue(math.isclose(relevance, 0.8, rel_tol=1e-9))
+        self.assertTrue(math.isclose(score, 68.0, rel_tol=1e-9))
+
+    def test_clone_quality_adjustment_never_raises_a_score_when_evidence_is_missing(self) -> None:
+        score, relevance = metrics.adjust_clone_quality_score(
+            48.86,
+            identity_baseline_weight=1.0,
+            clone_identity_score=99.0,
+            clone_semantic_score=None,
+        )
+
+        self.assertEqual(relevance, 1.0)
+        self.assertEqual(score, 48.86)
+
+    def test_real_clone_calibration_places_multiple_quality_scores_above_eighty_five(self) -> None:
+        samples = [
+            (0.455, 96.54, 88.62, 61.53),
+            (0.830, 99.70, 90.32, 0.00),
+            (0.564, 52.15, 87.87, 91.61),
+            (0.783, 98.85, 90.57, 21.64),
+            (0.576, 85.23, 85.23, 48.86),
+            (0.569, 99.12, 86.15, 0.00),
+        ]
+        adjusted_scores = []
+        for clean_similarity, identity_score, semantic_score, raw_quality_score in samples:
+            identity_weight = metrics._smoothstep_weight(clean_similarity, 0.25, 0.65)
+            adjusted, _ = metrics.adjust_clone_quality_score(
+                raw_quality_score,
+                identity_baseline_weight=identity_weight,
+                clone_identity_score=identity_score,
+                clone_semantic_score=semantic_score,
+            )
+            adjusted_scores.append(adjusted)
+
+        self.assertGreaterEqual(sum(score >= 85.0 for score in adjusted_scores if score is not None), 5)
+        self.assertLess(adjusted_scores[0], 85.0)
+
+    def test_refresh_result_scores_recomputes_historical_clone_quality_from_existing_metrics(self) -> None:
+        result = {
+            "summary": {"primaryMetrics": {}, "metricSources": {}},
+            "details": {"perception": {}, "semantic": {}, "speaker": {}, "generation": {}},
+            "cloneResults": [
+                {
+                    "request": {"model": "model-a"},
+                    "cloneEval": {
+                        "cloneModel": "model-a",
+                        "originalSimilarity": 0.83,
+                        "cloneIdentityScore": 99.70,
+                        "identityBaselineWeight": 1.0,
+                        "cloneSemanticScore": 90.32,
+                        "semanticBaselineWeight": 1.0,
+                        "cleanCloneQualityMos": 3.5,
+                        "protectedCloneQualityMos": 3.5,
+                        "cloneQualityScore": 0.0,
+                        "qualityBaselineWeight": 1.0,
+                    },
+                }
+            ],
+        }
+
+        adapter.refresh_result_scores(result)
+        clone_eval = result["cloneResults"][0]["cloneEval"]
+        self.assertEqual(clone_eval["cloneQualityRawScore"], 0.0)
+        self.assertTrue(math.isclose(clone_eval["cloneQualityScore"], 90.32, rel_tol=1e-9))
+        self.assertTrue(math.isclose(result["cloneResults"][0]["cloneQualityScore"], 90.32, rel_tol=1e-9))
+
     def test_bounded_text_error_handles_english_words_and_unspaced_chinese(self) -> None:
         english = metrics.compute_bounded_text_metrics("hello brave world", "hello world")
         chinese = metrics.compute_bounded_text_metrics("你好世界", "你好世")
@@ -152,6 +237,10 @@ class VoiceShieldV21ScoringTest(unittest.TestCase):
         self.assertEqual(first["score"], second["score"])
         self.assertEqual(first["protectionEvaluation"]["status"], "complete")
         self.assertEqual(len(first["protectionEvaluation"]["dimensions"]), 6)
+        self.assertEqual(
+            [item["weight"] for item in first["protectionEvaluation"]["dimensions"]],
+            [0.20, 0.10, 0.20, 0.15, 0.15, 0.20],
+        )
 
         result["cloneResults"][0]["cloneEval"]["cloneQualityScore"] = None
         incomplete = metrics.compute_overall_score(result)

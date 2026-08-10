@@ -46,6 +46,8 @@ class CloneMetricsBackfillTest(unittest.TestCase):
             "cloneQualityModel": "DNSMOS P.835 OVRL",
             "cleanCloneQualityMos": 3.8,
             "protectedCloneQualityMos": 3.1,
+            "cloneQualityRawScore": 58.0,
+            "cloneQualityRelevance": 0.82,
             "cloneQualityScore": 65.0,
             "qualityBaselineWeight": 1.0,
             "createdAt": "2099-01-01T00:00:00+00:00",
@@ -212,10 +214,12 @@ class CloneMetricsBackfillTest(unittest.TestCase):
         self.assertEqual(persisted_clone["cloneSemanticScore"], 78.0)
         self.assertEqual(persisted_clone["createdAt"], "2026-08-08T00:58:32+00:00")
         self.assertEqual(persisted_clone["cloneEval"]["createdAt"], "2026-08-08T00:58:32+00:00")
-        self.assertEqual(clone_sidecar["cloneEval"]["cloneQualityScore"], 65.0)
+        expected_quality_score = persisted_clone["cloneEval"]["cloneQualityScore"]
+        self.assertGreater(expected_quality_score, 65.0)
+        self.assertEqual(clone_sidecar["cloneEval"]["cloneQualityScore"], expected_quality_score)
         self.assertEqual(history_sidecar["cloneEval"]["cloneIdentityScore"], 82.0)
         self.assertEqual(status["cloneResult"]["cloneEval"]["cloneSemanticScore"], 78.0)
-        self.assertEqual(status["cloneTask"]["cloneResult"]["cloneEval"]["cloneQualityScore"], 65.0)
+        self.assertEqual(status["cloneTask"]["cloneResult"]["cloneEval"]["cloneQualityScore"], expected_quality_score)
         self.assertEqual(status["cloneTasks"][0]["cloneResult"]["cloneEval"]["cloneIdentityScore"], 82.0)
         self.assertEqual(status["cloneBatches"][0]["items"][0]["cloneResult"]["cloneEval"]["cloneSemanticScore"], 78.0)
         self.assertEqual(wav_files_after, wav_files_before)

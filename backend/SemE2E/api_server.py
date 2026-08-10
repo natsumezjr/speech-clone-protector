@@ -1093,6 +1093,8 @@ def _frontend_clone(clone: dict[str, Any]) -> dict[str, Any]:
         "identityBaselineWeight": clone_metric("identityBaselineWeight"),
         "cloneSemanticScore": clone_metric("cloneSemanticScore"),
         "semanticBaselineWeight": clone_metric("semanticBaselineWeight"),
+        "cloneQualityRawScore": clone_metric("cloneQualityRawScore"),
+        "cloneQualityRelevance": clone_metric("cloneQualityRelevance"),
         "cloneQualityScore": clone_metric("cloneQualityScore"),
         "qualityBaselineWeight": clone_metric("qualityBaselineWeight"),
         "cloneConfidenceBefore": clone.get("cloneConfidenceBefore"),

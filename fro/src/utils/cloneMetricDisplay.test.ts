@@ -51,3 +51,15 @@ const visibleText = [
 assert(!visibleText.includes('↓ 100.0%'), 'Speaker Similarity card must not show relative percent drop')
 assert(!visibleText.includes('↑ 89.1%'), 'Embedding distance card must not show relative percent increase')
 assert(!visibleText.includes('防护下降率'), 'Clone result label should be replaced by 相似度下降量 in UI')
+
+const adjustedQualityInsight = generateCloneMetricInsights({
+  cloneIdentityScore: 99.70,
+  cloneSemanticScore: 90.32,
+  cloneQualityRawScore: 0,
+  cloneQualityRelevance: 0.0968,
+  cloneQualityScore: 90.32,
+  cloneQualityDropRate: 0,
+}).join(' ')
+assert(adjustedQualityInsight.includes('克隆后语音质量下降评分为 90.32 分'), 'Adjusted clone quality score should be explained')
+assert(adjustedQualityInsight.includes('原始质量退化分为 0.00 分'), 'Raw DNSMOS degradation score should remain traceable')
+assert(adjustedQualityInsight.includes('额外降低听感质量的必要性较低'), 'Strong identity and semantic protection should lower quality-degradation relevance')

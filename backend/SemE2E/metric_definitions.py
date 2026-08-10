@@ -337,14 +337,51 @@ def compute_clone_semantic_score(
     }
 
 
-def compute_clone_quality_score(clean_mos: Any, protected_mos: Any) -> dict[str, Any]:
+def adjust_clone_quality_score(
+    raw_score: Any,
+    *,
+    identity_baseline_weight: Any = None,
+    clone_identity_score: Any = None,
+    clone_semantic_score: Any = None,
+) -> tuple[float | None, float | None]:
+    raw_value = finite_float(raw_score)
+    score = raw_value
+    relevance = None
+    identity_weight = finite_float(identity_baseline_weight)
+    identity_score = finite_float(clone_identity_score)
+    semantic_score = finite_float(clone_semantic_score)
+    if raw_value is not None:
+        # Missing identity/semantic evidence must never improve the quality score.
+        relevance = 1.0
+        if identity_weight is not None and identity_score is not None and semantic_score is not None:
+            baseline_need = 1.0 - clamp(identity_weight)
+            defense_need = 1.0 - clamp(min(identity_score, semantic_score) / 100.0)
+            relevance = clamp(max(baseline_need, defense_need))
+            score = (1.0 - relevance) * 100.0 + relevance * raw_value
+    return score, relevance
+
+
+def compute_clone_quality_score(
+    clean_mos: Any,
+    protected_mos: Any,
+    *,
+    identity_baseline_weight: Any = None,
+    clone_identity_score: Any = None,
+    clone_semantic_score: Any = None,
+) -> dict[str, Any]:
     clean_value = finite_float(clean_mos)
     protected_value = finite_float(protected_mos)
     drop_rate = None
     if clean_value is not None and protected_value is not None and clean_value > 1.0:
         drop_rate = max(0.0, (clean_value - protected_value) / (clean_value - 1.0))
     baseline_weight = _smoothstep_weight(clean_value, 2.5, 4.0)
-    score = phi_score(drop_rate, SCORE_CALIBRATION["cloneQualityDropRate90"])
+    raw_score = phi_score(drop_rate, SCORE_CALIBRATION["cloneQualityDropRate90"])
+    score, relevance = adjust_clone_quality_score(
+        raw_score,
+        identity_baseline_weight=identity_baseline_weight,
+        clone_identity_score=clone_identity_score,
+        clone_semantic_score=clone_semantic_score,
+    )
     if clean_value is None or protected_value is None:
         reason = "克隆语音质量结果尚未生成"
     elif clean_value <= 1.0:
@@ -357,6 +394,8 @@ def compute_clone_quality_score(clean_mos: Any, protected_mos: Any) -> dict[str,
         "cleanCloneQualityMos": clean_value,
         "protectedCloneQualityMos": protected_value,
         "cloneQualityDropRate": drop_rate,
+        "cloneQualityRawScore": raw_score,
+        "cloneQualityRelevance": relevance,
         "cloneQualityScore": score,
         "qualityBaselineWeight": baseline_weight,
         "cloneQualityStatus": "available" if score is not None else "unavailable",
@@ -1765,6 +1804,8 @@ def compute_clone_eval(
         "cleanCloneQualityMos": finite_float(quality_metrics.get("cleanMos")),
         "protectedCloneQualityMos": finite_float(quality_metrics.get("protectedMos")),
         "cloneQualityDropRate": None,
+        "cloneQualityRawScore": None,
+        "cloneQualityRelevance": None,
         "cloneQualityScore": None,
         "qualityBaselineWeight": None,
         "cloneQualityModel": quality_metrics.get("model") or "DNSMOS P.835 OVRL",
@@ -1804,7 +1845,7 @@ def compute_clone_eval(
                 quality_metrics.get("status") or "unavailable",
                 quality_metrics.get("model") or "DNSMOS P.835 OVRL",
                 reason=quality_metrics.get("reason"),
-                formula="Phi(max(0,(q0-q1)/(q0-1)); cloneQualityDropRate90)",
+                formula="raw=Phi(max(0,(q0-q1)/(q0-1));r_q90); rho=max(1-w_id,1-min(S_id,S_sem)/100); score=(1-rho)*100+rho*raw",
             ),
             "cloneEval.cloneConfidenceBefore": metric_source("unavailable", "confidence_calibrator", reason="No confidence calibrator is configured", formula="sigmoid(A*similarity+B)"),
             "cloneEval.cloneConfidenceAfter": metric_source("unavailable", "confidence_calibrator", reason="No confidence calibrator is configured", formula="sigmoid(A*similarity+B)"),
@@ -1901,17 +1942,25 @@ def compute_clone_eval(
         formula="w_sem=A_clean^2*(3-2*A_clean); score=.55*Phi(tokenChange)+.45*Phi(semanticDrift)",
     )
 
-    quality = compute_clone_quality_score(quality_metrics.get("cleanMos"), quality_metrics.get("protectedMos"))
+    quality = compute_clone_quality_score(
+        quality_metrics.get("cleanMos"),
+        quality_metrics.get("protectedMos"),
+        identity_baseline_weight=eval_payload.get("identityBaselineWeight"),
+        clone_identity_score=eval_payload.get("cloneIdentityScore"),
+        clone_semantic_score=eval_payload.get("cloneSemanticScore"),
+    )
     eval_payload.update(quality)
     if quality_metrics.get("status") not in {"available", "computed"}:
         eval_payload["cloneQualityStatus"] = quality_metrics.get("status") or "unavailable"
         eval_payload["cloneQualityReason"] = quality_metrics.get("reason") or quality.get("cloneQualityReason")
-    eval_payload["_metricSources"]["cloneEval.cloneQualityScore"] = metric_source(
+    quality_source = metric_source(
         eval_payload["cloneQualityStatus"],
         quality_metrics.get("model") or "DNSMOS P.835 OVRL",
         reason=eval_payload.get("cloneQualityReason"),
-        formula="w_q=smoothstep((q0-2.5)/(4.0-2.5)); score=Phi(max(0,(q0-q1)/(q0-1));r_q90)",
+        formula="w_q=smoothstep((q0-2.5)/(4.0-2.5)); raw=Phi(max(0,(q0-q1)/(q0-1));r_q90); rho=max(1-w_id,1-min(S_id,S_sem)/100); score=(1-rho)*100+rho*raw",
     )
+    for metric_key in ("cloneQualityRawScore", "cloneQualityRelevance", "cloneQualityScore"):
+        eval_payload["_metricSources"][f"cloneEval.{metric_key}"] = quality_source
 
     available_dimensions = sum(
         eval_payload.get(key) == "available"

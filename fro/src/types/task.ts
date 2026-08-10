@@ -413,6 +413,8 @@ export interface CloneEval {
   cleanCloneQualityMos?: number | null
   protectedCloneQualityMos?: number | null
   cloneQualityDropRate?: number | null
+  cloneQualityRawScore?: number | null
+  cloneQualityRelevance?: number | null
   cloneQualityScore?: number | null
   qualityBaselineWeight?: number | null
   cloneQualityModel?: string | null

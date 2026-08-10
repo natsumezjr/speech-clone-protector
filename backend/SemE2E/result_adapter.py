@@ -28,6 +28,7 @@ from metric_definitions import (
     compute_asr_metrics,
     compute_clone_eval,
     compute_clone_identity_score,
+    compute_clone_quality_score,
     compute_direct_identity_score,
     compute_direct_speaker_metrics,
     compute_loss_summary,
@@ -83,6 +84,8 @@ CLONE_EVAL_MIRROR_FIELDS = (
     "cleanCloneQualityMos",
     "protectedCloneQualityMos",
     "cloneQualityDropRate",
+    "cloneQualityRawScore",
+    "cloneQualityRelevance",
     "cloneQualityScore",
     "qualityBaselineWeight",
     "cloneQualityModel",
@@ -2229,6 +2232,25 @@ def refresh_result_scores(result: dict[str, Any]) -> dict[str, Any]:
             )
             clone_eval.update(identity)
             clone_eval["cloneDefenseScore"] = identity.get("cloneIdentityScore")
+        elif clone_eval.get("identityBaselineWeight") is None:
+            identity = compute_clone_identity_score(
+                clone_eval.get("originalSimilarity", clone_result.get("originalSimilarity")),
+                clone_eval.get("protectedSimilarity", clone_result.get("protectedSimilarity")),
+            )
+            if identity.get("identityBaselineWeight") is not None:
+                clone_eval["identityBaselineWeight"] = identity["identityBaselineWeight"]
+        clean_clone_mos = clone_eval.get("cleanCloneQualityMos", clone_result.get("cleanCloneQualityMos"))
+        protected_clone_mos = clone_eval.get("protectedCloneQualityMos", clone_result.get("protectedCloneQualityMos"))
+        if to_float(clean_clone_mos) is not None and to_float(protected_clone_mos) is not None:
+            clone_eval.update(
+                compute_clone_quality_score(
+                    clean_clone_mos,
+                    protected_clone_mos,
+                    identity_baseline_weight=clone_eval.get("identityBaselineWeight"),
+                    clone_identity_score=clone_eval.get("cloneIdentityScore"),
+                    clone_semantic_score=clone_eval.get("cloneSemanticScore"),
+                )
+            )
         _sync_clone_eval_fields(clone_result, clone_eval)
         latest_clone_eval = clone_eval
     if latest_clone_eval is not None:
@@ -3621,6 +3643,8 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
             "identityBaselineWeight": clone_eval.get("identityBaselineWeight"),
             "cloneSemanticScore": clone_eval.get("cloneSemanticScore"),
             "semanticBaselineWeight": clone_eval.get("semanticBaselineWeight"),
+            "cloneQualityRawScore": clone_eval.get("cloneQualityRawScore"),
+            "cloneQualityRelevance": clone_eval.get("cloneQualityRelevance"),
             "cloneQualityScore": clone_eval.get("cloneQualityScore"),
             "qualityBaselineWeight": clone_eval.get("qualityBaselineWeight"),
             "cloneConfidenceBefore": clone_eval.get("cloneConfidenceBefore"),

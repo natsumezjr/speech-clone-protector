@@ -50,6 +50,8 @@ def missing_clone_metric_groups(clone_result: dict[str, Any]) -> list[str]:
         clone_eval.get("cloneQualityStatus") == "available"
         and _finite(clone_eval.get("cleanCloneQualityMos"))
         and _finite(clone_eval.get("protectedCloneQualityMos"))
+        and _finite(clone_eval.get("cloneQualityRawScore"))
+        and _finite(clone_eval.get("cloneQualityRelevance"))
         and _finite(clone_eval.get("cloneQualityScore"))
         and _finite(clone_eval.get("qualityBaselineWeight"))
     ):

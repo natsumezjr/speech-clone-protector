@@ -233,6 +233,8 @@ def empty_details() -> dict[str, Any]:
             "cleanCloneQualityMos": None,
             "protectedCloneQualityMos": None,
             "cloneQualityDropRate": None,
+            "cloneQualityRawScore": None,
+            "cloneQualityRelevance": None,
             "cloneQualityScore": None,
             "qualityBaselineWeight": None,
             "cloneQualityModel": None,
