@@ -52,6 +52,20 @@ class ModelCapabilitiesTest(unittest.TestCase):
         self.assertTrue(gpt_sovits["promptRequired"])
         self.assertNotIn("fineTuneDatasetSeconds", gpt_sovits)
 
+    def test_xtts_v11_is_not_advertised_for_new_clone_tasks(self) -> None:
+        tts_values = {option["value"] for option in self.config["models"]["tts"]}
+        tts_backend_values = {option["backendValue"] for option in self.config["models"]["tts"]}
+
+        self.assertIn("XTTS-v2", tts_values)
+        self.assertIn("xtts_v2", tts_backend_values)
+        self.assertNotIn("XTTS-v1.1", tts_values)
+        self.assertNotIn("tts_models/multilingual/multi-dataset/xtts_v1.1", tts_backend_values)
+        self.assertEqual(
+            result_adapter.normalize_tts_model("XTTS-v1.1"),
+            "tts_models/multilingual/multi-dataset/xtts_v1.1",
+        )
+        self.assertEqual(result_adapter._tts_catalog_entry("XTTS-v1.1")["value"], "XTTS-v1.1")
+
     def test_gpt_sovits_status_accepts_live_fine_tune_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -101,12 +115,16 @@ class ModelCapabilitiesTest(unittest.TestCase):
         cached = {
             "ok": True,
             "modelTypes": {"asr": [{"value": "old"}]},
-            "config": {"defaults": {"optimization": {"steps": 100}}},
+            "config": {
+                "defaults": {"optimization": {"steps": 100}},
+                "models": {"tts": [{"value": "XTTS-v1.1"}]},
+            },
             "cache": {"hit": True, "revision": 1},
         }
         fresh = {
             "modelTypes": {"asr": [{"value": "generative_asr"}]},
             "defaults": {"optimization": {"steps": 200}},
+            "models": {"tts": [{"value": "XTTS-v2"}]},
         }
 
         with patch.object(api_server, "cached_capabilities", return_value=cached), patch.object(
@@ -117,6 +135,7 @@ class ModelCapabilitiesTest(unittest.TestCase):
             payload = api_server.capabilities()
 
         self.assertEqual(payload["config"]["defaults"]["optimization"]["steps"], 200)
+        self.assertEqual(payload["config"]["models"]["tts"], [{"value": "XTTS-v2"}])
         self.assertEqual(payload["modelTypes"], fresh["modelTypes"])
         self.assertEqual(payload["cache"]["revision"], 1)
 

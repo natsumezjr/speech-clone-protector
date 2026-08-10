@@ -450,6 +450,7 @@ SUPPORTED_TTS_MODELS = [
         "languages": ["en", "zh-cn"],
         "description": "Coqui XTTS-v1.1 cross-language voice cloning backend.",
         "backend": "CoquiTTS",
+        "frontendVisible": False,
     },
     {
         "label": "YourTTS",
@@ -852,6 +853,8 @@ def runtime_config() -> dict[str, Any]:
     ]
     tts_options = []
     for item in SUPPORTED_TTS_MODELS:
+        if item.get("frontendVisible") is False:
+            continue
         status, reason, cache_path = _tts_catalog_status(item, coqui_available=tts_available)
         tts_options.append(
             _model_option(
