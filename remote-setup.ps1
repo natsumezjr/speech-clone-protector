@@ -302,11 +302,13 @@ export SEME2E_ASR_WORKER_MAX_CONCURRENCY=1
 export SEME2E_SEMANTIC_WORKER_MAX_CONCURRENCY=1
 export SEME2E_COQUI_TTS_WORKER_MAX_CONCURRENCY=1
 export SEME2E_COSYVOICE_WORKER_MAX_CONCURRENCY=1
-export SEME2E_GPT_SOVITS_WORKER_MAX_CONCURRENCY=1
 export SEME2E_CLONE_GPU_MAX_CONCURRENCY=1
 export SEME2E_DNSMOS_WORKER_MAX_CONCURRENCY=1
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export PYTHONUNBUFFERED=1
+gpt_worker_max_concurrency=1
+unset SEME2E_GPT_SOVITS_GPU_POOL
+unset SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES
 
 if command -v nvidia-smi >/dev/null 2>&1; then
   mapfile -t gpu_candidates < <(
@@ -324,19 +326,26 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     )
   fi
   if [ "${#gpu_candidates[@]}" -gt 0 ]; then
-    protect_gpu="${gpu_candidates[0]}"
-    asr_gpu="${gpu_candidates[1]:-$protect_gpu}"
-    clone_gpu="${gpu_candidates[2]:-$asr_gpu}"
-    gpt_gpu="${gpu_candidates[3]:-$protect_gpu}"
+    gpt_gpu_primary="${gpu_candidates[0]}"
+    gpt_gpu_secondary="${gpu_candidates[1]:-}"
+    gpt_gpu_pool="$gpt_gpu_primary"
+    if [ -n "$gpt_gpu_secondary" ] && [ "$gpt_gpu_secondary" != "$gpt_gpu_primary" ]; then
+      gpt_gpu_pool="$gpt_gpu_primary,$gpt_gpu_secondary"
+      gpt_worker_max_concurrency=2
+    fi
+    protect_gpu="${gpu_candidates[2]:-$gpt_gpu_primary}"
+    asr_gpu="${gpu_candidates[3]:-$protect_gpu}"
+    clone_gpu="${gpu_candidates[4]:-$asr_gpu}"
     export CUDA_VISIBLE_DEVICES="$protect_gpu"
     export SEME2E_ASR_CUDA_VISIBLE_DEVICES="$asr_gpu"
     export SEME2E_CLONE_ASR_CUDA_VISIBLE_DEVICES="$asr_gpu"
     export SEME2E_COQUI_TTS_CUDA_VISIBLE_DEVICES="$clone_gpu"
     export SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES="$clone_gpu"
-    export SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES="$gpt_gpu"
-    printf 'GPU routing: protect=%s asr=%s clone=%s gpt-sovits=%s\n' "$protect_gpu" "$asr_gpu" "$clone_gpu" "$gpt_gpu"
+    export SEME2E_GPT_SOVITS_GPU_POOL="$gpt_gpu_pool"
+    printf 'GPU routing: protect=%s asr=%s clone=%s gpt-sovits-pool=%s\n' "$protect_gpu" "$asr_gpu" "$clone_gpu" "$gpt_gpu_pool"
   fi
 fi
+export SEME2E_GPT_SOVITS_WORKER_MAX_CONCURRENCY="$gpt_worker_max_concurrency"
 
 new_pid=""
 tracked_new_pids=""

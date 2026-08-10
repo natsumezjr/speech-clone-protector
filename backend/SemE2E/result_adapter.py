@@ -718,17 +718,21 @@ ASR_WORKER_MAX_CONCURRENCY = max(1, _env_int("SEME2E_ASR_WORKER_MAX_CONCURRENCY"
 SEMANTIC_WORKER_MAX_CONCURRENCY = max(1, _env_int("SEME2E_SEMANTIC_WORKER_MAX_CONCURRENCY", 2))
 COQUI_TTS_WORKER_MAX_CONCURRENCY = max(1, _env_int("SEME2E_COQUI_TTS_WORKER_MAX_CONCURRENCY", 2))
 COSYVOICE_WORKER_MAX_CONCURRENCY = max(1, _env_int("SEME2E_COSYVOICE_WORKER_MAX_CONCURRENCY", 1))
-GPT_SOVITS_WORKER_MAX_CONCURRENCY = max(1, _env_int("SEME2E_GPT_SOVITS_WORKER_MAX_CONCURRENCY", 1))
+GPT_SOVITS_WORKER_MAX_CONCURRENCY = min(
+    2,
+    max(1, _env_int("SEME2E_GPT_SOVITS_WORKER_MAX_CONCURRENCY", 2)),
+)
 DNSMOS_WORKER_MAX_CONCURRENCY = max(1, _env_int("SEME2E_DNSMOS_WORKER_MAX_CONCURRENCY", 1))
 CLONE_GPU_MAX_CONCURRENCY = max(1, _env_int("SEME2E_CLONE_GPU_MAX_CONCURRENCY", 1))
 ASR_WORKER_SLOTS = threading.BoundedSemaphore(ASR_WORKER_MAX_CONCURRENCY)
 SEMANTIC_WORKER_SLOTS = threading.BoundedSemaphore(SEMANTIC_WORKER_MAX_CONCURRENCY)
 COQUI_TTS_WORKER_SLOTS = threading.BoundedSemaphore(COQUI_TTS_WORKER_MAX_CONCURRENCY)
 COSYVOICE_WORKER_SLOTS = threading.BoundedSemaphore(COSYVOICE_WORKER_MAX_CONCURRENCY)
-GPT_SOVITS_WORKER_SLOTS = threading.BoundedSemaphore(GPT_SOVITS_WORKER_MAX_CONCURRENCY)
 DNSMOS_WORKER_SLOTS = threading.BoundedSemaphore(DNSMOS_WORKER_MAX_CONCURRENCY)
 CLONE_GPU_SLOTS_GUARD = threading.Lock()
 CLONE_GPU_SLOTS: dict[str, threading.BoundedSemaphore] = {}
+GPT_SOVITS_GPU_LEASE_CONDITION = threading.Condition()
+GPT_SOVITS_GPU_LEASES: set[str] = set()
 
 
 def _acquire_worker_slot(semaphore: threading.BoundedSemaphore, cancel_event: Any | None) -> None:
@@ -792,6 +796,65 @@ def _clone_gpu_slot(key: str) -> threading.BoundedSemaphore:
             slot = threading.BoundedSemaphore(CLONE_GPU_MAX_CONCURRENCY)
             CLONE_GPU_SLOTS[key] = slot
         return slot
+
+
+def _gpt_sovits_gpu_candidates(requested_device: str) -> tuple[str, ...]:
+    configured_pool = os.getenv("SEME2E_GPT_SOVITS_GPU_POOL", "").strip()
+    if not configured_pool:
+        configured_pool = os.getenv("SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES", "").strip()
+    candidates = _visible_gpu_tokens(configured_pool)
+    if not candidates:
+        candidates = _clone_gpu_slot_keys(
+            requested_device,
+            "SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES",
+        )
+    candidates = candidates[:GPT_SOVITS_WORKER_MAX_CONCURRENCY]
+    if not candidates:
+        raise RuntimeError("GPT-SoVITS requires at least one configured CUDA GPU")
+    return candidates
+
+
+def _acquire_gpt_sovits_gpu_lease(
+    candidates: tuple[str, ...],
+    cancel_event: Any | None,
+) -> str:
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("TASK_CANCELLED")
+        with GPT_SOVITS_GPU_LEASE_CONDITION:
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("TASK_CANCELLED")
+            for candidate in candidates:
+                if candidate in GPT_SOVITS_GPU_LEASES:
+                    continue
+                GPT_SOVITS_GPU_LEASES.add(candidate)
+                if cancel_event is not None and cancel_event.is_set():
+                    GPT_SOVITS_GPU_LEASES.remove(candidate)
+                    GPT_SOVITS_GPU_LEASE_CONDITION.notify_all()
+                    raise RuntimeError("TASK_CANCELLED")
+                return candidate
+            GPT_SOVITS_GPU_LEASE_CONDITION.wait(timeout=0.25)
+
+
+def _release_gpt_sovits_gpu_lease(candidate: str) -> None:
+    with GPT_SOVITS_GPU_LEASE_CONDITION:
+        GPT_SOVITS_GPU_LEASES.discard(candidate)
+        GPT_SOVITS_GPU_LEASE_CONDITION.notify_all()
+
+
+@contextmanager
+def _gpt_sovits_gpu_lease(
+    requested_device: str,
+    cancel_event: Any | None,
+):
+    candidate = _acquire_gpt_sovits_gpu_lease(
+        _gpt_sovits_gpu_candidates(requested_device),
+        cancel_event,
+    )
+    try:
+        yield candidate
+    finally:
+        _release_gpt_sovits_gpu_lease(candidate)
 
 
 def _release_worker_slots(slots: list[threading.BoundedSemaphore]) -> None:
@@ -3181,10 +3244,6 @@ def _gpt_sovits_clone_pair(
     worker = ROOT / "gpt_sovits_live_finetune.py"
     work_dir = original_output.parent / "fine_tune"
     timeout_seconds = _env_int("SEME2E_GPT_SOVITS_TIMEOUT_SECONDS", 900)
-    worker_device, worker_env = _cuda_worker_runtime(
-        device,
-        "SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES",
-    )
     command = [
         str(GPT_SOVITS_PYTHON),
         str(worker),
@@ -3213,7 +3272,7 @@ def _gpt_sovits_clone_pair(
         "--protected-output",
         str(protected_output),
         "--device",
-        worker_device,
+        "cuda:0",
         "--cnhubert",
         str(GPT_SOVITS_CNHUBERT),
         "--bert",
@@ -3227,28 +3286,31 @@ def _gpt_sovits_clone_pair(
         "--timeout",
         str(timeout_seconds),
     ]
-    cuda_visible_devices = os.getenv("SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES", "").strip()
-    device_index = device.split(":", 1)[1] if ":" in device else "0"
-    command.extend(["--gpu-numbers", cuda_visible_devices or device_index])
-    if cuda_visible_devices:
-        command.extend(["--cuda-visible-devices", cuda_visible_devices])
-    environment = os.environ.copy()
-    _apply_environment_overrides(environment, worker_env)
-    acquired_slots = _acquire_clone_worker_slots(
-        GPT_SOVITS_WORKER_SLOTS,
-        _clone_gpu_slot_keys(device, "SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES"),
-        cancel_event,
-    )
-    try:
-        completed = _run_cancellable_subprocess(
-            command,
-            cwd=str(GPT_SOVITS_REPO_DIR),
-            env=environment,
-            timeout_seconds=timeout_seconds * 3,
-            cancel_event=cancel_event,
-        )
-    finally:
-        _release_worker_slots(acquired_slots)
+    with _gpt_sovits_gpu_lease(device, cancel_event) as leased_gpu:
+        shared_gpu_slot = _clone_gpu_slot(leased_gpu)
+        _acquire_worker_slot(shared_gpu_slot, cancel_event)
+        try:
+            # GPT-SoVITS s2_train.py rewrites CUDA_VISIBLE_DEVICES from gpu_numbers.
+            # Pass the physical lease there, while the worker itself uses logical cuda:0.
+            leased_command = [
+                *command,
+                "--gpu-numbers",
+                leased_gpu,
+                "--cuda-visible-devices",
+                leased_gpu,
+            ]
+            environment = os.environ.copy()
+            environment["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+            environment["CUDA_VISIBLE_DEVICES"] = leased_gpu
+            completed = _run_cancellable_subprocess(
+                leased_command,
+                cwd=str(GPT_SOVITS_REPO_DIR),
+                env=environment,
+                timeout_seconds=timeout_seconds * 3,
+                cancel_event=cancel_event,
+            )
+        finally:
+            shared_gpu_slot.release()
     marker = "VOICE_SHIELD_GPT_SOVITS_LIVE_RESULT="
     result_line = next((line for line in reversed(completed.stdout.splitlines()) if line.startswith(marker)), None)
     if completed.returncode != 0 or result_line is None:

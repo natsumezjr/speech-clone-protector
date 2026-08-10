@@ -393,13 +393,20 @@ class IsolatedWorkerRuntimeTest(unittest.TestCase):
             stdout='VOICE_SHIELD_GPT_SOVITS_LIVE_RESULT={"ok": true}\n',
             stderr="",
         )
+        lease_condition = threading.Condition()
+        leases: set[str] = set()
         with (
             mock.patch.object(result_adapter, "_gpt_sovits_model_status", return_value=("available", None, None)),
             mock.patch.object(result_adapter, "_run_cancellable_subprocess", return_value=completed) as runner,
-            mock.patch.object(result_adapter, "GPT_SOVITS_WORKER_SLOTS", threading.BoundedSemaphore(1)),
+            mock.patch.object(result_adapter, "GPT_SOVITS_WORKER_MAX_CONCURRENCY", 2),
+            mock.patch.object(result_adapter, "GPT_SOVITS_GPU_LEASE_CONDITION", lease_condition),
+            mock.patch.object(result_adapter, "GPT_SOVITS_GPU_LEASES", leases),
             mock.patch.dict(
                 result_adapter.os.environ,
-                {"SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES": "5"},
+                {
+                    "SEME2E_GPT_SOVITS_GPU_POOL": "5,2",
+                    "SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES": "",
+                },
             ),
         ):
             response = result_adapter._gpt_sovits_clone_pair(
@@ -419,17 +426,190 @@ class IsolatedWorkerRuntimeTest(unittest.TestCase):
         self.assertEqual(command[command.index("--device") + 1], "cuda:0")
         self.assertEqual(command[command.index("--gpu-numbers") + 1], "5")
         self.assertEqual(command[command.index("--cuda-visible-devices") + 1], "5")
+        self.assertEqual(runner.call_args.kwargs["env"]["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
         self.assertEqual(runner.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"], "5")
         self.assertEqual(runner.call_args.kwargs["timeout_seconds"], 2700)
+        self.assertEqual(leases, set())
         self.assertTrue(response["ok"])
 
-    def test_expensive_clone_worker_concurrency_defaults_to_one(self) -> None:
+    def test_expensive_clone_worker_concurrency_defaults(self) -> None:
         if "SEME2E_COSYVOICE_WORKER_MAX_CONCURRENCY" not in result_adapter.os.environ:
             self.assertEqual(result_adapter.COSYVOICE_WORKER_MAX_CONCURRENCY, 1)
         if "SEME2E_GPT_SOVITS_WORKER_MAX_CONCURRENCY" not in result_adapter.os.environ:
-            self.assertEqual(result_adapter.GPT_SOVITS_WORKER_MAX_CONCURRENCY, 1)
+            self.assertEqual(result_adapter.GPT_SOVITS_WORKER_MAX_CONCURRENCY, 2)
         if "SEME2E_CLONE_GPU_MAX_CONCURRENCY" not in result_adapter.os.environ:
             self.assertEqual(result_adapter.CLONE_GPU_MAX_CONCURRENCY, 1)
+
+    def test_gpt_sovits_gpu_pool_runs_two_distinct_leases_and_queues_the_third(self) -> None:
+        lease_condition = threading.Condition()
+        leases: set[str] = set()
+        entered = {name: threading.Event() for name in ("first", "second", "third")}
+        releases = {name: threading.Event() for name in entered}
+        assignments: dict[str, str] = {}
+        errors: list[BaseException] = []
+
+        def occupy(name: str) -> None:
+            try:
+                with result_adapter._gpt_sovits_gpu_lease("cuda:0", None) as leased_gpu:
+                    assignments[name] = leased_gpu
+                    entered[name].set()
+                    releases[name].wait(timeout=3)
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        threads: list[threading.Thread] = []
+        with (
+            mock.patch.object(result_adapter, "GPT_SOVITS_WORKER_MAX_CONCURRENCY", 2),
+            mock.patch.object(result_adapter, "GPT_SOVITS_GPU_LEASE_CONDITION", lease_condition),
+            mock.patch.object(result_adapter, "GPT_SOVITS_GPU_LEASES", leases),
+            mock.patch.dict(
+                result_adapter.os.environ,
+                {
+                    "SEME2E_GPT_SOVITS_GPU_POOL": "5,2,7",
+                    "SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES": "",
+                },
+            ),
+        ):
+            try:
+                for name in ("first", "second"):
+                    thread = threading.Thread(target=occupy, args=(name,))
+                    threads.append(thread)
+                    thread.start()
+                    self.assertTrue(entered[name].wait(timeout=1))
+
+                self.assertEqual({assignments["first"], assignments["second"]}, {"5", "2"})
+                self.assertEqual(leases, {"5", "2"})
+
+                third_thread = threading.Thread(target=occupy, args=("third",))
+                threads.append(third_thread)
+                third_thread.start()
+                self.assertFalse(entered["third"].wait(timeout=0.15))
+
+                releases["first"].set()
+                self.assertTrue(entered["third"].wait(timeout=1))
+                self.assertEqual(assignments["third"], assignments["first"])
+            finally:
+                for release in releases.values():
+                    release.set()
+                for thread in threads:
+                    thread.join(timeout=2)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(leases, set())
+
+    def test_gpt_sovits_gpu_pool_wait_honors_cancellation_without_leaking(self) -> None:
+        lease_condition = threading.Condition()
+        leases: set[str] = set()
+        cancel_event = threading.Event()
+        timer = threading.Timer(0.05, cancel_event.set)
+        with (
+            mock.patch.object(result_adapter, "GPT_SOVITS_WORKER_MAX_CONCURRENCY", 2),
+            mock.patch.object(result_adapter, "GPT_SOVITS_GPU_LEASE_CONDITION", lease_condition),
+            mock.patch.object(result_adapter, "GPT_SOVITS_GPU_LEASES", leases),
+            mock.patch.dict(
+                result_adapter.os.environ,
+                {
+                    "SEME2E_GPT_SOVITS_GPU_POOL": "5,2",
+                    "SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES": "",
+                },
+            ),
+        ):
+            first = result_adapter._acquire_gpt_sovits_gpu_lease(("5", "2"), None)
+            second = result_adapter._acquire_gpt_sovits_gpu_lease(("5", "2"), None)
+            timer.start()
+            try:
+                with self.assertRaisesRegex(RuntimeError, "TASK_CANCELLED"):
+                    result_adapter._acquire_gpt_sovits_gpu_lease(("5", "2"), cancel_event)
+            finally:
+                timer.cancel()
+                result_adapter._release_gpt_sovits_gpu_lease(second)
+                result_adapter._release_gpt_sovits_gpu_lease(first)
+
+        self.assertTrue(cancel_event.is_set())
+        self.assertEqual(leases, set())
+
+    def test_gpt_sovits_shared_clone_gpu_slot_wait_honors_cancellation_without_leaking(self) -> None:
+        lease_condition = threading.Condition()
+        leases: set[str] = set()
+        shared_gpu_slot = threading.BoundedSemaphore(1)
+        shared_gpu_slot.acquire()
+        cancel_event = threading.Event()
+        timer = threading.Timer(0.05, cancel_event.set)
+        timer.start()
+        try:
+            with (
+                mock.patch.object(result_adapter, "_gpt_sovits_model_status", return_value=("available", None, None)),
+                mock.patch.object(result_adapter, "_clone_gpu_slot", return_value=shared_gpu_slot),
+                mock.patch.object(result_adapter, "_run_cancellable_subprocess") as runner,
+                mock.patch.object(result_adapter, "GPT_SOVITS_WORKER_MAX_CONCURRENCY", 2),
+                mock.patch.object(result_adapter, "GPT_SOVITS_GPU_LEASE_CONDITION", lease_condition),
+                mock.patch.object(result_adapter, "GPT_SOVITS_GPU_LEASES", leases),
+                mock.patch.dict(
+                    result_adapter.os.environ,
+                    {
+                        "SEME2E_GPT_SOVITS_GPU_POOL": "5,2",
+                        "SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES": "",
+                    },
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "TASK_CANCELLED"):
+                    result_adapter._gpt_sovits_clone_pair(
+                        Path("original.wav"),
+                        Path("protected.wav"),
+                        Path("original_clone.wav"),
+                        Path("protected_clone.wav"),
+                        original_transcript="original transcript",
+                        protected_transcript="protected transcript",
+                        text="target text",
+                        language="en",
+                        speed=1.0,
+                        device="cuda:0",
+                        cancel_event=cancel_event,
+                    )
+                runner.assert_not_called()
+        finally:
+            timer.cancel()
+            shared_gpu_slot.release()
+
+        self.assertTrue(cancel_event.is_set())
+        self.assertEqual(leases, set())
+        self.assertTrue(shared_gpu_slot.acquire(blocking=False))
+        shared_gpu_slot.release()
+
+    def test_gpt_sovits_gpu_lease_releases_after_worker_exception_and_cancellation(self) -> None:
+        lease_condition = threading.Condition()
+        leases: set[str] = set()
+        for message in ("synthetic worker failure", "TASK_CANCELLED"):
+            with self.subTest(message=message):
+                with (
+                    mock.patch.object(result_adapter, "_gpt_sovits_model_status", return_value=("available", None, None)),
+                    mock.patch.object(result_adapter, "_run_cancellable_subprocess", side_effect=RuntimeError(message)),
+                    mock.patch.object(result_adapter, "GPT_SOVITS_WORKER_MAX_CONCURRENCY", 2),
+                    mock.patch.object(result_adapter, "GPT_SOVITS_GPU_LEASE_CONDITION", lease_condition),
+                    mock.patch.object(result_adapter, "GPT_SOVITS_GPU_LEASES", leases),
+                    mock.patch.dict(
+                        result_adapter.os.environ,
+                        {
+                            "SEME2E_GPT_SOVITS_GPU_POOL": "5,2",
+                            "SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES": "",
+                        },
+                    ),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        result_adapter._gpt_sovits_clone_pair(
+                            Path("original.wav"),
+                            Path("protected.wav"),
+                            Path("original_clone.wav"),
+                            Path("protected_clone.wav"),
+                            original_transcript="original transcript",
+                            protected_transcript="protected transcript",
+                            text="target text",
+                            language="en",
+                            speed=1.0,
+                            device="cuda:0",
+                        )
+                self.assertEqual(leases, set())
 
     def test_worker_slot_wait_honors_cancellation_without_consuming_slot(self) -> None:
         semaphore = threading.BoundedSemaphore(1)
@@ -596,7 +776,7 @@ class IsolatedWorkerRuntimeTest(unittest.TestCase):
             self.assertTrue(shared_gpu_slot.acquire(blocking=False))
             shared_gpu_slot.release()
 
-    def test_cosyvoice_and_gpt_sovits_cancel_while_waiting_for_worker_slots(self) -> None:
+    def test_cosyvoice_cancel_while_waiting_for_worker_slot(self) -> None:
         cosy_slots = threading.BoundedSemaphore(1)
         cosy_slots.acquire()
         cosy_cancel = threading.Event()
@@ -625,36 +805,6 @@ class IsolatedWorkerRuntimeTest(unittest.TestCase):
         finally:
             cosy_timer.cancel()
             cosy_slots.release()
-
-        gpt_slots = threading.BoundedSemaphore(1)
-        gpt_slots.acquire()
-        gpt_cancel = threading.Event()
-        gpt_timer = threading.Timer(0.05, gpt_cancel.set)
-        gpt_timer.start()
-        try:
-            with (
-                mock.patch.object(result_adapter, "_gpt_sovits_model_status", return_value=("available", None, None)),
-                mock.patch.object(result_adapter, "GPT_SOVITS_WORKER_SLOTS", gpt_slots),
-                mock.patch.object(result_adapter, "_run_cancellable_subprocess") as runner,
-            ):
-                with self.assertRaisesRegex(RuntimeError, "TASK_CANCELLED"):
-                    result_adapter._gpt_sovits_clone_pair(
-                        Path("original.wav"),
-                        Path("protected.wav"),
-                        Path("original_clone.wav"),
-                        Path("protected_clone.wav"),
-                        original_transcript="original transcript",
-                        protected_transcript="protected transcript",
-                        text="target text",
-                        language="en",
-                        speed=1.0,
-                        device="cuda:0",
-                        cancel_event=gpt_cancel,
-                    )
-                runner.assert_not_called()
-        finally:
-            gpt_timer.cancel()
-            gpt_slots.release()
 
 
 class TaskRuntimeRegistryTest(unittest.TestCase):

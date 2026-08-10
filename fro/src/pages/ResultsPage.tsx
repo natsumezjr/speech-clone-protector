@@ -38,6 +38,7 @@ import { TrendChart } from '@/components/charts/TrendChart'
 import { MathBlock, MathText } from '@/components/common/MathText'
 import { ModelInformationModal } from '@/components/common/ModelInformationModal'
 import { computeAbsoluteDelta, formatCloneMetricNumber, generateCloneMetricInsights } from '@/utils/cloneMetricDisplay'
+import { formatAsrRatePercent, generateAsrMetricInsights } from '@/utils/asrInsightDisplay'
 import { analyzeLossConvergence, analyzeLossTrend, type TrendDirection } from '@/utils/resultMetrics'
 import { resolveEpsilonUsageRate } from '@/utils/perturbationMetrics'
 import { resolveAsrErrorShares } from '@/utils/metricNormalization'
@@ -1441,6 +1442,7 @@ function AsrTab({ result, asrEval, editStats, history, batches = [], selectedAsr
   const sharedSemantic = result.semanticEval
   const tokenDiff = sharedSemantic?.tokenChangeRate ?? sharedSemantic?.tokenErrorRate
   const tokenUsesEditDistance = sharedSemantic?.tokenChangeRate == null && sharedSemantic?.tokenErrorRate != null
+  const tokenDetailLabel = tokenUsesEditDistance ? 'Token 编辑率' : 'Token 变化率'
   const textMetricLevel = asrEval.metricLevel ?? editStats?.level ?? 'word'
   const tokenUnavailableReason = tokenDiff == null
     ? sharedSemantic?.error || sharedSemantic?.reason || metricReason(result, ['semanticEval.tokenChangeRate', 'semanticEval.tokenErrorRate', 'asrEval.tokenChangeRate', 'asrEval.tokenErrorRate'])
@@ -1473,22 +1475,26 @@ function AsrTab({ result, asrEval, editStats, history, batches = [], selectedAsr
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_288px_minmax(0,1fr)]">
         <TextBox title="参考文本 / 原始转写（ASR）" text={referenceText || '未生成'} foot="用于 WER/CER 与 diff 的参考文本" />
         <div className="grid grid-cols-2 content-center gap-3">
-          <ScoreBox label={<>WER<br />词错率</>} value={formatMetricValue(wer, 'percent')} red compact foot={'词级识别错误率：\\(\\mathrm{WER}=\\frac{S_w+D_w+I_w}{\\max(N_w,1)}\\)。其中 \\(S_w\\)、\\(D_w\\)、\\(I_w\\) 分别为词级替换、删除和插入数量，\\(N_w\\) 为参考文本词数。'} />
-          <ScoreBox label={<>CER<br />字错率</>} value={formatMetricValue(cer, 'percent')} red compact foot={'字符级识别错误率：\\(\\mathrm{CER}=\\frac{S_c+D_c+I_c}{\\max(N_c,1)}\\)。其中 \\(S_c\\)、\\(D_c\\)、\\(I_c\\) 分别为字符级替换、删除和插入数量，\\(N_c\\) 为参考文本字符数。'} />
-          <ScoreBox label={<>IR<br />插入率</>} value={formatMetricValue(insertRate, 'percent')} red compact foot={'插入率：\\(\\mathrm{IR}=\\frac{I}{\\max(N,1)}\\)。其中 \\(I\\) 为新增单位数，\\(N\\) 为参考文本在当前统计层级下的单位数。'} />
-          <ScoreBox label={<>SR<br />替换率</>} value={formatMetricValue(substituteRate, 'percent')} red compact foot={'替换率：\\(\\mathrm{SR}=\\frac{S}{\\max(N,1)}\\)。其中 \\(S\\) 为替换单位数，\\(N\\) 为参考文本在当前统计层级下的单位数。'} />
+          <ScoreBox label={<>WER<br />词错率</>} value={formatAsrRatePercent(wer)} red compact foot={'词级识别错误率：\\(\\mathrm{WER}=\\frac{S_w+D_w+I_w}{\\max(N_w,1)}\\)。其中 \\(S_w\\)、\\(D_w\\)、\\(I_w\\) 分别为词级替换、删除和插入数量，\\(N_w\\) 为参考文本词数。'} />
+          <ScoreBox label={<>CER<br />字错率</>} value={formatAsrRatePercent(cer)} red compact foot={'字符级识别错误率：\\(\\mathrm{CER}=\\frac{S_c+D_c+I_c}{\\max(N_c,1)}\\)。其中 \\(S_c\\)、\\(D_c\\)、\\(I_c\\) 分别为字符级替换、删除和插入数量，\\(N_c\\) 为参考文本字符数。'} />
+          <ScoreBox label={<>IR<br />插入率</>} value={formatAsrRatePercent(insertRate)} red compact foot={'插入率：\\(\\mathrm{IR}=\\frac{I}{\\max(N,1)}\\)。其中 \\(I\\) 为新增单位数，\\(N\\) 为参考文本在当前统计层级下的单位数。'} />
+          <ScoreBox label={<>SR<br />替换率</>} value={formatAsrRatePercent(substituteRate)} red compact foot={'替换率：\\(\\mathrm{SR}=\\frac{S}{\\max(N,1)}\\)。其中 \\(S\\) 为替换单位数，\\(N\\) 为参考文本在当前统计层级下的单位数。'} />
         </div>
         <TextBox title="保护音频转写（ASR）" text={protectedText || '未生成'} foot="红色为新增内容，绿色删除线为原文缺失内容" content={diffOps.length ? renderDiffOps(diffOps) : undefined} />
       </div>
       <div className="grid grid-cols-[1.05fr_0.95fr] gap-5 max-lg:grid-cols-1">
         <MetricPanel title="保护任务共享语义指标">
           <ScoreBox label={semanticDetailLabel} value={formatMetricValue(sharedSemantic?.semanticDrift, 'number')} foot={semanticFoot} />
-          <ScoreBox label="Token 变化率" value={formatMetricValue(tokenDiff, 'percent')} foot={tokenFoot} />
+          <ScoreBox label={tokenDetailLabel} value={formatAsrRatePercent(tokenDiff)} foot={tokenFoot} />
           <ScoreBox label="指标层级" value={textMetricLevel} foot={metricLevelFoot} />
         </MetricPanel>
         <RateBreakdown substituteShare={errorShares?.substituteShare} insertShare={errorShares?.insertShare} />
       </div>
-      <InsightPanel title="ASR 结果解读" items={generateAsrInsights(asrEval, editStats)} naturalHeight />
+      <InsightPanel
+        title="ASR 结果解读"
+        items={generateAsrMetricInsights(asrEval, editStats, sharedSemantic ? { ...sharedSemantic, semanticIsMfccProxy } : null)}
+        naturalHeight
+      />
     </div>
   )
 }
@@ -1670,7 +1676,7 @@ function RateBreakdown({ substituteShare, insertShare }: { substituteShare?: num
             <div key={label}>
               <div className="mb-1 flex items-center justify-between text-xs">
                 <span className="font-bold text-slate-300">{label}</span>
-                <span className="font-mono text-slate-400">{formatMetricValue(numberValue, 'percent')}</span>
+                <span className="font-mono text-slate-400">{formatAsrRatePercent(numberValue)}</span>
               </div>
               {numberValue === null ? (
                 <div className="rounded-[6px] border border-dashed border-cyan-300/12 px-3 py-2 text-xs text-slate-500">未生成</div>
@@ -1834,9 +1840,9 @@ function CloneTranscriptColumn({ title, text, reference }: { title: string; text
   const editMetrics = text && reference ? computeEditMetrics(reference, text, chooseEditLevel(reference, text)) : null
   const content = editMetrics ? renderDiffOps(editMetrics.diffOps) : text
   return (
-    <div className="min-h-[166px] rounded-[9px] border border-cyan-300/12 bg-slate-950/22 p-4">
+    <div className="min-w-0 rounded-[9px] border border-cyan-300/12 bg-slate-950/22 p-4">
       <h3 className="text-center text-sm font-black text-cyan-100">{title}</h3>
-      <div className="mt-3 max-h-[132px] min-h-[92px] overflow-y-auto rounded-[7px] border border-cyan-300/8 bg-slate-950/30 p-3 text-sm leading-7 text-slate-200">{content || <span className="text-slate-500">暂未生成</span>}</div>
+      <div className="mt-3 h-[156px] min-w-0 overflow-x-hidden overflow-y-auto whitespace-pre-wrap break-words rounded-[7px] border border-cyan-300/8 bg-slate-950/30 p-3 text-sm leading-7 text-slate-200 [overflow-wrap:anywhere]">{content || <span className="text-slate-500">暂未生成</span>}</div>
     </div>
   )
 }
@@ -2076,8 +2082,8 @@ function AsrHistoryPanel({ history, batches, selectedAsrSubId, onSelect, onOpenB
                     <p className={cn('mt-1 text-center font-mono text-[10px] font-bold', tone.text)}>{progressPercent}% · {statusLabel}</p>
                   </td>
                   <td className="px-2 py-3 text-center font-mono">{elapsedSec !== null ? seconds(elapsedSec) : '—'}</td>
-                  <td className="px-2 py-3 text-center font-mono">{formatMetricValue(evaluation?.wer, 'percent')}</td>
-                  <td className="px-2 py-3 text-center font-mono">{formatMetricValue(evaluation?.cer, 'percent')}</td>
+                  <td className="px-2 py-3 text-center font-mono">{formatAsrRatePercent(evaluation?.wer)}</td>
+                  <td className="px-2 py-3 text-center font-mono">{formatAsrRatePercent(evaluation?.cer)}</td>
                 </tr>
               )
             })}
@@ -3498,17 +3504,6 @@ function generateProtectionInsights(result: TaskResult, evaluationContext: Prote
   items.push(`调参建议：${tuning.length ? tuning.join('') : '当前曲线运行平稳，保持现有参数即可。'}`)
   items.push(linkedAsrTuningAdvice(evaluationContext))
   items.push(linkedCloneTuningAdvice(evaluationContext))
-  return items
-}
-
-function generateAsrInsights(asrEval: AsrEval, editStats: EditMetrics | null) {
-  const wer = optionalNumber(asrEval.wer) ?? (editStats?.level === 'word' ? editStats.werOrCer : null)
-  const cer = optionalNumber(asrEval.cer) ?? (editStats?.level === 'char' ? editStats.werOrCer : null)
-  const insertRate = optionalNumber(asrEval.insertRate) ?? editStats?.insertRate ?? null
-  const items: string[] = []
-  if ((wer ?? 0) >= 0.3 || (cer ?? 0) >= 0.3) items.push('WER/CER 较高，ASR 识别受到干扰。')
-  if ((insertRate ?? 0) >= 0.2) items.push('插入率较高，句子结构稳定性下降。')
-  if (items.length === 0) items.push('ASR 文本级错误率较低或指标不足；任务级 Token 变化率与语义漂移在共享语义指标区域单独展示。')
   return items
 }
 
