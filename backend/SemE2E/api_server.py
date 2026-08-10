@@ -121,6 +121,29 @@ def request_task_cancel(task_id: str) -> tuple[threading.Event | None, threading
     return cancel_event, thread, process
 
 
+def request_all_task_cancels(task_id: str) -> tuple[list[threading.Event], list[threading.Thread], list[multiprocessing.Process]]:
+    with TASK_REGISTRY_LOCK:
+        prefix = f"{task_id}:"
+        cancel_events = [value for key, value in TASK_CANCEL_EVENTS.items() if key == task_id or key.startswith(prefix)]
+        threads = [value for key, value in TASK_THREADS.items() if key == task_id or key.startswith(prefix)]
+        processes = [value for key, value in TASK_PROCESSES.items() if key == task_id or key.startswith(prefix)]
+    for cancel_event in cancel_events:
+        cancel_event.set()
+    return (
+        list({id(value): value for value in cancel_events}.values()),
+        list({id(value): value for value in threads}.values()),
+        list({id(value): value for value in processes}.values()),
+    )
+
+
+def cleanup_all_task_runtimes(task_id: str) -> None:
+    prefix = f"{task_id}:"
+    with TASK_REGISTRY_LOCK:
+        for registry in (TASK_CANCEL_EVENTS, TASK_THREADS, TASK_PROCESSES):
+            for key in [item for item in registry if item == task_id or item.startswith(prefix)]:
+                registry.pop(key, None)
+
+
 def mark_task_deleted(task_id: str) -> None:
     with TASK_REGISTRY_LOCK:
         DELETED_TASK_IDS.add(task_id)
@@ -2572,12 +2595,27 @@ def run_asr_eval(task_id: str, payload: AsrEvalRequest) -> JSONResponse:
                 asrResult=None,
                 elapsedSec=round(time.time() - asr_started_at, 3),
             )
-            result = create_asr_eval(task_id, {**payload.model_dump(), "asrSubId": asr_sub_id})
+            result = create_asr_eval(
+                task_id,
+                {**payload.model_dump(), "asrSubId": asr_sub_id},
+                cancel_event=cancel_event,
+            )
             ensure_task_not_cancelled(task_id, cancel_event)
             asr_payload = result.get("asr") if isinstance(result, dict) else {}
             asr_status = (asr_payload or {}).get("status") if isinstance(asr_payload, dict) else None
             if asr_status not in {"available", "computed", "partial"}:
                 reason = (asr_payload or {}).get("error") or (asr_payload or {}).get("reason") or "ASR evaluator did not generate transcriptions"
+                worker_diagnostics = asr_payload.get("diagnostics") if isinstance(asr_payload, dict) else None
+                write_task_log(
+                    task_id,
+                    {
+                        "requestId": req_id,
+                        "taskId": task_id,
+                        "currentStage": "asr_eval",
+                        "reason": str(reason),
+                        **({"diagnostics": worker_diagnostics} if worker_diagnostics else {}),
+                    },
+                )
                 write_asr_status(
                     status="failed",
                     progress=1,
@@ -2589,7 +2627,15 @@ def run_asr_eval(task_id: str, payload: AsrEvalRequest) -> JSONResponse:
                         "requestId": req_id,
                         "taskId": task_id,
                         "stage": "asr_eval",
-                        "details": {"model": payload.model, "reason": str(reason)},
+                        "details": {
+                            "model": payload.model,
+                            "reason": str(reason),
+                            **(
+                                {"diagnostics": worker_diagnostics}
+                                if worker_diagnostics
+                                else {}
+                            ),
+                        },
                     },
                     asrResult=result,
                     elapsedSec=round(time.time() - asr_started_at, 3),
@@ -2616,6 +2662,16 @@ def run_asr_eval(task_id: str, payload: AsrEvalRequest) -> JSONResponse:
                     elapsedSec=round(time.time() - asr_started_at, 3),
                 )
         except Exception as exc:
+            if isinstance(exc, RuntimeError) and str(exc) == "TASK_CANCELLED":
+                if (TASK_DIR / task_id).exists():
+                    write_asr_status(
+                        status="cancelled",
+                        stage="asr_eval",
+                        message="Task cancelled by delete request",
+                        error=None,
+                        elapsedSec=round(time.time() - asr_started_at, 3),
+                    )
+                return
             write_task_log(
                 task_id,
                 {
@@ -2661,20 +2717,26 @@ def delete_task(task_id: str) -> dict[str, Any]:
         status = read_task_status(task_id)
     except Exception:
         status = {}
-    cancel_event, thread, process = request_task_cancel(task_id)
+    cancel_events, threads, processes = request_all_task_cancels(task_id)
     mark_task_deleted(task_id)
     removed_from_queue = remove_pending_protect_job(task_id)
-    cancelled = cancel_event is not None or process is not None or status.get("status") in {"queued", "running"}
-    process_pid = process.pid if process is not None else None
-    if process is not None and process.is_alive():
+    cancelled = bool(cancel_events or processes) or status.get("status") in {"queued", "running"}
+    process_pids = [process.pid for process in processes if process.pid is not None]
+    process_deadline = time.monotonic() + 15.0
+    for process in processes:
+        if not process.is_alive():
+            continue
         process.terminate()
-        process.join(timeout=15.0)
+        process.join(timeout=max(0.0, process_deadline - time.monotonic()))
+    for process in processes:
         if process.is_alive():
             process.kill()
             process.join(timeout=5.0)
-    if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-        thread.join(timeout=15.0)
-    cleanup_task_runtime(task_id)
+    thread_deadline = time.monotonic() + 15.0
+    for thread in threads:
+        if thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, thread_deadline - time.monotonic()))
+    cleanup_all_task_runtimes(task_id)
     last_error: Exception | None = None
     for _ in range(8):
         try:
@@ -2685,9 +2747,10 @@ def delete_task(task_id: str) -> dict[str, Any]:
                 "status": "deleted",
                 "cancelled": cancelled,
                 "removedFromQueue": removed_from_queue,
-                "threadStopped": thread is None or not thread.is_alive(),
-                "processPid": process_pid,
-                "processStopped": process is None or not process.is_alive(),
+                "threadStopped": all(not thread.is_alive() for thread in threads),
+                "processPid": process_pids[0] if process_pids else None,
+                "processPids": process_pids,
+                "processStopped": all(not process.is_alive() for process in processes),
             }
         except Exception as exc:
             last_error = exc

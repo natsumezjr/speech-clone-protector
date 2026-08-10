@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import math
 import os
+import signal
 import shutil
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import uuid
 import wave
@@ -60,6 +62,12 @@ class CloneBackendUnavailableError(RuntimeError):
         self.task_id = task_id
         self.diagnostics = diagnostics
         self.reason = reason
+
+
+class IsolatedWorkerError(RuntimeError):
+    def __init__(self, message: str, *, diagnostics: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
 
 
 def ensure_runtime_dirs() -> None:
@@ -170,12 +178,166 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _stop_isolated_worker(process: subprocess.Popen[str], *, grace_seconds: float = 5.0) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+    except (OSError, ProcessLookupError):
+        pass
+    try:
+        process.wait(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+    except (OSError, ProcessLookupError):
+        pass
+    try:
+        process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _run_isolated_json_worker(
+    worker_path: Path,
+    request_payload: dict[str, Any],
+    *,
+    timeout_seconds: int,
+    cancel_event: Any | None = None,
+) -> dict[str, Any]:
+    worker_path = worker_path.resolve()
+    timeout_seconds = max(1, int(timeout_seconds))
+    environment = os.environ.copy()
+    existing_python_path = environment.get("PYTHONPATH", "").strip()
+    environment["PYTHONPATH"] = str(ROOT) + (os.pathsep + existing_python_path if existing_python_path else "")
+    environment["PYTHONUNBUFFERED"] = "1"
+    environment["PYTHONIOENCODING"] = "utf-8"
+    command = [sys.executable, "-u", str(worker_path)]
+    popen_kwargs: dict[str, Any] = {
+        "cwd": str(ROOT),
+        "env": environment,
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    elif os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+    try:
+        process = subprocess.Popen(command, **popen_kwargs)
+    except Exception as exc:
+        raise IsolatedWorkerError(
+            f"Unable to start isolated worker {worker_path.name}: {exc}",
+            diagnostics={
+                "worker": str(worker_path),
+                "pythonExecutable": sys.executable,
+                "cwd": str(ROOT),
+                "exceptionType": type(exc).__name__,
+                "exceptionMessage": str(exc),
+                "stackTrace": traceback.format_exc(),
+            },
+        ) from exc
+
+    request_text: str | None = json.dumps(request_payload, ensure_ascii=False, allow_nan=False)
+    started_at = time.monotonic()
+    stdout = ""
+    stderr = ""
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            _stop_isolated_worker(process)
+            stdout, stderr = process.communicate()
+            raise RuntimeError("TASK_CANCELLED")
+        elapsed = time.monotonic() - started_at
+        remaining = timeout_seconds - elapsed
+        if remaining <= 0:
+            _stop_isolated_worker(process)
+            stdout, stderr = process.communicate()
+            raise IsolatedWorkerError(
+                f"Isolated worker {worker_path.name} timed out after {timeout_seconds}s",
+                diagnostics={
+                    "worker": str(worker_path),
+                    "pythonExecutable": sys.executable,
+                    "cwd": str(ROOT),
+                    "returnCode": process.returncode,
+                    "timeoutSec": timeout_seconds,
+                    "stdoutTail": stdout[-4000:].strip(),
+                    "stderrTail": stderr[-8000:].strip(),
+                },
+            )
+        try:
+            stdout, stderr = process.communicate(input=request_text, timeout=min(0.25, remaining))
+            break
+        except subprocess.TimeoutExpired:
+            request_text = None
+
+    response: dict[str, Any] | None = None
+    for line in reversed(stdout.splitlines()):
+        candidate = line.strip()
+        if not candidate:
+            continue
+        try:
+            decoded = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(decoded, dict):
+            response = decoded
+            break
+
+    diagnostics: dict[str, Any] = {
+        "worker": str(worker_path),
+        "pythonExecutable": sys.executable,
+        "cwd": str(ROOT),
+        "returnCode": process.returncode,
+        "timeoutSec": timeout_seconds,
+        "elapsedSec": round(time.monotonic() - started_at, 3),
+        "stdoutTail": stdout[-4000:].strip(),
+        "stderrTail": stderr[-8000:].strip(),
+    }
+    if response is not None:
+        diagnostics["response"] = response
+    if response is None:
+        raise IsolatedWorkerError(
+            f"Isolated worker {worker_path.name} did not return a JSON response",
+            diagnostics=diagnostics,
+        )
+    if process.returncode != 0 or response.get("ok") is not True:
+        worker_error = response.get("error") if isinstance(response.get("error"), dict) else {}
+        message = str(worker_error.get("message") or f"worker exited with code {process.returncode}")
+        raise IsolatedWorkerError(message, diagnostics=diagnostics)
+    return response
+
+
 def _env_list(name: str, default: list[str]) -> list[str]:
     raw = os.getenv(name)
     if not raw:
         return default
     values = [item.strip() for item in raw.split(",") if item.strip()]
     return values or default
+
+
+ASR_WORKER_MAX_CONCURRENCY = max(1, _env_int("SEME2E_ASR_WORKER_MAX_CONCURRENCY", 2))
+COQUI_TTS_WORKER_MAX_CONCURRENCY = max(1, _env_int("SEME2E_COQUI_TTS_WORKER_MAX_CONCURRENCY", 2))
+ASR_WORKER_SLOTS = threading.BoundedSemaphore(ASR_WORKER_MAX_CONCURRENCY)
+COQUI_TTS_WORKER_SLOTS = threading.BoundedSemaphore(COQUI_TTS_WORKER_MAX_CONCURRENCY)
+
+
+def _acquire_worker_slot(semaphore: threading.BoundedSemaphore, cancel_event: Any | None) -> None:
+    while not semaphore.acquire(timeout=0.25):
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("TASK_CANCELLED")
 
 
 FORMAL_EPSILON = 4 / 255
@@ -1302,7 +1464,13 @@ def compute_mfcc_semantic(clean_path: Path, protected_path: Path, config: dict[s
     return details
 
 
-def maybe_asr_eval(clean_path: Path, protected_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+def maybe_asr_eval(
+    clean_path: Path,
+    protected_path: Path,
+    payload: dict[str, Any],
+    *,
+    cancel_event: Any | None = None,
+) -> dict[str, Any]:
     asr = empty_details()["asr"]
     reference_text = payload.get("referenceText") or payload.get("reference_text")
     asr["referenceText"] = reference_text
@@ -1333,14 +1501,28 @@ def maybe_asr_eval(clean_path: Path, protected_path: Path, payload: dict[str, An
         return asr
 
     try:
-        from asr_backends import ASRTranscriber, openai_whisper_session
-
         evaluations = []
         for model in actual_models:
-            with openai_whisper_session(model):
-                transcriber = ASRTranscriber(model, os.getenv("SEME2E_API_DEVICE", "cpu"), str(payload.get("language") or "en"))
-                clean_text = transcriber.transcribe(clean_path)
-                protected_text = transcriber.transcribe(protected_path)
+            _acquire_worker_slot(ASR_WORKER_SLOTS, cancel_event)
+            try:
+                worker_result = _run_isolated_json_worker(
+                    ROOT / "asr_worker.py",
+                    {
+                        "model": model,
+                        "device": os.getenv("SEME2E_API_DEVICE", "cpu"),
+                        "language": str(payload.get("language") or "en"),
+                        "originalPath": str(clean_path.resolve()),
+                        "protectedPath": str(protected_path.resolve()),
+                    },
+                    timeout_seconds=_env_int("SEME2E_ASR_WORKER_TIMEOUT_SECONDS", 600),
+                    cancel_event=cancel_event,
+                )
+            finally:
+                ASR_WORKER_SLOTS.release()
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("TASK_CANCELLED")
+            clean_text = str(worker_result.get("originalText") or "")
+            protected_text = str(worker_result.get("protectedText") or "")
             item = compute_asr_metrics(
                 clean_text,
                 protected_text,
@@ -1354,6 +1536,17 @@ def maybe_asr_eval(clean_path: Path, protected_path: Path, payload: dict[str, An
             asr["model"] = evaluations[0]["model"]
             asr["evaluations"] = evaluations
             asr["status"] = "available"
+    except IsolatedWorkerError as exc:
+        asr["status"] = "unavailable"
+        asr["error"] = str(exc)
+        asr["diagnostics"] = exc.diagnostics
+        asr["_metricSources"] = {"asrEval.*": metric_source("error", "isolated_asr_worker", reason=str(exc), formula="transcribe(original/protected)+Levenshtein")}
+    except RuntimeError as exc:
+        if str(exc) == "TASK_CANCELLED":
+            raise
+        asr["status"] = "unavailable"
+        asr["error"] = str(exc)
+        asr["_metricSources"] = {"asrEval.*": metric_source("error", "ASRTranscriber", reason=str(exc), formula="transcribe(original/protected)+Levenshtein")}
     except Exception as exc:
         asr["status"] = "unavailable"
         asr["error"] = str(exc)
@@ -1361,7 +1554,7 @@ def maybe_asr_eval(clean_path: Path, protected_path: Path, payload: dict[str, An
     return asr
 
 
-def create_asr_eval(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def create_asr_eval(task_id: str, payload: dict[str, Any], *, cancel_event: Any | None = None) -> dict[str, Any]:
     original_path, protected_path, result = _task_audio_paths(task_id)
     request_semantic = ((result.get("request") or {}).get("semantic") or {}) if isinstance(result.get("request"), dict) else {}
     payload_semantic = payload.get("semantic") if isinstance(payload.get("semantic"), dict) else {}
@@ -1379,6 +1572,7 @@ def create_asr_eval(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
             "semantic": semantic_config,
             "forceAsrEval": True,
         },
+        cancel_event=cancel_event,
     )
     created_at = utc_now_iso()
     response = {
@@ -1393,6 +1587,8 @@ def create_asr_eval(task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         },
         "createdAt": created_at,
     }
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("TASK_CANCELLED")
     with RESULT_WRITE_LOCK:
         result_path = TASK_DIR / task_id / "result.json"
         latest_result = load_result(task_id) if result_path.exists() else result
@@ -1908,6 +2104,52 @@ def _tts_clone_to_file(reference_path: Path, text: str, output_path: Path, *, mo
     return model
 
 
+def _coqui_tts_clone_pair(
+    original_reference: Path,
+    protected_reference: Path,
+    original_output: Path,
+    protected_output: Path,
+    *,
+    text: str,
+    model: str,
+    language: str,
+    speed: float,
+    device: str,
+    task_id: str,
+    clone_sub_id: str | None,
+    cancel_event: Any | None,
+) -> dict[str, Any]:
+    local_model = _local_tts_model_files(model)
+    request_payload: dict[str, Any] = {
+        "taskId": task_id,
+        "cloneSubId": clone_sub_id,
+        "model": model,
+        "text": text,
+        "language": language,
+        "speed": speed,
+        "device": device,
+        "ttsHome": str(PROJECT_TTS_CACHE_DIR.resolve()),
+        "originalReferencePath": str(original_reference.resolve()),
+        "protectedReferencePath": str(protected_reference.resolve()),
+        "originalOutputPath": str(original_output.resolve()),
+        "protectedOutputPath": str(protected_output.resolve()),
+    }
+    if local_model is not None:
+        model_path, config_path = local_model
+        request_payload["modelPath"] = str(model_path.resolve())
+        request_payload["configPath"] = str(config_path.resolve())
+    _acquire_worker_slot(COQUI_TTS_WORKER_SLOTS, cancel_event)
+    try:
+        return _run_isolated_json_worker(
+            ROOT / "coqui_tts_worker.py",
+            request_payload,
+            timeout_seconds=_env_int("SEME2E_COQUI_TTS_WORKER_TIMEOUT_SECONDS", 900),
+            cancel_event=cancel_event,
+        )
+    finally:
+        COQUI_TTS_WORKER_SLOTS.release()
+
+
 def _is_cosyvoice_model(model: str) -> bool:
     return normalize_tts_model(model).lower() == "cosyvoice2:0.5b"
 
@@ -2212,24 +2454,48 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
             diagnostics["workerResult"] = worker_result
             source_model = model
         else:
-            source_model = _tts_clone_to_file(original_path, text, original_clone_path, model=model, language=language, speed=speed, device=device)
             if progress_callback is not None:
-                progress_callback(progress=0.62, message="正在从保护参考音频生成克隆音频")
-            if cancel_event is not None and cancel_event.is_set():
-                raise RuntimeError("TASK_CANCELLED")
-            _tts_clone_to_file(protected_path, text, protected_clone_path, model=model, language=language, speed=speed, device=device)
+                progress_callback(progress=0.46, message="Coqui TTS 正在独立子进程中加载模型并生成两组克隆音频")
+            worker_result = _coqui_tts_clone_pair(
+                original_path,
+                protected_path,
+                original_clone_path,
+                protected_clone_path,
+                text=text,
+                model=model,
+                language=language,
+                speed=speed,
+                device=device,
+                task_id=task_id,
+                clone_sub_id=str(payload.get("cloneSubId") or "") or None,
+                cancel_event=cancel_event,
+            )
+            diagnostics["workerResult"] = worker_result
+            source_model = str(worker_result.get("sourceModel") or model)
+            if progress_callback is not None:
+                progress_callback(progress=0.82, message="Coqui TTS 独立子进程已生成原始与保护克隆音频")
         if progress_callback is not None:
             progress_callback(progress=0.9, message="正在保存下游 TTS 克隆结果")
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("TASK_CANCELLED")
     except Exception as exc:
+        if isinstance(exc, RuntimeError) and str(exc) == "TASK_CANCELLED":
+            original_clone_path.unlink(missing_ok=True)
+            protected_clone_path.unlink(missing_ok=True)
+            raise
+        if isinstance(exc, IsolatedWorkerError):
+            diagnostics["workerDiagnostics"] = exc.diagnostics
+        original_output_exists = original_clone_path.exists()
+        protected_output_exists = protected_clone_path.exists()
+        original_clone_path.unlink(missing_ok=True)
+        protected_clone_path.unlink(missing_ok=True)
         diagnostics.update(
             {
                 "exceptionType": type(exc).__name__,
                 "exceptionMessage": str(exc),
                 "stackTrace": traceback.format_exc(),
-                "originalOutputExists": original_clone_path.exists(),
-                "protectedOutputExists": protected_clone_path.exists(),
+                "originalOutputExists": original_output_exists,
+                "protectedOutputExists": protected_output_exists,
             }
         )
         raise CloneBackendUnavailableError(
@@ -2283,6 +2549,8 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
             for key, value in worker_result.items()
             if key not in {"cleanReferencePath", "protectedReferencePath"}
         }
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("TASK_CANCELLED")
     clone_eval = compute_clone_eval(
         evaluation_reference_path,
         original_clone_path,
@@ -2311,6 +2579,8 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
         }
     )
 
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("TASK_CANCELLED")
     with RESULT_WRITE_LOCK:
         result_path = TASK_DIR / task_id / "result.json"
         latest_result = load_result(task_id) if result_path.exists() else result

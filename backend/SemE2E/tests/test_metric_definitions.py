@@ -719,9 +719,21 @@ class MetricDefinitionsTest(unittest.TestCase):
             write_wav(protected, np.zeros(160, dtype=np.float32))
             stored_result = {"details": {}, "summary": {"primaryMetrics": {}, "metricSources": {}}}
 
-            def fake_clone_to_file(reference_path: Path, text: str, output_path: Path, **kwargs: object) -> str:
-                write_wav(output_path, np.zeros(160, dtype=np.float32))
-                return "fake_tts"
+            generated_paths: list[Path] = []
+
+            def fake_clone_pair(
+                original_reference: Path,
+                protected_reference: Path,
+                original_output: Path,
+                protected_output: Path,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                self.assertEqual(original_reference, original)
+                self.assertEqual(protected_reference, protected)
+                write_wav(original_output, np.zeros(160, dtype=np.float32))
+                write_wav(protected_output, np.zeros(160, dtype=np.float32))
+                generated_paths.extend([original_output, protected_output])
+                return {"ok": True, "sourceModel": "fake_tts"}
 
             fake_clone_eval = {
                 "originalSimilarity": 0.9,
@@ -736,21 +748,83 @@ class MetricDefinitionsTest(unittest.TestCase):
                 "_metricSources": {"cloneEval.*": {"status": "available", "source": "fake_speaker"}},
             }
 
-            with mock.patch.object(adapter, "TASK_DIR", task_root):
-                with mock.patch.object(adapter, "_task_audio_paths", return_value=(original, protected, stored_result)):
-                    with mock.patch.object(adapter, "_module_available", return_value=True):
-                        with mock.patch.object(adapter, "_tts_clone_to_file", side_effect=fake_clone_to_file):
-                            with mock.patch.object(adapter, "compute_clone_eval", return_value=fake_clone_eval):
-                                response = adapter.create_clone_voice("task_test", {"text": "hello", "model": "xtts-v2"})
+            with (
+                mock.patch.object(adapter, "TASK_DIR", task_root),
+                mock.patch.object(adapter, "_task_audio_paths", return_value=(original, protected, stored_result)),
+                mock.patch.object(adapter, "_module_available", return_value=True),
+                mock.patch.object(adapter, "_tts_catalog_status", return_value=("available", None, "fake-model")),
+                mock.patch.object(adapter, "_coqui_tts_clone_pair", side_effect=fake_clone_pair) as clone_pair,
+                mock.patch.object(adapter, "compute_clone_eval", return_value=fake_clone_eval),
+            ):
+                response = adapter.create_clone_voice("task_test", {"text": "hello", "model": "xtts-v2"})
+                clone_pair.assert_called_once()
+                self.assertEqual(clone_pair.call_args.kwargs["model"], "xtts_v2")
+                self.assertEqual(len(generated_paths), 2)
+                self.assertTrue(all(path.is_file() for path in generated_paths))
 
         self.assertEqual(response["cloneEval"]["originalSimilarity"], 0.9)
         self.assertEqual(response["cloneEval"]["protectedSimilarity"], 0.3)
         self.assertEqual(response["cloneEval"]["similarityDropRate"], 2 / 3)
+        self.assertEqual(response["source"], "CoquiTTS:fake_tts")
+        self.assertGreater(response["originalCloneAudio"]["sizeBytes"], 0)
+        self.assertGreater(response["protectedCloneAudio"]["sizeBytes"], 0)
         self.assertIsNone(response["request"]["annotationSource"])
         self.assertIsNone(response["request"]["speakerPrompt"])
         self.assertIsNone(response["request"]["annotationAsrSubId"])
         self.assertEqual(stored_result["details"]["cloneEval"]["originalSimilarity"], 0.9)
         self.assertEqual(stored_result["summary"]["metricSources"]["cloneEval.*"]["source"], "fake_speaker")
+
+    def test_create_clone_voice_preserves_structured_worker_error_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task_root = root / "tasks"
+            task_root.mkdir()
+            (task_root / "task_test").mkdir()
+            original = root / "original.wav"
+            protected = root / "protected.wav"
+            write_wav(original, np.zeros(160, dtype=np.float32))
+            write_wav(protected, np.zeros(160, dtype=np.float32))
+            stored_result = {"details": {}, "summary": {"primaryMetrics": {}, "metricSources": {}}}
+            worker_diagnostics = {
+                "returnCode": 1,
+                "response": {
+                    "ok": False,
+                    "sourceModel": "xtts_v2",
+                    "error": {
+                        "code": "COQUI_TTS_WORKER_FAILED",
+                        "stage": "load_model",
+                        "exceptionType": "UnpicklingError",
+                        "message": "worker load failed",
+                        "traceback": "worker traceback",
+                    },
+                },
+            }
+            worker_error = adapter.IsolatedWorkerError(
+                "worker load failed",
+                diagnostics=worker_diagnostics,
+            )
+
+            with (
+                mock.patch.object(adapter, "TASK_DIR", task_root),
+                mock.patch.object(adapter, "_task_audio_paths", return_value=(original, protected, stored_result)),
+                mock.patch.object(adapter, "_module_available", return_value=True),
+                mock.patch.object(adapter, "_tts_catalog_status", return_value=("available", None, "fake-model")),
+                mock.patch.object(adapter, "_coqui_tts_clone_pair", side_effect=worker_error) as clone_pair,
+                mock.patch.object(adapter, "compute_clone_eval") as clone_eval,
+            ):
+                with self.assertRaises(adapter.CloneBackendUnavailableError) as raised:
+                    adapter.create_clone_voice("task_test", {"text": "hello", "model": "xtts-v2"})
+
+            clone_pair.assert_called_once()
+            clone_eval.assert_not_called()
+            self.assertEqual(raised.exception.reason, "tts_generation_failed")
+            self.assertEqual(raised.exception.diagnostics["workerDiagnostics"], worker_diagnostics)
+            self.assertEqual(
+                raised.exception.diagnostics["workerDiagnostics"]["response"]["error"]["stage"],
+                "load_model",
+            )
+            self.assertEqual(raised.exception.diagnostics["exceptionType"], "IsolatedWorkerError")
+            self.assertFalse(any((task_root / "task_test" / "clones").rglob("*.wav")))
 
     def test_optimization_trace_maps_to_frontend_trace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
