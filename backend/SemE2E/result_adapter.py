@@ -14,17 +14,21 @@ import uuid
 import wave
 import zipfile
 import importlib.util
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
 from audio_preprocess import AudioPreprocessError, audio_preprocess_capabilities, preprocess_audio
 from capability_cache import get_capabilities_snapshot
+from dnsmos_quality import dnsmos_model_status
 from metric_definitions import (
     align_audio_pair,
     compute_asr_metrics,
     compute_clone_eval,
+    compute_clone_identity_score,
+    compute_direct_identity_score,
     compute_direct_speaker_metrics,
     compute_loss_summary,
     compute_overall_score,
@@ -32,6 +36,8 @@ from metric_definitions import (
     compute_psychoacoustic_metrics,
     compute_psychoacoustic_slice,
     compute_quality_metrics,
+    compute_protection_quality_score,
+    compute_protection_semantic_score,
     compute_semantic_token_metrics,
     metric_source,
 )
@@ -39,6 +45,58 @@ from result_schema import default_chains, empty_charts, empty_details, empty_pri
 
 ProgressCallback = Callable[..., None]
 RESULT_WRITE_LOCK = threading.RLock()
+DNSMOS_TASK_FLIGHTS_GUARD = threading.Lock()
+DNSMOS_TASK_FLIGHTS: dict[str, threading.Event] = {}
+
+CLONE_EVAL_MIRROR_FIELDS = (
+    "directSimilarity",
+    "originalSimilarity",
+    "protectedSimilarity",
+    "similarityDropRate",
+    "embeddingDistanceBefore",
+    "embeddingDistanceAfter",
+    "embeddingDistanceDelta",
+    "embeddingDistanceIncreaseRate",
+    "cloneIdentityScore",
+    "identityBaselineWeight",
+    "cloneIdentityStatus",
+    "cloneIdentityReason",
+    "cleanCloneTranscription",
+    "protectedCloneTranscription",
+    "cloneAsrModel",
+    "cloneAsrStatus",
+    "cloneAsrReason",
+    "cleanCloneTextAccuracy",
+    "cleanCloneTextError",
+    "protectedCloneTextAccuracy",
+    "protectedCloneTextError",
+    "cloneTextChangeAccuracy",
+    "cloneTextChangeRate",
+    "semanticBaselineWeight",
+    "cloneTokenChangeRate",
+    "cloneSemanticDrift",
+    "cloneTokenScore",
+    "cloneDriftScore",
+    "cloneSemanticScore",
+    "cloneSemanticStatus",
+    "cloneSemanticReason",
+    "cleanCloneQualityMos",
+    "protectedCloneQualityMos",
+    "cloneQualityDropRate",
+    "cloneQualityScore",
+    "qualityBaselineWeight",
+    "cloneQualityModel",
+    "cloneQualityModelPath",
+    "cloneQualityStatus",
+    "cloneQualityReason",
+    "cloneConfidenceBefore",
+    "cloneConfidenceAfter",
+    "cloneConfidenceDropRate",
+    "cloneRadar",
+    "cloneTrend",
+    "cloneDefenseScore",
+    "createdAt",
+)
 
 ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = Path(os.getenv("SEME2E_RUNTIME_DIR", ROOT.parents[1] / "seme2e-runtime"))
@@ -83,6 +141,18 @@ def to_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _sync_clone_eval_fields(clone_result: dict[str, Any], clone_eval: dict[str, Any]) -> None:
+    """Keep the per-clone canonical eval and legacy flattened fields consistent."""
+
+    for key in CLONE_EVAL_MIRROR_FIELDS:
+        nested_value = clone_eval.get(key)
+        flat_value = clone_result.get(key)
+        if nested_value is None and flat_value is not None:
+            clone_eval[key] = flat_value
+        elif key in clone_eval:
+            clone_result[key] = nested_value
 
 
 def read_wav_meta(path: Path) -> dict[str, Any]:
@@ -178,8 +248,74 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _apply_environment_overrides(
+    environment: dict[str, str],
+    env_overrides: Mapping[str, str | None] | None,
+) -> None:
+    if not env_overrides:
+        return
+    for name, value in env_overrides.items():
+        if value is None:
+            environment.pop(str(name), None)
+        else:
+            environment[str(name)] = str(value)
+
+
+def _cuda_worker_runtime(
+    requested_device: str,
+    visible_devices_env: str,
+) -> tuple[str, dict[str, str] | None]:
+    visible_devices = os.getenv(visible_devices_env, "").strip()
+    if not visible_devices:
+        return requested_device, None
+    return "cuda:0", {"CUDA_VISIBLE_DEVICES": visible_devices}
+
+
+def _isolated_process_group_options() -> dict[str, Any]:
+    if os.name == "posix":
+        return {"start_new_session": True}
+    if os.name == "nt":
+        return {
+            "creationflags": (
+                getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            )
+        }
+    return {}
+
+
 def _stop_isolated_worker(process: subprocess.Popen[str], *, grace_seconds: float = 5.0) -> None:
-    if process.poll() is not None:
+    root_process_exited = process.poll() is not None
+    if root_process_exited and os.name != "posix":
+        return
+    grace_seconds = max(0.1, float(grace_seconds))
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=grace_seconds,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.SubprocessError):
+            try:
+                process.terminate()
+            except (OSError, ProcessLookupError):
+                pass
+        try:
+            process.wait(timeout=grace_seconds)
+            return
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except (OSError, ProcessLookupError):
+                pass
+        try:
+            process.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            pass
         return
     try:
         if os.name == "posix":
@@ -206,12 +342,59 @@ def _stop_isolated_worker(process: subprocess.Popen[str], *, grace_seconds: floa
         pass
 
 
+def _run_cancellable_subprocess(
+    command: list[str],
+    *,
+    cwd: str | Path,
+    env: Mapping[str, str] | None,
+    timeout_seconds: int,
+    cancel_event: Any | None = None,
+) -> subprocess.CompletedProcess[str]:
+    timeout_seconds = max(1, int(timeout_seconds))
+    popen_kwargs: dict[str, Any] = {
+        "cwd": str(cwd),
+        "env": dict(env) if env is not None else None,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    popen_kwargs.update(_isolated_process_group_options())
+    process = subprocess.Popen(command, **popen_kwargs)
+    started_at = time.monotonic()
+    stdout = ""
+    stderr = ""
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            _stop_isolated_worker(process)
+            stdout, stderr = process.communicate()
+            raise RuntimeError("TASK_CANCELLED")
+        remaining = timeout_seconds - (time.monotonic() - started_at)
+        if remaining <= 0:
+            _stop_isolated_worker(process)
+            stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired(
+                command,
+                timeout_seconds,
+                output=stdout,
+                stderr=stderr,
+            )
+        try:
+            stdout, stderr = process.communicate(timeout=min(0.25, remaining))
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    return subprocess.CompletedProcess(command, int(process.returncode or 0), stdout, stderr)
+
+
 def _run_isolated_json_worker(
     worker_path: Path,
     request_payload: dict[str, Any],
     *,
     timeout_seconds: int,
     cancel_event: Any | None = None,
+    env_overrides: Mapping[str, str | None] | None = None,
 ) -> dict[str, Any]:
     worker_path = worker_path.resolve()
     timeout_seconds = max(1, int(timeout_seconds))
@@ -220,6 +403,7 @@ def _run_isolated_json_worker(
     environment["PYTHONPATH"] = str(ROOT) + (os.pathsep + existing_python_path if existing_python_path else "")
     environment["PYTHONUNBUFFERED"] = "1"
     environment["PYTHONIOENCODING"] = "utf-8"
+    _apply_environment_overrides(environment, env_overrides)
     command = [sys.executable, "-u", str(worker_path)]
     popen_kwargs: dict[str, Any] = {
         "cwd": str(ROOT),
@@ -231,10 +415,7 @@ def _run_isolated_json_worker(
         "encoding": "utf-8",
         "errors": "replace",
     }
-    if os.name == "posix":
-        popen_kwargs["start_new_session"] = True
-    elif os.name == "nt":
-        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    popen_kwargs.update(_isolated_process_group_options())
 
     try:
         process = subprocess.Popen(command, **popen_kwargs)
@@ -320,6 +501,211 @@ def _run_isolated_json_worker(
     return response
 
 
+def _evaluate_dnsmos_pair_isolated(
+    clean_path: Path,
+    protected_path: Path,
+    *,
+    cancel_event: Any | None = None,
+) -> dict[str, Any]:
+    status = dnsmos_model_status()
+    if status.get("status") != "available":
+        return status
+    try:
+        _acquire_worker_slot(DNSMOS_WORKER_SLOTS, cancel_event)
+        try:
+            response = _run_isolated_json_worker(
+                ROOT / "dnsmos_worker.py",
+                {
+                    "modelPath": status.get("modelPath"),
+                    "originalPath": str(clean_path.resolve()),
+                    "protectedPath": str(protected_path.resolve()),
+                },
+                timeout_seconds=_env_int("SEME2E_DNSMOS_WORKER_TIMEOUT_SECONDS", 180),
+                cancel_event=cancel_event,
+            )
+        finally:
+            DNSMOS_WORKER_SLOTS.release()
+        return {
+            "status": "available",
+            "model": response.get("model") or status.get("model"),
+            "modelPath": response.get("modelPath") or status.get("modelPath"),
+            "provider": response.get("provider"),
+            "clean": response.get("clean"),
+            "protected": response.get("protected"),
+            "cleanMos": to_float(response.get("cleanMos")),
+            "protectedMos": to_float(response.get("protectedMos")),
+            "reason": None,
+        }
+    except IsolatedWorkerError as exc:
+        return {
+            **status,
+            "status": "error",
+            "reason": f"语音质量评分生成失败：{exc}",
+            "diagnostics": exc.diagnostics,
+        }
+    except RuntimeError as exc:
+        if str(exc) == "TASK_CANCELLED":
+            raise
+        return {
+            **status,
+            "status": "error",
+            "reason": f"语音质量评分生成失败：{exc}",
+            "diagnostics": {
+                "exceptionType": type(exc).__name__,
+                "exceptionMessage": str(exc),
+                "stackTrace": traceback.format_exc(),
+            },
+        }
+    except Exception as exc:
+        return {
+            **status,
+            "status": "error",
+            "reason": f"语音质量评分生成失败：{exc}",
+            "diagnostics": {
+                "exceptionType": type(exc).__name__,
+                "exceptionMessage": str(exc),
+                "stackTrace": traceback.format_exc(),
+            },
+        }
+
+
+def _dnsmos_fields_from_evaluation(evaluation: dict[str, Any]) -> dict[str, Any]:
+    dns_value = to_float(evaluation.get("protectedMos"))
+    invalid_value = dns_value is not None and not 1.0 <= dns_value <= 5.0
+    if invalid_value:
+        dns_value = None
+    dns_status = "available" if dns_value is not None else str(evaluation.get("status") or "unavailable")
+    if invalid_value:
+        dns_status = "error"
+    dns_reason = None
+    if dns_value is None:
+        dns_reason = str(
+            evaluation.get("reason")
+            or ("语音质量评分超出 1–5 分范围" if invalid_value else "语音质量评分尚未生成")
+        )
+    return {
+        "dnsMos": dns_value,
+        "dnsMosStatus": dns_status,
+        "dnsMosReason": dns_reason,
+        "dnsMosModel": evaluation.get("model"),
+        "dnsMosModelPath": evaluation.get("modelPath"),
+        "dnsMosProvider": evaluation.get("provider"),
+        "dnsMosDiagnostics": evaluation.get("diagnostics"),
+    }
+
+
+def _transcribe_clone_pair_isolated(
+    clean_clone_path: Path,
+    protected_clone_path: Path,
+    payload: dict[str, Any],
+    *,
+    cancel_event: Any | None = None,
+) -> dict[str, Any]:
+    model = str(
+        payload.get("asrModel")
+        or os.getenv("SEME2E_CLONE_ASR_MODEL")
+        or os.getenv("SEME2E_ASR_MODEL")
+        or "openai-whisper:base"
+    ).strip()
+    language = str(payload.get("language") or "auto").strip()
+    if language.lower() in {"auto", "default", ""}:
+        target_text = str(payload.get("text") or "")
+        language = "zh" if any("\u4e00" <= char <= "\u9fff" for char in target_text) else "en"
+    worker_device, worker_env = _cuda_worker_runtime(
+        os.getenv("SEME2E_CLONE_ASR_DEVICE") or os.getenv("SEME2E_API_DEVICE", "cpu"),
+        "SEME2E_CLONE_ASR_CUDA_VISIBLE_DEVICES",
+    )
+    _acquire_worker_slot(ASR_WORKER_SLOTS, cancel_event)
+    try:
+        response = _run_isolated_json_worker(
+            ROOT / "asr_worker.py",
+            {
+                "model": model,
+                "device": worker_device,
+                "language": language,
+                "originalPath": str(clean_clone_path.resolve()),
+                "protectedPath": str(protected_clone_path.resolve()),
+            },
+            timeout_seconds=_env_int("SEME2E_CLONE_ASR_WORKER_TIMEOUT_SECONDS", 600),
+            cancel_event=cancel_event,
+            **({"env_overrides": worker_env} if worker_env else {}),
+        )
+    except RuntimeError as exc:
+        if str(exc) == "TASK_CANCELLED":
+            raise
+        return {
+            "status": "error",
+            "model": model,
+            "originalText": None,
+            "protectedText": None,
+            "reason": f"克隆语音文本尚未生成：{exc}",
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "model": model,
+            "originalText": None,
+            "protectedText": None,
+            "reason": f"克隆语音文本尚未生成：{exc}",
+        }
+    finally:
+        ASR_WORKER_SLOTS.release()
+    return {
+        "status": "available",
+        "model": response.get("model") or model,
+        "language": response.get("language") or language,
+        "originalText": str(response.get("originalText") or ""),
+        "protectedText": str(response.get("protectedText") or ""),
+        "reason": None,
+        "elapsedSec": response.get("elapsedSec"),
+    }
+
+
+def _compute_clone_semantic_isolated(
+    clean_clone_path: Path,
+    protected_clone_path: Path,
+    config: dict[str, Any],
+    *,
+    cancel_event: Any | None = None,
+) -> dict[str, Any]:
+    _acquire_worker_slot(SEMANTIC_WORKER_SLOTS, cancel_event)
+    try:
+        response = _run_isolated_json_worker(
+            ROOT / "semantic_metrics_worker.py",
+            {
+                "originalPath": str(clean_clone_path.resolve()),
+                "protectedPath": str(protected_clone_path.resolve()),
+                "config": config,
+            },
+            timeout_seconds=_env_int("SEME2E_SEMANTIC_WORKER_TIMEOUT_SECONDS", 900),
+            cancel_event=cancel_event,
+        )
+        metrics = response.get("metrics")
+        if not isinstance(metrics, dict):
+            raise ValueError("semantic worker did not return metrics")
+        if not metrics.get("reason") and metrics.get("status") not in {"available", "partial"}:
+            metrics["reason"] = metrics.get("error") or "克隆语义指标尚未生成"
+        return metrics
+    except RuntimeError as exc:
+        if str(exc) == "TASK_CANCELLED":
+            raise
+        return {
+            "status": "error",
+            "tokenChangeRate": None,
+            "semanticDrift": None,
+            "reason": f"克隆语义指标尚未生成：{exc}",
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "tokenChangeRate": None,
+            "semanticDrift": None,
+            "reason": f"克隆语义指标尚未生成：{exc}",
+        }
+    finally:
+        SEMANTIC_WORKER_SLOTS.release()
+
+
 def _env_list(name: str, default: list[str]) -> list[str]:
     raw = os.getenv(name)
     if not raw:
@@ -329,15 +715,107 @@ def _env_list(name: str, default: list[str]) -> list[str]:
 
 
 ASR_WORKER_MAX_CONCURRENCY = max(1, _env_int("SEME2E_ASR_WORKER_MAX_CONCURRENCY", 2))
+SEMANTIC_WORKER_MAX_CONCURRENCY = max(1, _env_int("SEME2E_SEMANTIC_WORKER_MAX_CONCURRENCY", 2))
 COQUI_TTS_WORKER_MAX_CONCURRENCY = max(1, _env_int("SEME2E_COQUI_TTS_WORKER_MAX_CONCURRENCY", 2))
+COSYVOICE_WORKER_MAX_CONCURRENCY = max(1, _env_int("SEME2E_COSYVOICE_WORKER_MAX_CONCURRENCY", 1))
+GPT_SOVITS_WORKER_MAX_CONCURRENCY = max(1, _env_int("SEME2E_GPT_SOVITS_WORKER_MAX_CONCURRENCY", 1))
+DNSMOS_WORKER_MAX_CONCURRENCY = max(1, _env_int("SEME2E_DNSMOS_WORKER_MAX_CONCURRENCY", 1))
+CLONE_GPU_MAX_CONCURRENCY = max(1, _env_int("SEME2E_CLONE_GPU_MAX_CONCURRENCY", 1))
 ASR_WORKER_SLOTS = threading.BoundedSemaphore(ASR_WORKER_MAX_CONCURRENCY)
+SEMANTIC_WORKER_SLOTS = threading.BoundedSemaphore(SEMANTIC_WORKER_MAX_CONCURRENCY)
 COQUI_TTS_WORKER_SLOTS = threading.BoundedSemaphore(COQUI_TTS_WORKER_MAX_CONCURRENCY)
+COSYVOICE_WORKER_SLOTS = threading.BoundedSemaphore(COSYVOICE_WORKER_MAX_CONCURRENCY)
+GPT_SOVITS_WORKER_SLOTS = threading.BoundedSemaphore(GPT_SOVITS_WORKER_MAX_CONCURRENCY)
+DNSMOS_WORKER_SLOTS = threading.BoundedSemaphore(DNSMOS_WORKER_MAX_CONCURRENCY)
+CLONE_GPU_SLOTS_GUARD = threading.Lock()
+CLONE_GPU_SLOTS: dict[str, threading.BoundedSemaphore] = {}
 
 
 def _acquire_worker_slot(semaphore: threading.BoundedSemaphore, cancel_event: Any | None) -> None:
-    while not semaphore.acquire(timeout=0.25):
+    while True:
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("TASK_CANCELLED")
+        if not semaphore.acquire(timeout=0.25):
+            continue
+        if cancel_event is not None and cancel_event.is_set():
+            semaphore.release()
+            raise RuntimeError("TASK_CANCELLED")
+        return
+
+
+def _gpu_slot_sort_key(value: str) -> tuple[int, int | str]:
+    try:
+        return 0, int(value)
+    except ValueError:
+        return 1, value
+
+
+def _visible_gpu_tokens(raw_value: str) -> tuple[str, ...]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for raw_item in raw_value.split(","):
+        item = raw_item.strip()
+        if not item or item.lower() in {"-1", "none", "nodevfiles"} or item in seen:
+            continue
+        seen.add(item)
+        values.append(item)
+    return tuple(values)
+
+
+def _clone_gpu_slot_keys(requested_device: str, visible_devices_env: str) -> tuple[str, ...]:
+    explicit_visible_devices = os.getenv(visible_devices_env, "").strip()
+    if explicit_visible_devices:
+        return tuple(sorted(_visible_gpu_tokens(explicit_visible_devices), key=_gpu_slot_sort_key))
+
+    normalized_device = (requested_device or "").strip().lower()
+    if not normalized_device.startswith("cuda"):
+        return ()
+
+    parent_visible_devices = _visible_gpu_tokens(os.getenv("CUDA_VISIBLE_DEVICES", ""))
+    logical_index = 0
+    if ":" in normalized_device:
+        try:
+            logical_index = int(normalized_device.split(":", 1)[1])
+        except ValueError:
+            logical_index = 0
+    if parent_visible_devices:
+        if 0 <= logical_index < len(parent_visible_devices):
+            return (parent_visible_devices[logical_index],)
+        return tuple(sorted(parent_visible_devices, key=_gpu_slot_sort_key))
+    return (str(logical_index),)
+
+
+def _clone_gpu_slot(key: str) -> threading.BoundedSemaphore:
+    with CLONE_GPU_SLOTS_GUARD:
+        slot = CLONE_GPU_SLOTS.get(key)
+        if slot is None:
+            slot = threading.BoundedSemaphore(CLONE_GPU_MAX_CONCURRENCY)
+            CLONE_GPU_SLOTS[key] = slot
+        return slot
+
+
+def _release_worker_slots(slots: list[threading.BoundedSemaphore]) -> None:
+    for slot in reversed(slots):
+        slot.release()
+
+
+def _acquire_clone_worker_slots(
+    model_slot: threading.BoundedSemaphore,
+    gpu_keys: tuple[str, ...],
+    cancel_event: Any | None,
+) -> list[threading.BoundedSemaphore]:
+    acquired_slots: list[threading.BoundedSemaphore] = []
+    try:
+        _acquire_worker_slot(model_slot, cancel_event)
+        acquired_slots.append(model_slot)
+        for key in sorted(set(gpu_keys), key=_gpu_slot_sort_key):
+            gpu_slot = _clone_gpu_slot(key)
+            _acquire_worker_slot(gpu_slot, cancel_event)
+            acquired_slots.append(gpu_slot)
+        return acquired_slots
+    except Exception:
+        _release_worker_slots(acquired_slots)
+        raise
 
 
 FORMAL_EPSILON = 4 / 255
@@ -1044,11 +1522,13 @@ def diagnose_capabilities() -> dict[str, Any]:
     speaker_available = _module_available("speechbrain")
     pesq_available = _module_available("pesq")
     stoi_available = _module_available("pystoi")
+    dnsmos_status = dnsmos_model_status()
+    dnsmos_available = dnsmos_status.get("status") == "available"
     tts_available = _module_available("TTS")
     cosyvoice_status, cosyvoice_reason, _ = _cosyvoice_model_status()
     gpt_sovits_status, gpt_sovits_reason, _ = _gpt_sovits_model_status()
-    perception_available = ["snr", "maskingCurve"] + (["pesq"] if pesq_available else []) + (["stoi"] if stoi_available else [])
-    perception_unavailable = ([] if pesq_available else ["pesq"]) + ([] if stoi_available else ["stoi"]) + ["mos", "mosLqo"]
+    perception_available = ["snr", "maskingCurve"] + (["pesq"] if pesq_available else []) + (["stoi"] if stoi_available else []) + (["dnsMos"] if dnsmos_available else [])
+    perception_unavailable = ([] if pesq_available else ["pesq"]) + ([] if stoi_available else ["stoi"]) + ([] if dnsmos_available else ["dnsMos"])
     return {
         "ok": True,
         "modelTypes": MODEL_TYPES,
@@ -1082,10 +1562,11 @@ def diagnose_capabilities() -> dict[str, Any]:
                 "reason": None if speaker_available else "speaker model dependency speechbrain not installed",
             },
             "perception_eval": {
-                "status": "partial",
+                "status": "available" if not perception_unavailable else "partial",
                 "available": perception_available,
                 "unavailable": perception_unavailable,
-                "reason": "MOS/MOS-LQO require human feedback or a declared calibrated model" if pesq_available and stoi_available else "Install pesq and pystoi to enable objective PESQ/STOI metrics; MOS/MOS-LQO require human feedback or a declared calibrated model",
+                "qualityModel": dnsmos_status,
+                "reason": None if not perception_unavailable else "部分语音质量指标尚未生成",
             },
             "downstream_tts_eval": {
                 "status": "available" if tts_available or cosyvoice_status == "available" or gpt_sovits_status == "available" else "unavailable",
@@ -1391,6 +1872,14 @@ def compute_perception(clean_path: Path, protected_path: Path, payload: dict[str
         "stoi": None,
         "mos": None,
         "mosLqo": None,
+        "dnsMos": None,
+        "dnsMosScore": None,
+        "dnsMosStatus": "unavailable",
+        "dnsMosReason": "语音质量评分尚未生成",
+        "dnsMosModel": None,
+        "dnsMosModelPath": None,
+        "dnsMosProvider": None,
+        "dnsMosDiagnostics": None,
         "qualityScore": None,
         "qualityLevel": None,
         "l2Norm": None,
@@ -1413,13 +1902,88 @@ def compute_perception(clean_path: Path, protected_path: Path, payload: dict[str
         "source": "metric_definitions.py",
         "_metricSources": {},
     }
+
+    try:
+        dns_mos = _evaluate_dnsmos_pair_isolated(clean_path, protected_path)
+    except IsolatedWorkerError as exc:
+        dns_mos = {
+            "status": "error",
+            "model": "DNSMOS P.835 OVRL",
+            "reason": f"语音质量评分生成失败：{exc}",
+            "diagnostics": exc.diagnostics,
+        }
+    except RuntimeError as exc:
+        if str(exc) == "TASK_CANCELLED":
+            raise
+        dns_mos = {
+            "status": "error",
+            "model": "DNSMOS P.835 OVRL",
+            "reason": f"语音质量评分生成失败：{exc}",
+            "diagnostics": {
+                "exceptionType": type(exc).__name__,
+                "exceptionMessage": str(exc),
+                "stackTrace": traceback.format_exc(),
+            },
+        }
+    except Exception as exc:
+        dns_mos = {
+            "status": "error",
+            "model": "DNSMOS P.835 OVRL",
+            "reason": f"语音质量评分生成失败：{exc}",
+            "diagnostics": {
+                "exceptionType": type(exc).__name__,
+                "exceptionMessage": str(exc),
+                "stackTrace": traceback.format_exc(),
+            },
+        }
+
+    dns_fields = _dnsmos_fields_from_evaluation(dns_mos)
+    dns_score_payload = compute_protection_quality_score(None, None, None, dns_fields["dnsMos"])
+    if dns_fields["dnsMos"] is None:
+        dns_score_payload["dnsMosStatus"] = dns_fields["dnsMosStatus"]
+        dns_score_payload["dnsMosReason"] = dns_fields["dnsMosReason"]
+    quality: dict[str, Any] = {
+        "snr": None,
+        "pesq": None,
+        "stoi": None,
+        "mos": None,
+        "mosLqo": None,
+        **dns_score_payload,
+        **dns_fields,
+    }
+    perception.update(
+        {
+            **dns_fields,
+            "dnsMosScore": dns_score_payload.get("dnsMosScore"),
+            "qualityScore": dns_score_payload.get("qualityScore"),
+            "qualityLevel": dns_score_payload.get("qualityLevel"),
+            "protectionQuality": quality,
+        }
+    )
+    dns_source = metric_source(
+        str(dns_fields["dnsMosStatus"]),
+        str(dns_fields.get("dnsMosModel") or "DNSMOS P.835 OVRL"),
+        reason=dns_fields.get("dnsMosReason"),
+        formula="100*(DNSMOS_OVRL-1)/4 when 1<=DNSMOS_OVRL<=5",
+    )
+    perception["_metricSources"]["protectionQuality.dnsMos"] = dns_source
+
     try:
         x, xp, delta, sr = align_audio_pair(clean_path, protected_path)
         perturbation = compute_perturbation_metrics(x, xp, delta, sr, epsilon=epsilon, epsilon_norm=epsilon_norm)
-        quality = compute_quality_metrics(x, xp, delta, sr, perturbation)
-        psycho = compute_psychoacoustic_metrics(x, xp, delta, sr)
+        quality = compute_quality_metrics(
+            x,
+            xp,
+            delta,
+            sr,
+            perturbation,
+            dns_mos=dns_fields["dnsMos"],
+            dns_mos_status=str(dns_fields["dnsMosStatus"]),
+            dns_mos_reason=dns_fields.get("dnsMosReason"),
+        )
+        quality.update(dns_fields)
         quality_sources = quality.pop("_metricSources", {})
-        psycho_sources = psycho.pop("_metricSources", {})
+        quality_sources["protectionQuality.dnsMos"] = dns_source
         perception.update(perturbation)
         perception.update(
             {
@@ -1428,16 +1992,62 @@ def compute_perception(clean_path: Path, protected_path: Path, payload: dict[str
                 "stoi": quality.get("stoi"),
                 "mos": quality.get("mos"),
                 "mosLqo": quality.get("mosLqo"),
+                "dnsMos": quality.get("dnsMos"),
+                "dnsMosScore": quality.get("dnsMosScore"),
+                "dnsMosStatus": quality.get("dnsMosStatus"),
+                "dnsMosReason": quality.get("dnsMosReason"),
+                "dnsMosModel": quality.get("dnsMosModel"),
+                "dnsMosModelPath": quality.get("dnsMosModelPath"),
+                "dnsMosProvider": quality.get("dnsMosProvider"),
+                "dnsMosDiagnostics": quality.get("dnsMosDiagnostics"),
                 "qualityScore": quality.get("qualityScore"),
                 "qualityLevel": quality.get("qualityLevel"),
+                "perturbation": perturbation,
+                "protectionQuality": quality,
+                "status": "available",
+            }
+        )
+        sources = dict(perception["_metricSources"])
+        perturbation_source = metric_source(
+            "available",
+            "align_audio_pair + compute_perturbation_metrics",
+            formula="delta=xp-x; l2Norm=sqrt(sum(delta^2)); snr=10*log10((P_signal+1e-12)/(P_noise+1e-12))",
+        )
+        sources["perturbation.*"] = perturbation_source
+        for key in perturbation:
+            sources[f"perturbation.{key}"] = perturbation_source
+        sources.update(quality_sources)
+        perception["_metricSources"] = sources
+    except Exception as exc:
+        if str(exc) == "TASK_CANCELLED":
+            raise
+        reason = str(exc)
+        perception["error"] = reason
+        perception["_metricSources"].update(
+            {
+                "perturbation.*": metric_source("error", "align_audio_pair", reason=reason, formula="read/resample/mono/truncate audio pair"),
+                "protectionQuality.snr": metric_source("unavailable", "compute_perturbation_metrics", reason=reason, formula="10*log10((P_signal+1e-12)/(P_noise+1e-12))"),
+                "protectionQuality.pesq": metric_source("unavailable", "pesq", reason="Audio pair alignment failed before PESQ", formula="pesq(sr,x,xp,mode)"),
+                "protectionQuality.stoi": metric_source("unavailable", "pystoi", reason="Audio pair alignment failed before STOI", formula="stoi(x,xp,sr)"),
+                "protectionQuality.mosLqo": metric_source("unavailable", "objective_mos_lqo_model", reason="No explicit MOS-LQO objective model is configured", formula="None"),
+                "protectionQuality.qualityScore": metric_source("unavailable", "VoiceShield_v2.1_piecewise_quality", reason=quality.get("scoreReason")),
+                "protectionQuality.qualityLevel": metric_source("unavailable", "qualityScore_thresholds", reason="qualityScore is unavailable"),
+                "psychoacoustic.*": metric_source("error", "engineering_stft_masking_threshold", reason=reason, formula="V=max(0,PSD_delta-Theta)"),
+            }
+        )
+        return perception
+
+    try:
+        psycho = compute_psychoacoustic_metrics(x, xp, delta, sr)
+        psycho_sources = psycho.pop("_metricSources", {})
+        perception.update(
+            {
                 "lPsy": psycho.get("lPsy"),
                 "overMaskRate": psycho.get("overMaskRate"),
                 "psychoacousticViolationRate": psycho.get("overMaskRate"),
                 "maskingThreshold": psycho.get("maskingThreshold"),
                 "perturbationSpectrum": psycho.get("perturbationSpectrum"),
                 "maskingCurve": psycho.get("chart") or [],
-                "perturbation": perturbation,
-                "protectionQuality": quality,
                 "psychoacoustic": {
                     "lPsy": psycho.get("lPsy"),
                     "overMaskRate": psycho.get("overMaskRate"),
@@ -1449,42 +2059,129 @@ def compute_perception(clean_path: Path, protected_path: Path, payload: dict[str
                     "maskingThreshold": psycho.get("maskingThreshold"),
                     "perturbationSpectrum": psycho.get("perturbationSpectrum"),
                 },
-                "status": "available",
             }
         )
-        sources = {
-            "perturbation.*": metric_source(
-                "available",
-                "align_audio_pair + compute_perturbation_metrics",
-                formula="delta=xp-x; l2Norm=sqrt(sum(delta^2)); snr=10*log10((P_signal+1e-12)/(P_noise+1e-12))",
-            )
-        }
-        for key in perturbation:
-            sources[f"perturbation.{key}"] = sources["perturbation.*"]
-        sources.update(quality_sources)
-        sources.update(psycho_sources)
+        perception["_metricSources"].update(psycho_sources)
         for key in ["lPsy", "overMaskRate", "maskingThreshold", "perturbationSpectrum"]:
-            sources[f"psychoacoustic.{key}"] = sources["psychoacoustic.*"]
-        perception["_metricSources"] = sources
+            perception["_metricSources"][f"psychoacoustic.{key}"] = perception["_metricSources"]["psychoacoustic.*"]
     except Exception as exc:
+        if str(exc) == "TASK_CANCELLED":
+            raise
         reason = str(exc)
-        perception["error"] = reason
-        perception["_metricSources"] = {
-            "perturbation.*": metric_source("error", "align_audio_pair", reason=reason, formula="read/resample/mono/truncate audio pair"),
-            "protectionQuality.pesq": metric_source("unavailable", "pesq", reason="Audio pair alignment failed before PESQ", formula="pesq(sr,x,xp,mode)"),
-            "protectionQuality.stoi": metric_source("unavailable", "pystoi", reason="Audio pair alignment failed before STOI", formula="stoi(x,xp,sr)"),
-            "protectionQuality.mos": metric_source("unavailable", "human_listening_test", reason="MOS requires human listening test or a declared MOS model", formula="None"),
-            "protectionQuality.mosLqo": metric_source("unavailable", "objective_mos_lqo_model", reason="No explicit MOS-LQO objective model is configured", formula="None"),
-            "psychoacoustic.*": metric_source("error", "engineering_stft_masking_threshold", reason=reason, formula="V=max(0,PSD_delta-Theta)"),
-        }
+        perception["status"] = "partial"
+        perception["psychoacousticError"] = reason
+        psycho_source = metric_source(
+            "error",
+            "engineering_stft_masking_threshold",
+            reason=reason,
+            formula="V=max(0,PSD_delta-Theta)",
+        )
+        perception["_metricSources"]["psychoacoustic.*"] = psycho_source
+        for key in ["lPsy", "overMaskRate", "maskingThreshold", "perturbationSpectrum"]:
+            perception["_metricSources"][f"psychoacoustic.{key}"] = psycho_source
     return perception
 
 
 def compute_mfcc_semantic(clean_path: Path, protected_path: Path, config: dict[str, Any] | None = None) -> dict[str, Any]:
     details = compute_semantic_token_metrics(clean_path, protected_path, config or {})
+    details.update(
+        compute_protection_semantic_score(
+            details.get("tokenChangeRate"),
+            details.get("semanticDrift"),
+        )
+    )
     if not details.get("encoderDistances"):
         details["encoderDistances"] = empty_details()["semantic"]["encoderDistances"]
     return details
+
+
+def refresh_result_scores(result: dict[str, Any]) -> dict[str, Any]:
+    """Attach the v2.1 score contract without fabricating missing dimensions."""
+
+    details = result.setdefault("details", {})
+    perception = details.setdefault("perception", {})
+    quality = perception.get("protectionQuality")
+    if not isinstance(quality, dict):
+        quality = {}
+        perception["protectionQuality"] = quality
+    explicit_dns_status = quality.get("dnsMosStatus") or perception.get("dnsMosStatus")
+    explicit_dns_reason = quality.get("dnsMosReason") or perception.get("dnsMosReason")
+    quality_score = compute_protection_quality_score(
+        quality.get("snr", perception.get("snr")),
+        quality.get("stoi", perception.get("stoi")),
+        quality.get("pesq", perception.get("pesq")),
+        quality.get("dnsMos", perception.get("dnsMos")),
+    )
+    quality.update(quality_score)
+    if quality_score.get("dnsMos") is None:
+        quality["dnsMosStatus"] = explicit_dns_status or quality_score.get("dnsMosStatus")
+        quality["dnsMosReason"] = explicit_dns_reason or quality_score.get("dnsMosReason")
+    perception.update(
+        {
+            "qualityScore": quality_score.get("qualityScore"),
+            "qualityLevel": quality_score.get("qualityLevel"),
+            "dnsMos": quality_score.get("dnsMos"),
+            "dnsMosScore": quality_score.get("dnsMosScore"),
+            "dnsMosStatus": quality.get("dnsMosStatus") or quality_score.get("dnsMosStatus"),
+            "dnsMosReason": quality.get("dnsMosReason") or quality_score.get("dnsMosReason"),
+        }
+    )
+    quality["qualityLevel"] = quality_score.get("qualityLevel")
+
+    semantic = details.get("semantic")
+    if not isinstance(semantic, dict):
+        semantic = {}
+        details["semantic"] = semantic
+    semantic.update(
+        compute_protection_semantic_score(
+            semantic.get("tokenChangeRate"),
+            semantic.get("semanticDrift"),
+        )
+    )
+    speaker = details.get("speaker")
+    if not isinstance(speaker, dict):
+        speaker = {}
+        details["speaker"] = speaker
+    direct_similarity = to_float(speaker.get("simOriginalProtected", speaker.get("simAfter")))
+    if direct_similarity is None:
+        direct_distance = to_float(speaker.get("embeddingDistanceAfter", speaker.get("embeddingDistance")))
+        if direct_distance is not None:
+            direct_similarity = 1.0 - direct_distance
+    if direct_similarity is None:
+        direct_similarity = to_float(((result.get("summary") or {}).get("primaryMetrics") or {}).get("speakerSimilarity"))
+    speaker.update(compute_direct_identity_score(direct_similarity))
+
+    latest_clone_eval: dict[str, Any] | None = None
+    for clone_result in result.get("cloneResults") or []:
+        if not isinstance(clone_result, dict):
+            continue
+        clone_eval = clone_result.get("cloneEval")
+        if not isinstance(clone_eval, dict):
+            continue
+        _sync_clone_eval_fields(clone_result, clone_eval)
+        if clone_eval.get("cloneIdentityScore") is None:
+            identity = compute_clone_identity_score(
+                clone_eval.get("originalSimilarity", clone_result.get("originalSimilarity")),
+                clone_eval.get("protectedSimilarity", clone_result.get("protectedSimilarity")),
+            )
+            clone_eval.update(identity)
+            clone_eval["cloneDefenseScore"] = identity.get("cloneIdentityScore")
+        _sync_clone_eval_fields(clone_result, clone_eval)
+        latest_clone_eval = clone_eval
+    if latest_clone_eval is not None:
+        details["cloneEval"] = latest_clone_eval
+
+    summary_score = compute_overall_score(result)
+    evaluation = summary_score["protectionEvaluation"]
+    details["protectionEvaluation"] = evaluation
+    result["protectionEvaluation"] = evaluation
+    summary = result.setdefault("summary", {})
+    summary["score"] = summary_score["score"]
+    summary["verdict"] = summary_score["verdict"]
+    metric_sources = summary.setdefault("metricSources", {})
+    metric_sources.update(summary_score.get("_metricSources") or {})
+    result["metricSources"] = metric_sources
+    return summary_score
 
 
 def maybe_asr_eval(
@@ -1523,6 +2220,10 @@ def maybe_asr_eval(
         asr["_metricSources"] = {"asrEval.*": metric_source("not_run", "ASRTranscriber", reason=asr["reason"], formula="独立 ASR 转写与编辑距离评估")}
         return asr
 
+    worker_device, worker_env = _cuda_worker_runtime(
+        os.getenv("SEME2E_API_DEVICE", "cpu"),
+        "SEME2E_ASR_CUDA_VISIBLE_DEVICES",
+    )
     try:
         evaluations = []
         for model in actual_models:
@@ -1532,13 +2233,14 @@ def maybe_asr_eval(
                     ROOT / "asr_worker.py",
                     {
                         "model": model,
-                        "device": os.getenv("SEME2E_API_DEVICE", "cpu"),
+                        "device": worker_device,
                         "language": str(payload.get("language") or "en"),
                         "originalPath": str(clean_path.resolve()),
                         "protectedPath": str(protected_path.resolve()),
                     },
                     timeout_seconds=_env_int("SEME2E_ASR_WORKER_TIMEOUT_SECONDS", 600),
                     cancel_event=cancel_event,
+                    **({"env_overrides": worker_env} if worker_env else {}),
                 )
             finally:
                 ASR_WORKER_SLOTS.release()
@@ -1630,11 +2332,7 @@ def create_asr_eval(task_id: str, payload: dict[str, Any], *, cancel_event: Any 
         if asr_sub_id:
             asr_results[:] = [item for item in asr_results if item.get("asrSubId") != asr_sub_id]
         asr_results.append(response)
-        summary_score = compute_overall_score(latest_result)
-        latest_result.setdefault("summary", {})["score"] = summary_score["score"]
-        latest_result.setdefault("summary", {})["verdict"] = summary_score["verdict"]
-        metric_sources.update(summary_score.get("_metricSources") or {})
-        latest_result["metricSources"] = metric_sources
+        refresh_result_scores(latest_result)
         save_result(TASK_DIR / task_id, latest_result)
     return response
 
@@ -1897,18 +2595,94 @@ def build_task_payload(
             "python": sys.version.split()[0],
         },
     }
-    summary_score = compute_overall_score(result)
-    result["summary"]["score"] = summary_score["score"]
-    result["summary"]["verdict"] = summary_score["verdict"]
-    metric_sources.update(summary_score.get("_metricSources") or {})
     result["summary"]["metricSources"] = metric_sources
     result["metricSources"] = metric_sources
+    refresh_result_scores(result)
     return result
 
 
+def _lock_result_file(lock_file: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write(b"\0")
+            lock_file.flush()
+        while True:
+            try:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                time.sleep(0.05)
+    elif os.name == "posix":
+        import fcntl
+
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_result_file(lock_file: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+    elif os.name == "posix":
+        import fcntl
+
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _result_file_transaction(task_dir: Path) -> Any:
+    task_dir.mkdir(parents=True, exist_ok=True)
+    with RESULT_WRITE_LOCK:
+        with (task_dir / ".result.lock").open("a+b") as lock_file:
+            _lock_result_file(lock_file)
+            try:
+                yield
+            finally:
+                _unlock_result_file(lock_file)
+
+
+def _write_result_atomic_unlocked(task_dir: Path, result: dict[str, Any]) -> None:
+    result_path = task_dir / "result.json"
+    temporary_path = task_dir / f".result.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+    try:
+        with temporary_path.open("x", encoding="utf-8") as file:
+            json.dump(result, file, ensure_ascii=False, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_path, result_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
 def save_result(task_dir: Path, result: dict[str, Any]) -> None:
-    with (task_dir / "result.json").open("w", encoding="utf-8") as file:
-        json.dump(result, file, ensure_ascii=False, indent=2)
+    with _result_file_transaction(task_dir):
+        _write_result_atomic_unlocked(task_dir, result)
+
+
+def update_result_safely(
+    task_id: str,
+    updater: Callable[[dict[str, Any]], bool],
+    *,
+    after_write: Callable[[dict[str, Any]], None] | None = None,
+) -> tuple[dict[str, Any], bool]:
+    task_dir = TASK_DIR / task_id
+    result_path = task_dir / "result.json"
+    with _result_file_transaction(task_dir):
+        if not result_path.exists():
+            raise FileNotFoundError(f"task {task_id} result.json is missing")
+        with result_path.open("r", encoding="utf-8") as file:
+            result = json.load(file)
+        changed = bool(updater(result))
+        if changed:
+            _write_result_atomic_unlocked(task_dir, result)
+            if after_write is not None:
+                after_write(result)
+        return result, changed
 
 
 def load_result(task_id: str) -> dict[str, Any]:
@@ -2032,6 +2806,128 @@ def _task_audio_paths(task_id: str) -> tuple[Path, Path, dict[str, Any]]:
     return original_path, protected_path, result
 
 
+def _join_dnsmos_task_flight(task_id: str) -> tuple[threading.Event, bool]:
+    with DNSMOS_TASK_FLIGHTS_GUARD:
+        existing = DNSMOS_TASK_FLIGHTS.get(task_id)
+        if existing is not None:
+            return existing, False
+        flight = threading.Event()
+        DNSMOS_TASK_FLIGHTS[task_id] = flight
+        return flight, True
+
+
+def _finish_dnsmos_task_flight(task_id: str, flight: threading.Event) -> None:
+    with DNSMOS_TASK_FLIGHTS_GUARD:
+        if DNSMOS_TASK_FLIGHTS.get(task_id) is flight:
+            DNSMOS_TASK_FLIGHTS.pop(task_id, None)
+        flight.set()
+
+
+def ensure_protection_dnsmos(task_id: str, result: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Backfill DNSMOS while coalescing concurrent attempts for the same persisted task."""
+
+    current = result if isinstance(result, dict) else load_result(task_id)
+    current_perception = ((current.get("details") or {}).get("perception") or {})
+    current_quality = current_perception.get("protectionQuality")
+    if not isinstance(current_quality, dict):
+        current_quality = {}
+    if to_float(current_quality.get("dnsMos", current_perception.get("dnsMos"))) is not None:
+        refresh_result_scores(current)
+        return current
+
+    flight, is_leader = _join_dnsmos_task_flight(task_id)
+    if not is_leader:
+        flight.wait()
+        latest = load_result(task_id)
+        refresh_result_scores(latest)
+        return latest
+
+    try:
+        with RESULT_WRITE_LOCK:
+            latest = load_result(task_id)
+            latest_perception = ((latest.get("details") or {}).get("perception") or {})
+            latest_quality = latest_perception.get("protectionQuality")
+            if not isinstance(latest_quality, dict):
+                latest_quality = {}
+            if to_float(latest_quality.get("dnsMos", latest_perception.get("dnsMos"))) is not None:
+                refresh_result_scores(latest)
+                return latest
+
+        try:
+            original_path, protected_path, _ = _task_audio_paths(task_id)
+            evaluation = _evaluate_dnsmos_pair_isolated(original_path, protected_path)
+        except IsolatedWorkerError as exc:
+            evaluation = {
+                "status": "error",
+                "model": "DNSMOS P.835 OVRL",
+                "reason": f"语音质量评分生成失败：{exc}",
+                "diagnostics": exc.diagnostics,
+            }
+        except RuntimeError as exc:
+            if str(exc) == "TASK_CANCELLED":
+                raise
+            evaluation = {
+                "status": "error",
+                "model": "DNSMOS P.835 OVRL",
+                "reason": f"语音质量评分生成失败：{exc}",
+                "diagnostics": {
+                    "exceptionType": type(exc).__name__,
+                    "exceptionMessage": str(exc),
+                    "stackTrace": traceback.format_exc(),
+                },
+            }
+        except Exception as exc:
+            evaluation = {
+                "status": "error",
+                "model": "DNSMOS P.835 OVRL",
+                "reason": f"语音质量评分生成失败：{exc}",
+                "diagnostics": {
+                    "exceptionType": type(exc).__name__,
+                    "exceptionMessage": str(exc),
+                    "stackTrace": traceback.format_exc(),
+                },
+            }
+
+        dns_fields = _dnsmos_fields_from_evaluation(evaluation)
+        dns_source = metric_source(
+            str(dns_fields["dnsMosStatus"]),
+            str(dns_fields.get("dnsMosModel") or "DNSMOS P.835 OVRL"),
+            reason=dns_fields.get("dnsMosReason"),
+            formula="100*(DNSMOS_OVRL-1)/4 when 1<=DNSMOS_OVRL<=5",
+        )
+
+        with RESULT_WRITE_LOCK:
+            latest = load_result(task_id)
+            details = latest.setdefault("details", {})
+            perception = details.setdefault("perception", {})
+            quality = perception.get("protectionQuality")
+            if not isinstance(quality, dict):
+                quality = {}
+                perception["protectionQuality"] = quality
+            existing = to_float(quality.get("dnsMos", perception.get("dnsMos")))
+            if existing is None:
+                quality.update(dns_fields)
+                perception.update(dns_fields)
+                perception.setdefault("_metricSources", {})["protectionQuality.dnsMos"] = dns_source
+                summary = latest.setdefault("summary", {})
+                metric_sources = summary.setdefault("metricSources", {})
+                metric_sources["protectionQuality.dnsMos"] = dns_source
+                refresh_result_scores(latest)
+                metric_sources["protectionQuality.qualityScore"] = metric_source(
+                    "available" if quality.get("qualityScore") is not None else "unavailable",
+                    "VoiceShield_v2.1_piecewise_quality",
+                    reason=quality.get("scoreReason"),
+                    formula="without DNSMOS: (.40*S_snr+.35*S_stoi+.15*S_pesq)/.90; with DNSMOS: .40*S_snr+.35*S_stoi+.15*S_pesq+.10*S_dnsmos",
+                )
+                latest["metricSources"] = metric_sources
+                save_result(TASK_DIR / task_id, latest)
+            else:
+                refresh_result_scores(latest)
+            return latest
+    finally:
+        _finish_dnsmos_task_flight(task_id, flight)
+
+
 def _local_tts_model_files(model: str) -> tuple[Path, Path] | None:
     backend_value = normalize_tts_model(model)
     for item in SUPPORTED_TTS_MODELS:
@@ -2143,6 +3039,10 @@ def _coqui_tts_clone_pair(
     cancel_event: Any | None,
 ) -> dict[str, Any]:
     local_model = _local_tts_model_files(model)
+    worker_device, worker_env = _cuda_worker_runtime(
+        device,
+        "SEME2E_COQUI_TTS_CUDA_VISIBLE_DEVICES",
+    )
     request_payload: dict[str, Any] = {
         "taskId": task_id,
         "cloneSubId": clone_sub_id,
@@ -2150,7 +3050,7 @@ def _coqui_tts_clone_pair(
         "text": text,
         "language": language,
         "speed": speed,
-        "device": device,
+        "device": worker_device,
         "ttsHome": str(PROJECT_TTS_CACHE_DIR.resolve()),
         "originalReferencePath": str(original_reference.resolve()),
         "protectedReferencePath": str(protected_reference.resolve()),
@@ -2161,16 +3061,21 @@ def _coqui_tts_clone_pair(
         model_path, config_path = local_model
         request_payload["modelPath"] = str(model_path.resolve())
         request_payload["configPath"] = str(config_path.resolve())
-    _acquire_worker_slot(COQUI_TTS_WORKER_SLOTS, cancel_event)
+    acquired_slots = _acquire_clone_worker_slots(
+        COQUI_TTS_WORKER_SLOTS,
+        _clone_gpu_slot_keys(device, "SEME2E_COQUI_TTS_CUDA_VISIBLE_DEVICES"),
+        cancel_event,
+    )
     try:
         return _run_isolated_json_worker(
             ROOT / "coqui_tts_worker.py",
             request_payload,
             timeout_seconds=_env_int("SEME2E_COQUI_TTS_WORKER_TIMEOUT_SECONDS", 900),
             cancel_event=cancel_event,
+            **({"env_overrides": worker_env} if worker_env else {}),
         )
     finally:
-        COQUI_TTS_WORKER_SLOTS.release()
+        _release_worker_slots(acquired_slots)
 
 
 def _is_cosyvoice_model(model: str) -> bool:
@@ -2192,11 +3097,16 @@ def _cosyvoice_clone_pair(
     protected_prompt_text: str,
     speed: float,
     device: str,
+    cancel_event: Any | None = None,
 ) -> dict[str, Any]:
     status, reason, _ = _cosyvoice_model_status()
     if status != "available":
         raise RuntimeError(reason or "CosyVoice2 runtime is unavailable")
     worker = ROOT / "cosyvoice_worker.py"
+    worker_device, worker_env = _cuda_worker_runtime(
+        device,
+        "SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES",
+    )
     command = [
         str(COSYVOICE_PYTHON),
         str(worker),
@@ -2221,18 +3131,25 @@ def _cosyvoice_clone_pair(
         "--speed",
         str(speed),
         "--device",
-        device,
+        worker_device,
     ]
-    completed = subprocess.run(
-        command,
-        cwd=str(COSYVOICE_REPO_DIR),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=_env_int("SEME2E_COSYVOICE_TIMEOUT_SECONDS", 900),
-        check=False,
+    environment = os.environ.copy()
+    _apply_environment_overrides(environment, worker_env)
+    acquired_slots = _acquire_clone_worker_slots(
+        COSYVOICE_WORKER_SLOTS,
+        _clone_gpu_slot_keys(device, "SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES"),
+        cancel_event,
     )
+    try:
+        completed = _run_cancellable_subprocess(
+            command,
+            cwd=str(COSYVOICE_REPO_DIR),
+            env=environment,
+            timeout_seconds=_env_int("SEME2E_COSYVOICE_TIMEOUT_SECONDS", 900),
+            cancel_event=cancel_event,
+        )
+    finally:
+        _release_worker_slots(acquired_slots)
     marker = "VOICE_SHIELD_COSYVOICE_RESULT="
     result_line = next((line for line in reversed(completed.stdout.splitlines()) if line.startswith(marker)), None)
     if completed.returncode != 0 or result_line is None:
@@ -2256,6 +3173,7 @@ def _gpt_sovits_clone_pair(
     language: str,
     speed: float,
     device: str,
+    cancel_event: Any | None = None,
 ) -> dict[str, Any]:
     status, reason, _ = _gpt_sovits_model_status()
     if status != "available":
@@ -2263,6 +3181,10 @@ def _gpt_sovits_clone_pair(
     worker = ROOT / "gpt_sovits_live_finetune.py"
     work_dir = original_output.parent / "fine_tune"
     timeout_seconds = _env_int("SEME2E_GPT_SOVITS_TIMEOUT_SECONDS", 900)
+    worker_device, worker_env = _cuda_worker_runtime(
+        device,
+        "SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES",
+    )
     command = [
         str(GPT_SOVITS_PYTHON),
         str(worker),
@@ -2291,7 +3213,7 @@ def _gpt_sovits_clone_pair(
         "--protected-output",
         str(protected_output),
         "--device",
-        device,
+        worker_device,
         "--cnhubert",
         str(GPT_SOVITS_CNHUBERT),
         "--bert",
@@ -2307,19 +3229,26 @@ def _gpt_sovits_clone_pair(
     ]
     cuda_visible_devices = os.getenv("SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES", "").strip()
     device_index = device.split(":", 1)[1] if ":" in device else "0"
-    command.extend(["--gpu-numbers", "0" if cuda_visible_devices else device_index])
+    command.extend(["--gpu-numbers", cuda_visible_devices or device_index])
     if cuda_visible_devices:
         command.extend(["--cuda-visible-devices", cuda_visible_devices])
-    completed = subprocess.run(
-        command,
-        cwd=str(GPT_SOVITS_REPO_DIR),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout_seconds * 3,
-        check=False,
+    environment = os.environ.copy()
+    _apply_environment_overrides(environment, worker_env)
+    acquired_slots = _acquire_clone_worker_slots(
+        GPT_SOVITS_WORKER_SLOTS,
+        _clone_gpu_slot_keys(device, "SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES"),
+        cancel_event,
     )
+    try:
+        completed = _run_cancellable_subprocess(
+            command,
+            cwd=str(GPT_SOVITS_REPO_DIR),
+            env=environment,
+            timeout_seconds=timeout_seconds * 3,
+            cancel_event=cancel_event,
+        )
+    finally:
+        _release_worker_slots(acquired_slots)
     marker = "VOICE_SHIELD_GPT_SOVITS_LIVE_RESULT="
     result_line = next((line for line in reversed(completed.stdout.splitlines()) if line.startswith(marker)), None)
     if completed.returncode != 0 or result_line is None:
@@ -2456,6 +3385,7 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
                 protected_prompt_text=protected_prompt_text,
                 speed=speed,
                 device=device,
+                cancel_event=cancel_event,
             )
             diagnostics["workerResult"] = worker_result
             source_model = model
@@ -2473,6 +3403,7 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
                 language=language,
                 speed=speed,
                 device=device,
+                cancel_event=cancel_event,
             )
             diagnostics["workerResult"] = worker_result
             source_model = model
@@ -2498,7 +3429,7 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
             if progress_callback is not None:
                 progress_callback(progress=0.82, message="Coqui TTS 独立子进程已生成原始与保护克隆音频")
         if progress_callback is not None:
-            progress_callback(progress=0.9, message="正在保存下游 TTS 克隆结果")
+            progress_callback(progress=0.84, message="克隆音频已生成，正在准备结果评估")
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("TASK_CANCELLED")
     except Exception as exc:
@@ -2553,6 +3484,7 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
         "request": {
             "text": text,
             "model": model,
+            "asrModel": payload.get("asrModel") or os.getenv("SEME2E_CLONE_ASR_MODEL") or os.getenv("SEME2E_ASR_MODEL") or "openai-whisper:base",
             "language": language,
             "speed": speed,
             "speakerPrompt": prompt_text or None,
@@ -2574,15 +3506,45 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
         }
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeError("TASK_CANCELLED")
+    if progress_callback is not None:
+        progress_callback(progress=0.86, message="正在生成克隆语音文本")
+    clone_transcription = _transcribe_clone_pair_isolated(
+        original_clone_path,
+        protected_clone_path,
+        payload,
+        cancel_event=cancel_event,
+    )
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("TASK_CANCELLED")
+    if progress_callback is not None:
+        progress_callback(progress=0.91, message="正在计算克隆语义与语音质量")
+    request_semantic = ((result.get("request") or {}).get("semantic") or {}) if isinstance(result.get("request"), dict) else {}
+    clone_semantic_metrics = _compute_clone_semantic_isolated(
+        original_clone_path,
+        protected_clone_path,
+        request_semantic if isinstance(request_semantic, dict) else {},
+        cancel_event=cancel_event,
+    )
+    clone_quality_metrics = _evaluate_dnsmos_pair_isolated(
+        original_clone_path,
+        protected_clone_path,
+        cancel_event=cancel_event,
+    )
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("TASK_CANCELLED")
     clone_eval = compute_clone_eval(
         evaluation_reference_path,
         original_clone_path,
         protected_clone_path,
         response,
         protected_audio_path=evaluation_protected_path,
+        clone_transcription=clone_transcription,
+        semantic_metrics=clone_semantic_metrics,
+        quality_metrics=clone_quality_metrics,
     )
     clone_eval_sources = clone_eval.get("_metricSources") or {}
     response["cloneEval"] = clone_eval
+    _sync_clone_eval_fields(response, clone_eval)
     response.update(
         {
             "directSimilarity": clone_eval.get("directSimilarity"),
@@ -2591,7 +3553,14 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
             "similarityDropRate": clone_eval.get("similarityDropRate"),
             "embeddingDistanceBefore": clone_eval.get("embeddingDistanceBefore"),
             "embeddingDistanceAfter": clone_eval.get("embeddingDistanceAfter"),
+            "embeddingDistanceDelta": clone_eval.get("embeddingDistanceDelta"),
             "embeddingDistanceIncreaseRate": clone_eval.get("embeddingDistanceIncreaseRate"),
+            "cloneIdentityScore": clone_eval.get("cloneIdentityScore"),
+            "identityBaselineWeight": clone_eval.get("identityBaselineWeight"),
+            "cloneSemanticScore": clone_eval.get("cloneSemanticScore"),
+            "semanticBaselineWeight": clone_eval.get("semanticBaselineWeight"),
+            "cloneQualityScore": clone_eval.get("cloneQualityScore"),
+            "qualityBaselineWeight": clone_eval.get("qualityBaselineWeight"),
             "cloneConfidenceBefore": clone_eval.get("cloneConfidenceBefore"),
             "cloneConfidenceAfter": clone_eval.get("cloneConfidenceAfter"),
             "cloneConfidenceDropRate": clone_eval.get("cloneConfidenceDropRate"),
@@ -2630,11 +3599,7 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
         )
         metric_sources = latest_result.setdefault("summary", {}).setdefault("metricSources", {})
         metric_sources.update(clone_eval_sources)
-        summary_score = compute_overall_score(latest_result)
-        latest_result.setdefault("summary", {})["score"] = summary_score["score"]
-        latest_result.setdefault("summary", {})["verdict"] = summary_score["verdict"]
-        metric_sources.update(summary_score.get("_metricSources") or {})
-        latest_result["metricSources"] = metric_sources
+        refresh_result_scores(latest_result)
         latest_result["updatedAt"] = utc_now_iso()
         save_result(TASK_DIR / task_id, latest_result)
     return response

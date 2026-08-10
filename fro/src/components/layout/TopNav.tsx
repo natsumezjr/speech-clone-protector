@@ -11,7 +11,7 @@ const navItems = [
 
 export function TopNav() {
   return (
-    <header className="sticky top-0 z-40 border-b border-cyan-300/10 bg-[#020a13]/95 shadow-[0_1px_0_rgba(56,189,248,0.06)] backdrop-blur-xl">
+    <header className="app-header sticky top-0 z-40 border-b border-cyan-300/10 bg-[#020a13]/95 shadow-[0_1px_0_rgba(56,189,248,0.06)] backdrop-blur-xl">
       <div className="mx-auto grid h-[66px] max-w-[1586px] grid-cols-[390px_1fr_390px] items-center px-[30px] max-xl:grid-cols-[1fr_auto] max-lg:h-[62px] max-lg:px-4">
         <NavLink to="/" className="flex min-w-0 items-center gap-3 whitespace-nowrap">
           <span className="nav-logo-mark grid h-[50px] w-[52px] shrink-0 place-items-center">
@@ -19,7 +19,7 @@ export function TopNav() {
           </span>
           <div className="flex min-w-0 items-center gap-3 whitespace-nowrap">
             <span className="truncate text-[27px] font-black leading-none tracking-normal text-white max-lg:text-xl">VoiceShield</span>
-            <span className="rounded-[5px] border border-cyan-400/60 px-1.5 py-0.5 font-mono text-xs font-bold text-cyan-300">V2.0</span>
+            <span className="rounded-[5px] border border-cyan-400/60 px-1.5 py-0.5 font-mono text-xs font-bold text-cyan-300">V2.1</span>
           </div>
         </NavLink>
 

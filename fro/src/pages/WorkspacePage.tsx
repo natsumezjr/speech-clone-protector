@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom'
 import {
   CheckSquare,
   ChevronDown,
+  ChevronUp,
   Info,
   Loader2,
   Mic,
@@ -94,11 +95,6 @@ function formatScientificParameterValue(value: number) {
   return value.toExponential(2).replace(/\.?0+e/, 'e').replace('e-0', 'e-').replace('e+0', 'e+')
 }
 
-function clampProgress(value: unknown) {
-  const progress = typeof value === 'number' && Number.isFinite(value) ? value : 0
-  return Math.max(0, Math.min(1, progress))
-}
-
 function isDoneStatus(status: TaskStatusResponse) {
   return status.status === 'completed' || status.status === 'success'
 }
@@ -110,33 +106,6 @@ function isFailedStatus(status: TaskStatusResponse) {
 function isTransientTaskNotFound(error: unknown) {
   const message = error instanceof Error ? error.message : ''
   return /task not found/i.test(message) || /TASK_NOT_FOUND/.test(message)
-}
-
-function ProtectionProgressBar({ progress, status }: { progress: number; status?: TaskStatusResponse | null }) {
-  const stepLabel =
-    typeof status?.currentStep === 'number' && typeof status.totalSteps === 'number'
-      ? `优化步 ${status.currentStep}/${status.totalSteps}`
-      : status?.stage
-  return (
-    <section className="ui-card p-4">
-      <div className="flex items-center gap-3">
-        <Loader2 className="h-5 w-5 animate-spin shrink-0 text-cyan-300" />
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center justify-between gap-3">
-            <h3 className="text-sm font-black text-white">正在生成保护音频</h3>
-            <p className="font-mono text-xs text-slate-400 shrink-0">{Math.round(progress * 100)}%</p>
-          </div>
-          <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-800">
-            <div className="h-full rounded-full bg-cyan-400 transition-all duration-500" style={{ width: `${Math.max(4, Math.round(progress * 100))}%` }} />
-          </div>
-          <div className="mt-1.5 flex items-center gap-4">
-            {stepLabel ? <p className="text-xs font-semibold text-cyan-200">{stepLabel}</p> : null}
-            {status?.message ? <p className="truncate text-xs leading-5 text-slate-400">{status.message}</p> : null}
-          </div>
-        </div>
-      </div>
-    </section>
-  )
 }
 
 function revokeObjectUrl(url?: string) {
@@ -152,10 +121,8 @@ function splitUploadedAt(value?: string) {
 export function WorkspacePage() {
   const navigate = useNavigate()
   const mountedRef = useRef(true)
-  const [progress, setProgress] = useState(0)
   const [running, setRunning] = useState(false)
   const [, setTaskId] = useState<string>()
-  const [taskStatus, setTaskStatus] = useState<TaskStatusResponse | null>(null)
   const activeTaskTokenRef = useRef(0)
   const { data: capabilities, error: capabilitiesQueryError } = useCapabilitiesQuery()
 
@@ -176,9 +143,6 @@ export function WorkspacePage() {
 
   const applyStatus = (status: TaskStatusResponse, taskToken: number) => {
     if (!mountedRef.current || taskToken !== activeTaskTokenRef.current) return
-    const nextProgress = isDoneStatus(status) ? 1 : clampProgress(status.progress)
-    setProgress(nextProgress)
-    setTaskStatus(status)
     setCurrentTaskStatus(status)
   }
 
@@ -212,8 +176,6 @@ export function WorkspacePage() {
     activeTaskTokenRef.current = taskToken
     try {
       setRunning(true)
-      setProgress(0)
-      setTaskStatus(null)
 
       const created = await createProtectionTask({ ...payload, fileId: uploadedFile?.fileId ?? payload.fileId })
       setTaskId(created.taskId)
@@ -236,14 +198,12 @@ export function WorkspacePage() {
   }
 
   return (
-    <div className="space-y-3">
-      <div className="grid grid-cols-[448px_1fr_514px] gap-3 max-2xl:grid-cols-[448px_1fr_514px] max-xl:grid-cols-1">
+    <div className="workspace-page-shell grid min-h-0 grid-rows-[minmax(0,1fr)]">
+      <div className="workspace-grid grid min-h-0 grid-cols-[minmax(360px,0.9fr)_minmax(390px,1fr)_minmax(420px,1.05fr)] gap-3 max-xl:grid-cols-1">
         <AudioAccessCard maxAudioSizeBytes={runtimeConfig?.constraints?.maxAudioSizeBytes} />
         <StrategyConfigCard running={running} runtimeConfig={runtimeConfig} configError={configError} onStart={(payload) => void startTask(payload)} />
         <WorkspaceEvaluationPanel runtimeConfig={runtimeConfig} modelTypes={runtimeConfig?.modelTypes ?? capabilities?.modelTypes} />
       </div>
-
-      {running ? <ProtectionProgressBar progress={progress} status={taskStatus} /> : null}
     </div>
   )
 }
@@ -397,7 +357,7 @@ function AudioAccessCard({ maxAudioSizeBytes }: { maxAudioSizeBytes?: number }) 
   const uploadMoment = splitUploadedAt(uploadedFile?.uploadedAt)
 
   return (
-    <section className="ui-card min-h-[730px] p-4">
+    <section className="workspace-audio-card ui-card h-full min-h-0 p-4">
       <h2 className="flex items-center gap-2 text-[21px] font-black text-white">
         音频接入
         <Info className="h-4 w-4 text-slate-500" />
@@ -421,14 +381,14 @@ function AudioAccessCard({ maxAudioSizeBytes }: { maxAudioSizeBytes?: number }) 
 
       {inputMode === 'upload' ? (
         <div
-          className="mt-5 grid h-[300px] place-items-center rounded-[12px] border border-dashed border-cyan-300/55 bg-sky-400/5 text-center transition hover:border-cyan-200 hover:bg-cyan-400/10"
+          className="workspace-audio-dropzone mt-5 grid place-items-center rounded-[12px] border border-dashed border-cyan-300/55 bg-sky-400/5 text-center transition hover:border-cyan-200 hover:bg-cyan-400/10"
           onDragOver={(event) => event.preventDefault()}
           onDrop={(event) => {
             event.preventDefault()
             void handleFile(event.dataTransfer.files[0])
           }}
         >
-          <div className="flex w-full flex-col items-center px-6 pt-6 pb-6 text-center">
+          <div className="workspace-audio-dropzone-content flex w-full flex-col items-center px-6 pt-6 pb-6 text-center">
             <UploadCloud className="mb-4 h-14 w-14 text-cyan-300" />
             <p className="text-[18px] font-black text-white">拖拽音频文件到此处，或点击上传</p>
             <p className="mt-3 text-[15px] leading-6 text-slate-300">
@@ -437,19 +397,20 @@ function AudioAccessCard({ maxAudioSizeBytes }: { maxAudioSizeBytes?: number }) 
               单文件 ≤ {maxAudioSizeLabel}
             </p>
             <input ref={inputRef} type="file" accept=".wav,.mp3,.flac,.m4a,.webm,audio/*" className="hidden" onChange={(event) => void handleFile(event.target.files?.[0])} />
-            <span onClick={() => inputRef.current?.click()} className="mt-6 inline-flex h-11 min-w-[180px] items-center justify-center gap-2 rounded-full bg-cyan-300 px-5 text-[17px] font-medium text-slate-950 shadow-[0_0_28px_rgba(34,211,238,0.25)] cursor-pointer">
+            <span onClick={() => inputRef.current?.click()} className="mt-3 inline-flex h-11 min-w-[180px] items-center justify-center gap-2 rounded-full bg-cyan-300 px-5 text-[17px] font-medium text-slate-950 shadow-[0_0_28px_rgba(34,211,238,0.25)] cursor-pointer">
               <UploadCloud className="h-5 w-5" />
               选择文件
             </span>
           </div>
         </div>
       ) : (
-        <div className="mt-5 grid h-[300px] place-items-center rounded-[12px] border border-dashed border-cyan-300/55 bg-sky-400/5 text-center transition hover:border-cyan-200 hover:bg-cyan-400/10">
-          <div className="flex w-full flex-col items-center px-6 pt-6 pb-6 text-center">
+        <div className="workspace-audio-dropzone mt-5 grid place-items-center rounded-[12px] border border-dashed border-cyan-300/55 bg-sky-400/5 text-center transition hover:border-cyan-200 hover:bg-cyan-400/10">
+          <div className="workspace-audio-dropzone-content workspace-recorder-content flex w-full flex-col items-center px-6 pt-6 pb-6 text-center">
             <button
               type="button"
               onClick={toggleRecording}
               className={cn(
+                'workspace-recorder-control',
                 'grid h-[4.5rem] w-[4.5rem] place-items-center rounded-full border-2 transition',
                 recording ? 'border-red-300 bg-red-400/18 text-red-200 shadow-[0_0_24px_rgba(248,113,113,0.35)]' : 'border-cyan-300/40 bg-cyan-400/12 text-cyan-200',
               )}
@@ -457,10 +418,9 @@ function AudioAccessCard({ maxAudioSizeBytes }: { maxAudioSizeBytes?: number }) 
             >
               {recording ? <StopCircle className="h-8 w-8" /> : <Mic className="h-8 w-8" />}
             </button>
-            <p className="mt-4 text-[18px] font-black text-white">{recording ? '点击停止录音' : '点击开始录音'}</p>
-            <p className="mt-2 font-mono text-[20px] font-black text-cyan-100">{formatDurationSeconds(recordingSec)}</p>
-            <p className="mt-3 text-[15px] text-slate-300">录音结束后会自动作为当前音频输入并完成上传。</p>
-            <TinyWave color={recording ? '#f87171' : '#00aef0'} className="mx-auto mt-5 h-9 w-full max-w-[330px]" />
+            <p className="workspace-recorder-title mt-4 text-[18px] font-black text-white">{recording ? '点击停止录音' : '点击开始录音'}</p>
+            <p className="workspace-recording-time mt-2 font-mono text-[20px] font-black text-cyan-100">{formatDurationSeconds(recordingSec)}</p>
+            <TinyWave color={recording ? '#f87171' : '#00aef0'} className="workspace-recorder-wave mx-auto mt-5 h-9 w-full max-w-[330px]" />
           </div>
         </div>
       )}
@@ -468,14 +428,10 @@ function AudioAccessCard({ maxAudioSizeBytes }: { maxAudioSizeBytes?: number }) 
       <div className="mt-9 border-t border-cyan-300/10 pt-3">
         <h3 className="text-[15px] font-bold text-slate-300">已上传文件</h3>
       </div>
-      <div className="uploaded-audio-panel mt-2 max-h-[420px] overflow-y-auto rounded-[8px] border border-cyan-300/12 bg-[#07192d]/85 p-4">
-        <div className="mb-4 flex items-center justify-between">
-            <div className="flex items-center gap-3">
-            <div>
-              <p className="font-bold text-white">{displayFile.filename}</p>
-            </div>
-          </div>
-          <span className={cn('rounded-full px-3 py-1 text-xs font-bold', uploadedFile ? 'bg-emerald-400/12 text-emerald-300' : 'bg-slate-500/12 text-slate-400')}>
+      <div className="uploaded-audio-panel mt-2 rounded-[8px] border border-cyan-300/12 bg-[#07192d]/85 p-3">
+        <div className="uploaded-audio-header mb-2 flex min-w-0 items-center gap-3">
+          <FilenameWithExtension filename={displayFile.filename} className="min-w-0 flex-1 font-bold text-white" />
+          <span className={cn('shrink-0 rounded-full px-3 py-1 text-xs font-bold', uploadedFile ? 'bg-emerald-400/12 text-emerald-300' : 'bg-slate-500/12 text-slate-400')}>
             {uploadedFile ? '就绪' : '待上传'}
           </span>
         </div>
@@ -485,12 +441,7 @@ function AudioAccessCard({ maxAudioSizeBytes }: { maxAudioSizeBytes?: number }) 
           filename={uploadedFile?.filename}
           disabledReason="请选择或拖拽音频文件后预览"
         />
-        <TinyWave color="#00aef0" className="h-[82px]" />
-        <div className="mt-1 flex justify-between font-mono text-xs text-slate-400">
-          <span>00:00</span>
-          <span>{formatDurationSeconds(duration)}</span>
-        </div>
-        <div className="mt-5 grid grid-cols-3 gap-x-3 gap-y-6 border-t border-cyan-300/10 pt-4 text-sm">
+        <div className="uploaded-audio-meta mt-3 grid grid-cols-3 gap-x-3 gap-y-4 border-t border-cyan-300/10 pt-3 text-sm leading-5">
           {[
             ['文件名', displayFile.filename],
             ['时长', duration ? `${duration.toFixed(2)}s` : '待解析'],
@@ -503,17 +454,35 @@ function AudioAccessCard({ maxAudioSizeBytes }: { maxAudioSizeBytes?: number }) 
           ].map(([label, value]) => (
             <div key={label} className="min-w-0">
               <p className="text-slate-500">{label}</p>
-              <p className="mt-1 truncate font-semibold text-slate-200">{value}</p>
+              {label === '文件名' ? (
+                <FilenameWithExtension filename={String(value)} className="mt-1 font-semibold text-slate-200" />
+              ) : (
+                <p className="mt-1 truncate font-semibold text-slate-200">{value}</p>
+              )}
             </div>
           ))}
-          <div className="col-span-3 min-w-0 border-t border-cyan-300/8 pt-4">
+          <div className="uploaded-audio-fingerprint order-last min-w-0">
             <p className="text-slate-500">文件指纹</p>
-            <p className="mt-1 break-all font-mono text-xs font-semibold leading-5 text-slate-200">{uploadedFile?.fingerprint ?? '-'}</p>
+            <p className="mt-1 truncate font-mono font-bold text-slate-200" title={uploadedFile?.fingerprint ?? '-'}>{uploadedFile?.fingerprint ?? '-'}</p>
           </div>
         </div>
       </div>
 
     </section>
+  )
+}
+
+function FilenameWithExtension({ filename, className }: { filename: string; className?: string }) {
+  const dotIndex = filename.lastIndexOf('.')
+  const hasExtension = dotIndex > 0 && dotIndex < filename.length - 1
+  const stem = hasExtension ? filename.slice(0, dotIndex) : filename
+  const extension = hasExtension ? filename.slice(dotIndex) : ''
+
+  return (
+    <span className={cn('flex min-w-0 items-baseline', className)} title={filename}>
+      <span className="min-w-0 truncate">{stem}</span>
+      {extension ? <span className="shrink-0">{extension}</span> : null}
+    </span>
   )
 }
 
@@ -578,7 +547,7 @@ function StrategyConfigCard({
 
   if (!runtimeConfig) {
     return (
-      <section className="ui-card min-h-[730px] p-5">
+      <section className="workspace-strategy-card ui-card flex h-full min-h-0 flex-col p-5">
         <div className="mb-6 flex items-center justify-between">
           <h2 className="flex items-center gap-2 text-[21px] font-black text-white">
             防护策略配置
@@ -588,7 +557,7 @@ function StrategyConfigCard({
             capabilities
           </span>
         </div>
-        <div className="grid min-h-[560px] place-items-center rounded-[7px] border border-cyan-300/14 bg-slate-950/20 p-6 text-center">
+        <div className="workspace-config-loading grid min-h-0 flex-1 place-items-center rounded-[7px] border border-cyan-300/14 bg-slate-950/20 p-6 text-center">
           <div>
             {configError ? <Info className="mx-auto h-10 w-10 text-amber-300" /> : <Loader2 className="mx-auto h-10 w-10 animate-spin text-cyan-300" />}
             <p className="mt-4 text-base font-black text-white">{configError ? '系统参数读取失败' : '正在读取系统参数'}</p>
@@ -702,8 +671,8 @@ function StrategyConfigCard({
   }
 
   return (
-    <section className="ui-card min-h-[730px] p-5">
-      <div className="mb-6 flex items-center justify-between">
+    <section className="workspace-strategy-card ui-card flex h-full min-h-0 flex-col overflow-hidden p-5">
+      <div className="workspace-strategy-header mb-6 flex items-center justify-between">
         <h2 className="flex items-center gap-2 text-[21px] font-black text-white">
           防护策略配置
           <Info className="h-4 w-4 text-slate-500" />
@@ -718,6 +687,7 @@ function StrategyConfigCard({
         </button>
       </div>
 
+      <div className="workspace-strategy-content min-h-0 flex-1">
       <ConfigBlock title="保护模式">
         <div className="grid grid-cols-4 gap-2.5">
           {modeOptions.map((mode) => (
@@ -726,7 +696,7 @@ function StrategyConfigCard({
               type="button"
               onClick={() => handleModeChange(mode.value)}
               className={cn(
-                'h-[70px] rounded-[6px] border bg-slate-950/18 px-3 text-left',
+                'workspace-mode-option h-[70px] rounded-[6px] border bg-slate-950/18 px-3 text-left',
                 mode.value === selectedMode ? 'border-cyan-400 bg-cyan-400/8 text-cyan-200' : 'border-cyan-300/12 text-slate-300',
               )}
             >
@@ -751,7 +721,7 @@ function StrategyConfigCard({
               disabled={disabled}
               onClick={() => handleTargetChange(targetValue)}
               className={cn(
-                'h-[74px] rounded-[6px] border px-3 py-2 text-left',
+                'workspace-target-option h-[74px] rounded-[6px] border px-3 py-2 text-left',
                 selected ? 'border-cyan-400 bg-cyan-400/10' : 'border-cyan-300/12 bg-slate-950/18',
                 disabled && 'cursor-not-allowed opacity-45',
               )}
@@ -768,15 +738,15 @@ function StrategyConfigCard({
       </ConfigBlock>
 
       <ConfigBlock title="参数配置" helper="自定义生效">
-        <div className="space-y-5">
-          <SliderRow label="ε（扰动强度）" value={formatParameterValue(epsilon, epsilonRange)} pct={pctFromRange(epsilon, epsilonRange)} min={epsilonRange.min} max={epsilonRange.max} step={epsilonRange.step} numericValue={epsilon} onChange={updateNumber(setEpsilon)} />
+        <div className="workspace-parameter-sliders grid gap-5">
+          <SliderRow label="扰动强度（ε）" value={formatParameterValue(epsilon, epsilonRange)} pct={pctFromRange(epsilon, epsilonRange)} min={epsilonRange.min} max={epsilonRange.max} step={epsilonRange.step} numericValue={epsilon} onChange={updateNumber(setEpsilon)} />
           <SliderRow label="优化轮数（Steps）" value={String(steps)} pct={pctFromRange(steps, stepsRange)} min={stepsRange.min} max={stepsRange.max} step={stepsRange.step} numericValue={steps} onChange={updateNumber((value) => setSteps(Math.round(value)))} />
         </div>
-        <div className="mt-5 grid grid-cols-1 gap-2.5 min-[1460px]:grid-cols-2">
+        <div className="workspace-model-selects mt-5 grid grid-cols-2 gap-2.5 max-sm:grid-cols-1">
           <ModelSelectSummary label="语义编码器" values={selectedSemanticEncoders} options={semanticOptionItems} onOpen={openModelModal} />
           <ModelSelectSummary label="身份编码器" values={selectedFeatureModels} options={featureOptionItems} onOpen={openModelModal} />
         </div>
-        <div className="mt-6 flex items-center gap-2 border-t border-cyan-300/10 pt-3">
+        <div className="workspace-advanced-row mt-6 flex items-center gap-2 border-t border-cyan-300/10 pt-3">
           <button type="button" onClick={() => setLambdaModalOpen(true)} className="flex min-w-0 flex-1 items-center justify-between text-left text-sm font-bold text-slate-300">
             <span className="inline-flex items-center gap-1">高级选项（<MathText formula="\lambda" className="text-cyan-100" />）</span>
             <ChevronDown className="h-4 w-4 text-cyan-300" />
@@ -785,13 +755,14 @@ function StrategyConfigCard({
             <Search className="h-4 w-4" />
           </button>
         </div>
-        <div className="mt-5 rounded-[7px] border border-cyan-300/16 bg-sky-400/10 p-3 text-[12px] leading-5 text-slate-300">
+        <div className="workspace-parameter-help mt-5 rounded-[7px] border border-cyan-300/16 bg-sky-400/10 p-3 text-[12px] leading-5 text-slate-300">
           <p className="font-bold text-cyan-200">参数说明</p>
           <p>
             <MathTerm>ε</MathTerm> 控制保护扰动的最大幅度，Steps 控制优化迭代次数；<MathText formula="\lambda" className="mx-0.5 text-cyan-100" /> 权重在高级选项弹窗中调节。建议先保持默认权重，再根据语义扰动、身份相似度与听感质量进行微调。
           </p>
         </div>
       </ConfigBlock>
+      </div>
 
       {modelModalOpen ? (
         <ModelConfigModal
@@ -848,8 +819,7 @@ function StrategyConfigCard({
 
       {architectureModalOpen ? <ArchitectureOverviewModal onClose={() => setArchitectureModalOpen(false)} /> : null}
 
-      <div className="mt-5">
-        <h3 className="mb-3 text-[15px] font-black text-white">任务执行</h3>
+      <div className="workspace-task-execution shrink-0 border-t border-cyan-300/10 pt-3">
         <div className="grid gap-3">
           <button
             disabled={running && !configurationChangedSinceSubmission}
@@ -920,7 +890,7 @@ function LossTerm({ formula, title, children }: { formula: string; title: string
 
 function ConfigBlock({ title, helper, children }: { title: string; helper?: string; children: ReactNode }) {
   return (
-    <div className="mb-8">
+    <div className="workspace-config-block mb-8">
       <h3 className="mb-3 flex items-center gap-2 text-[15px] font-black text-slate-200">
         {title}
         {helper ? <span className="text-xs font-normal text-slate-500">{helper}</span> : null}
@@ -954,7 +924,7 @@ function SliderRow({
   compact?: boolean
 }) {
   return (
-    <div className={cn('grid items-center text-sm', compact ? 'grid-cols-[112px_1fr_58px] gap-2' : 'grid-cols-[170px_1fr_74px] gap-4')}>
+    <div className={cn('parameter-slider-row grid items-center text-sm', compact ? 'grid-cols-[minmax(96px,112px)_minmax(52px,1fr)_88px] gap-2' : 'grid-cols-[minmax(124px,164px)_minmax(68px,1fr)_112px] gap-3')}>
       <span className="whitespace-nowrap text-slate-300">{label}</span>
       <div className="relative h-5">
         <input
@@ -973,26 +943,33 @@ function SliderRow({
         </div>
       </div>
       </div>
-      <input
-        type="number"
-        min={min}
-        max={max}
-        step={step}
-        value={value}
-        onChange={(event) => {
-          const next = Number(event.target.value)
-          if (Number.isFinite(next)) onChange(next)
-        }}
-        onBlur={(event) => {
-          const next = Number(event.target.value)
-          if (Number.isFinite(next)) onChange(clampToRange(next, { min, max, step }))
-        }}
-        className={cn(
-          'rounded-[6px] border border-cyan-300/16 bg-slate-950/32 py-1.5 text-center font-mono text-slate-200 outline-none focus:border-cyan-300',
-          compact ? 'px-1.5' : 'px-3',
-        )}
-        aria-label={`${labelText ?? (typeof label === 'string' ? label : '参数')} 手动输入`}
-      />
+      <div className="parameter-number-field relative h-9 min-w-0">
+        <input
+          type="number"
+          min={min}
+          max={max}
+          step={step}
+          value={value}
+          onChange={(event) => {
+            const next = Number(event.target.value)
+            if (Number.isFinite(next)) onChange(next)
+          }}
+          onBlur={(event) => {
+            const next = Number(event.target.value)
+            if (Number.isFinite(next)) onChange(clampToRange(next, { min, max, step }))
+          }}
+          className="parameter-number-input h-full w-full min-w-0 rounded-[6px] border border-cyan-300/16 bg-slate-950/32 py-1.5 font-mono tabular-nums text-slate-200 outline-none transition focus:border-cyan-300"
+          aria-label={`${labelText ?? (typeof label === 'string' ? label : '参数')} 手动输入`}
+        />
+        <div className="parameter-number-stepper absolute inset-y-px right-px grid w-7 grid-rows-2 overflow-hidden rounded-r-[5px] border-l border-cyan-300/12 bg-slate-950/18">
+          <button type="button" onClick={() => onChange(clampToRange(numericValue + step, { min, max, step }))} className="grid place-items-center text-slate-400 hover:bg-cyan-300/10 hover:text-cyan-200" aria-label={`${labelText ?? (typeof label === 'string' ? label : '参数')} 增加`}>
+            <ChevronUp className="h-3 w-3" />
+          </button>
+          <button type="button" onClick={() => onChange(clampToRange(numericValue - step, { min, max, step }))} className="grid place-items-center border-t border-cyan-300/10 text-slate-400 hover:bg-cyan-300/10 hover:text-cyan-200" aria-label={`${labelText ?? (typeof label === 'string' ? label : '参数')} 减少`}>
+            <ChevronDown className="h-3 w-3" />
+          </button>
+        </div>
+      </div>
     </div>
   )
 }
@@ -1028,7 +1005,7 @@ function selectionSummary(values: string[], options: UiModelOption[]) {
 
 function ModelSelectSummary({ label, values, options, onOpen }: { label: string; values: string[]; options: UiModelOption[]; onOpen: () => void }) {
   return (
-    <div className="min-h-[64px] rounded-[7px] border border-cyan-300/14 bg-slate-950/24 px-3 py-2.5">
+    <div className="workspace-model-select-summary min-h-[64px] rounded-[7px] border border-cyan-300/14 bg-slate-950/24 px-3 py-2.5">
       <div className="flex h-full items-center justify-between gap-3">
         <div className="min-w-0">
           <p className="truncate whitespace-nowrap text-sm font-black leading-5 text-slate-200">{label}</p>

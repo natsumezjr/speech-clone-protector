@@ -14,6 +14,7 @@ import numpy as np
 
 
 EPS = 1.0e-12
+PCM16_QUANTIZATION_STEP = 1.0 / 32768.0
 ROOT = Path(__file__).resolve().parent
 _S3_TOKENIZER_CACHE: dict[tuple[str, str], Any] = {}
 _SEMANTIC_ENCODER_CACHE: dict[tuple[str, str, str, str], Any] = {}
@@ -64,9 +65,35 @@ def clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
     return max(lower, min(upper, value))
 
 
-def calibrate_clone_distance(distance: float) -> float:
-    """Continuously map clone distance to the protection score's unit interval."""
-    return clamp(distance * (1.26 - 0.30 * distance))
+def _positive_env_float(name: str, default: float | None) -> float | None:
+    value = finite_float(os.getenv(name))
+    if value is None:
+        value = default
+    return value if value is not None and value > 0 else None
+
+
+# Lightweight protection-side calibration from four existing real tasks
+# (task_10a6a6320505 plus three current pro tasks). The defaults are rounded
+# 90th-percentile scales. Clone semantic and quality defaults come from six
+# existing real clone pairs in task_4810dbfae886. Every scale remains
+# environment-overridable.
+SCORE_CALIBRATION: dict[str, float | None] = {
+    "tokenChangeRate90": _positive_env_float("SEME2E_TOKEN_CHANGE_R90", 0.90),
+    "semanticDrift90": _positive_env_float("SEME2E_SEMANTIC_DRIFT_D90", 0.60),
+    "directDistance90": _positive_env_float("SEME2E_DIRECT_DISTANCE_D90", 0.50),
+    "cloneTokenChangeRate90": _positive_env_float("SEME2E_CLONE_TOKEN_CHANGE_R90", 1.00),
+    "cloneSemanticDrift90": _positive_env_float("SEME2E_CLONE_SEMANTIC_DRIFT_D90", 0.78),
+    "cloneQualityDropRate90": _positive_env_float("SEME2E_CLONE_QUALITY_DROP_R90", 0.18),
+}
+
+SCORE_CALIBRATION_SOURCES: dict[str, str] = {
+    "tokenChangeRate90": "real protection tasks p90 rounded: [0.7887,0.8684,0.8940,0.7602]",
+    "semanticDrift90": "real protection tasks p90 rounded: [0.5943,0.5535,0.5778,0.4318]",
+    "directDistance90": "real protection tasks p90 rounded: [0.4956,0.2618,0.4622,0.2689]",
+    "cloneTokenChangeRate90": "existing real clone pairs task_4810dbfae886, n=6, p90=0.9962 rounded",
+    "cloneSemanticDrift90": "existing real clone pairs task_4810dbfae886, n=6, p90=0.7784 rounded",
+    "cloneQualityDropRate90": "existing real clone pairs task_4810dbfae886, DNSMOS P.835 OVRL, n=6, p90=0.1774 rounded",
+}
 
 
 def weighted_available_mean(items: dict[str, tuple[float | None, float]]) -> float | None:
@@ -82,6 +109,279 @@ def weighted_available_mean(items: dict[str, tuple[float | None, float]]) -> flo
     if weight_sum <= 0:
         return None
     return weighted / weight_sum
+
+
+def piecewise_linear_score(value: Any, anchors: Sequence[tuple[float, float]]) -> float | None:
+    """Map a real metric to 0..100 using the exact ordered anchor table."""
+
+    number = finite_float(value)
+    points = sorted((float(x), float(score)) for x, score in anchors)
+    if number is None or not points:
+        return None
+    if number <= points[0][0]:
+        return clamp(points[0][1], 0.0, 100.0)
+    if number >= points[-1][0]:
+        return clamp(points[-1][1], 0.0, 100.0)
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        if x0 <= number <= x1:
+            ratio = (number - x0) / max(x1 - x0, EPS)
+            return clamp(y0 + ratio * (y1 - y0), 0.0, 100.0)
+    return None
+
+
+def phi_score(value: Any, x90: Any) -> float | None:
+    """VoiceShield v2.1 saturation calibration: 100 * (1 - 10^(-x/x90))."""
+
+    number = finite_float(value)
+    scale = finite_float(x90)
+    if number is None or scale is None or scale <= 0:
+        return None
+    return clamp(100.0 * (1.0 - 10.0 ** (-max(number, 0.0) / scale)), 0.0, 100.0)
+
+
+def _smoothstep_weight(value: Any, lower: float, upper: float) -> float | None:
+    number = finite_float(value)
+    if number is None:
+        return None
+    u = clamp((number - lower) / max(upper - lower, EPS))
+    return u * u * (3.0 - 2.0 * u)
+
+
+def compute_protection_quality_score(
+    snr: Any,
+    stoi: Any,
+    pesq: Any,
+    dns_mos: Any = None,
+) -> dict[str, Any]:
+    snr_score = piecewise_linear_score(snr, [(10.0, 0.0), (15.0, 55.0), (18.5, 75.0), (25.0, 92.0), (30.0, 100.0)])
+    stoi_score = piecewise_linear_score(stoi, [(0.60, 0.0), (0.75, 60.0), (0.90, 95.0), (1.00, 100.0)])
+    pesq_score = piecewise_linear_score(pesq, [(1.0, 0.0), (1.5, 45.0), (2.0, 75.0), (3.0, 90.0), (4.5, 100.0)])
+    dns_mos_value = finite_float(dns_mos)
+    if dns_mos_value is not None and not 1.0 <= dns_mos_value <= 5.0:
+        dns_mos_value = None
+    dns_mos_score = 100.0 * (dns_mos_value - 1.0) / 4.0 if dns_mos_value is not None else None
+    required = {"snr": snr_score, "stoi": stoi_score, "pesq": pesq_score}
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        quality_score = None
+        status = "unavailable"
+        reason = f"保护音频质量指标尚未完整生成：{', '.join(missing)}"
+    elif dns_mos_score is None:
+        quality_score = (0.40 * snr_score + 0.35 * stoi_score + 0.15 * pesq_score) / 0.90
+        status = "available"
+        reason = None
+    else:
+        quality_score = 0.40 * snr_score + 0.35 * stoi_score + 0.15 * pesq_score + 0.10 * dns_mos_score
+        status = "available"
+        reason = None
+    if quality_score is None:
+        quality_level = None
+    elif quality_score >= 85:
+        quality_level = "excellent"
+    elif quality_score >= 70:
+        quality_level = "good"
+    elif quality_score >= 50:
+        quality_level = "fair"
+    else:
+        quality_level = "poor"
+    return {
+        "snrScore": snr_score,
+        "stoiScore": stoi_score,
+        "pesqScore": pesq_score,
+        "dnsMos": dns_mos_value,
+        "dnsMosScore": dns_mos_score,
+        "dnsMosStatus": "available" if dns_mos_value is not None else "unavailable",
+        "dnsMosReason": None if dns_mos_value is not None else "语音质量评分尚未生成",
+        "qualityScore": quality_score,
+        "qualityLevel": quality_level,
+        "scoreStatus": status,
+        "scoreReason": reason,
+    }
+
+
+def compute_protection_semantic_score(token_change_rate: Any, semantic_drift: Any) -> dict[str, Any]:
+    token_score = phi_score(token_change_rate, SCORE_CALIBRATION["tokenChangeRate90"])
+    drift_score = phi_score(semantic_drift, SCORE_CALIBRATION["semanticDrift90"])
+    missing = [name for name, value in {"tokenChangeRate": token_score, "semanticDrift": drift_score}.items() if value is None]
+    score = 0.55 * token_score + 0.45 * drift_score if not missing else None
+    return {
+        "tokenScore": token_score,
+        "driftScore": drift_score,
+        "protectionSemanticScore": score,
+        "scoreStatus": "available" if score is not None else "unavailable",
+        "scoreReason": None if score is not None else f"保护语义指标尚未完整生成：{', '.join(missing)}",
+    }
+
+
+def compute_direct_identity_score(similarity: Any) -> dict[str, Any]:
+    similarity_value = finite_float(similarity)
+    distance = 1.0 - similarity_value if similarity_value is not None else None
+    score = phi_score(distance, SCORE_CALIBRATION["directDistance90"])
+    return {
+        "directDistance": distance,
+        "directIdentityScore": score,
+        "scoreStatus": "available" if score is not None else "unavailable",
+        "scoreReason": None if score is not None else "直接声音身份指标尚未生成",
+    }
+
+
+def compute_clone_identity_score(original_similarity: Any, protected_similarity: Any) -> dict[str, Any]:
+    similarity_before = finite_float(original_similarity)
+    similarity_after = finite_float(protected_similarity)
+    baseline_weight = _smoothstep_weight(similarity_before, 0.25, 0.65)
+    distance_before = 1.0 - similarity_before if similarity_before is not None else None
+    distance_after = 1.0 - similarity_after if similarity_after is not None else None
+    distance_delta = distance_after - distance_before if distance_before is not None and distance_after is not None else None
+    score = None
+    reason = None
+    if distance_before is None or distance_after is None:
+        reason = "原始克隆或保护后克隆的声音身份结果尚未生成"
+    elif 0.75 - distance_before <= EPS:
+        reason = "原始克隆的声音身份结果不足以进行有效比较"
+    else:
+        progress = clamp((distance_after - distance_before) / (0.75 - distance_before))
+        bonus = 5.0 * clamp((distance_after - 0.75) / 0.25)
+        score = 95.0 * progress + bonus
+    return {
+        "embeddingDistanceBefore": distance_before,
+        "embeddingDistanceAfter": distance_after,
+        "embeddingDistanceDelta": distance_delta,
+        "cloneIdentityScore": score,
+        "identityBaselineWeight": baseline_weight,
+        "cloneIdentityStatus": "available" if score is not None else "unavailable",
+        "cloneIdentityReason": reason,
+    }
+
+
+def compute_bounded_text_metrics(reference_text: str | None, hypothesis_text: str | None) -> dict[str, Any]:
+    reference = reference_text or ""
+    hypothesis = hypothesis_text or ""
+    word_ref = _normalize_words(reference)
+    word_hyp = _normalize_words(hypothesis)
+    char_ref = _normalize_chars(reference)
+    char_hyp = _normalize_chars(hypothesis)
+    word_distance = _edit_distance(word_ref, word_hyp)
+    char_distance = _edit_distance(char_ref, char_hyp)
+    word_denominator = max(len(word_ref), len(word_hyp))
+    char_denominator = max(len(char_ref), len(char_hyp))
+    word_accuracy = 1.0 if word_denominator == 0 else clamp(1.0 - word_distance / word_denominator)
+    char_accuracy = 1.0 if char_denominator == 0 else clamp(1.0 - char_distance / char_denominator)
+    accuracy = 0.6 * word_accuracy + 0.4 * char_accuracy
+    return {
+        "accuracy": accuracy,
+        "error": 1.0 - accuracy,
+        "wordAccuracy": word_accuracy,
+        "charAccuracy": char_accuracy,
+        "wordEditDistance": word_distance,
+        "charEditDistance": char_distance,
+        "referenceWordCount": len(word_ref),
+        "hypothesisWordCount": len(word_hyp),
+        "referenceCharCount": len(char_ref),
+        "hypothesisCharCount": len(char_hyp),
+        "wordUnit": "latin_word_or_cjk_character",
+        "charUnit": "non_whitespace_character",
+    }
+
+
+def compute_clone_semantic_score(
+    target_text: str | None,
+    clean_transcription: str | None,
+    protected_transcription: str | None,
+    token_change_rate: Any,
+    semantic_drift: Any,
+) -> dict[str, Any]:
+    if clean_transcription is None or protected_transcription is None:
+        return {
+            "cleanCloneTextAccuracy": None,
+            "cleanCloneTextError": None,
+            "protectedCloneTextAccuracy": None,
+            "protectedCloneTextError": None,
+            "cloneTextChangeAccuracy": None,
+            "cloneTextChangeRate": None,
+            "semanticBaselineWeight": None,
+            "cloneTokenScore": None,
+            "cloneDriftScore": None,
+            "cloneSemanticScore": None,
+            "cloneSemanticStatus": "unavailable",
+            "cloneSemanticReason": "克隆语音文本尚未生成",
+        }
+    clean_metrics = compute_bounded_text_metrics(target_text, clean_transcription)
+    protected_metrics = compute_bounded_text_metrics(target_text, protected_transcription)
+    change_metrics = compute_bounded_text_metrics(clean_transcription, protected_transcription)
+    baseline_weight = _smoothstep_weight(clean_metrics["accuracy"], 0.0, 1.0)
+    token_score = phi_score(token_change_rate, SCORE_CALIBRATION["cloneTokenChangeRate90"])
+    drift_score = phi_score(semantic_drift, SCORE_CALIBRATION["cloneSemanticDrift90"])
+    score = 0.55 * token_score + 0.45 * drift_score if token_score is not None and drift_score is not None else None
+    calibration_missing = SCORE_CALIBRATION["cloneTokenChangeRate90"] is None or SCORE_CALIBRATION["cloneSemanticDrift90"] is None
+    reason = None
+    if score is None:
+        reason = "克隆语义评分标定尚未完成" if calibration_missing else "克隆语义指标尚未完整生成"
+    return {
+        "cleanCloneTextAccuracy": clean_metrics["accuracy"],
+        "cleanCloneTextError": clean_metrics["error"],
+        "cleanCloneTextMetrics": clean_metrics,
+        "protectedCloneTextAccuracy": protected_metrics["accuracy"],
+        "protectedCloneTextError": protected_metrics["error"],
+        "protectedCloneTextMetrics": protected_metrics,
+        "cloneTextChangeAccuracy": change_metrics["accuracy"],
+        "cloneTextChangeRate": change_metrics["error"],
+        "cloneTextChangeMetrics": change_metrics,
+        "semanticBaselineWeight": baseline_weight,
+        "cloneTokenChangeRate": finite_float(token_change_rate),
+        "cloneSemanticDrift": finite_float(semantic_drift),
+        "cloneTokenScore": token_score,
+        "cloneDriftScore": drift_score,
+        "cloneSemanticScore": score,
+        "cloneSemanticStatus": "available" if score is not None else "unavailable",
+        "cloneSemanticReason": reason,
+    }
+
+
+def compute_clone_quality_score(clean_mos: Any, protected_mos: Any) -> dict[str, Any]:
+    clean_value = finite_float(clean_mos)
+    protected_value = finite_float(protected_mos)
+    drop_rate = None
+    if clean_value is not None and protected_value is not None and clean_value > 1.0:
+        drop_rate = max(0.0, (clean_value - protected_value) / (clean_value - 1.0))
+    baseline_weight = _smoothstep_weight(clean_value, 2.5, 4.0)
+    score = phi_score(drop_rate, SCORE_CALIBRATION["cloneQualityDropRate90"])
+    if clean_value is None or protected_value is None:
+        reason = "克隆语音质量结果尚未生成"
+    elif clean_value <= 1.0:
+        reason = "原始克隆的语音质量结果不足以进行有效比较"
+    elif SCORE_CALIBRATION["cloneQualityDropRate90"] is None:
+        reason = "克隆语音质量评分标定尚未完成"
+    else:
+        reason = None
+    return {
+        "cleanCloneQualityMos": clean_value,
+        "protectedCloneQualityMos": protected_value,
+        "cloneQualityDropRate": drop_rate,
+        "cloneQualityScore": score,
+        "qualityBaselineWeight": baseline_weight,
+        "cloneQualityStatus": "available" if score is not None else "unavailable",
+        "cloneQualityReason": reason,
+    }
+
+
+def aggregate_weighted_scores(
+    items: Sequence[dict[str, Any]],
+    score_key: str,
+    weight_key: str,
+    empty_reason: str,
+) -> tuple[float | None, str | None]:
+    weighted_sum = 0.0
+    weight_sum = 0.0
+    for item in items:
+        score = finite_float(item.get(score_key))
+        weight = finite_float(item.get(weight_key))
+        if score is None or weight is None or weight <= EPS:
+            continue
+        weighted_sum += weight * score
+        weight_sum += weight
+    if weight_sum <= EPS:
+        return None, empty_reason
+    return weighted_sum / weight_sum, None
 
 
 def metric_source(status: str, source: str, reason: str | None = None, formula: str | None = None, metric: str | None = None) -> dict[str, Any]:
@@ -244,11 +544,23 @@ def compute_perturbation_metrics(
     epsilon_value = finite_float(epsilon)
     epsilon_norm_value = str(epsilon_norm or "linf").lower()
     epsilon_usage_rate = None
+    epsilon_usage_rate_raw = None
+    epsilon_tolerance_rate = 0.0
+    epsilon_exceeded = None
     if epsilon_value is not None:
         if epsilon_norm_value == "linf" and linf_norm is not None:
-            epsilon_usage_rate = linf_norm / max(epsilon_value, EPS)
+            epsilon_usage_rate_raw = linf_norm / max(epsilon_value, EPS)
+            # The optimizer projects the floating-point perturbation to epsilon,
+            # but exporting and reading a PCM16 WAV can move one sample by one
+            # quantization step. Treat only that narrow serialization tolerance
+            # as 100% utilization; larger overruns remain visible as violations.
+            epsilon_tolerance_rate = PCM16_QUANTIZATION_STEP / max(epsilon_value, EPS)
+            epsilon_exceeded = epsilon_usage_rate_raw > 1.0 + epsilon_tolerance_rate + EPS
+            epsilon_usage_rate = epsilon_usage_rate_raw if epsilon_exceeded else min(epsilon_usage_rate_raw, 1.0)
         elif epsilon_norm_value == "l2":
-            epsilon_usage_rate = l2_norm / max(epsilon_value, EPS)
+            epsilon_usage_rate_raw = l2_norm / max(epsilon_value, EPS)
+            epsilon_usage_rate = epsilon_usage_rate_raw
+            epsilon_exceeded = epsilon_usage_rate_raw > 1.0 + EPS
     return {
         "l2Norm": l2_norm,
         "l2Rms": l2_rms,
@@ -256,6 +568,9 @@ def compute_perturbation_metrics(
         "epsilon": epsilon_value,
         "epsilonNorm": epsilon_norm_value,
         "epsilonUsageRate": epsilon_usage_rate,
+        "epsilonUsageRateRaw": epsilon_usage_rate_raw,
+        "epsilonToleranceRate": epsilon_tolerance_rate,
+        "epsilonExceeded": epsilon_exceeded,
         "snr": snr,
         "clippingRate": clipping_rate,
     }
@@ -267,11 +582,19 @@ def compute_quality_metrics(
     delta: np.ndarray,
     sr: int,
     perturbation_metrics: dict[str, Any],
+    dns_mos: float | None = None,
+    dns_mos_status: str | None = None,
+    dns_mos_reason: str | None = None,
 ) -> dict[str, Any]:
     del delta
     sources: dict[str, dict[str, Any]] = {
         "protectionQuality.snr": metric_source("available", "compute_perturbation_metrics", formula="10*log10((P_signal+1e-12)/(P_noise+1e-12))"),
-        "protectionQuality.mos": metric_source("unavailable", "human_listening_test", reason="MOS requires human listening test or a declared MOS model", formula="None without an explicit MOS model"),
+        "protectionQuality.dnsMos": metric_source(
+            "available" if finite_float(dns_mos) is not None else (dns_mos_status or "unavailable"),
+            "DNSMOS P.835 OVRL",
+            reason=None if finite_float(dns_mos) is not None else (dns_mos_reason or "语音质量评分尚未生成"),
+            formula="100*(DNSMOS_OVRL-1)/4 when 1<=DNSMOS_OVRL<=5",
+        ),
         "protectionQuality.mosLqo": metric_source("unavailable", "objective_mos_lqo_model", reason="No explicit MOS-LQO objective model is configured", formula="None without an explicit MOS-LQO model"),
     }
     pesq_value = None
@@ -303,20 +626,11 @@ def compute_quality_metrics(
             sources["protectionQuality.stoi"] = metric_source("error", "pystoi", reason=str(exc), formula="stoi(x, xp, sr)")
 
     snr = finite_float(perturbation_metrics.get("snr"))
-    clipping_rate = finite_float(perturbation_metrics.get("clippingRate"))
-    q_snr = clamp(((snr or 0.0) - 10.0) / 20.0) if snr is not None else None
-    q_pesq = clamp((pesq_value - 1.0) / 3.5) if pesq_value is not None else None
-    q_stoi = clamp((stoi_value - 0.5) / 0.5) if stoi_value is not None else None
-    q_clip = 1.0 - clamp((clipping_rate or 0.0) / 0.01) if clipping_rate is not None else None
-    quality_score_base = weighted_available_mean(
-        {
-            "q_snr": (q_snr, 0.35),
-            "q_pesq": (q_pesq, 0.30),
-            "q_stoi": (q_stoi, 0.25),
-            "q_clip": (q_clip, 0.10),
-        }
-    )
-    quality_score = 100.0 * quality_score_base if quality_score_base is not None else None
+    score_payload = compute_protection_quality_score(snr, stoi_value, pesq_value, dns_mos)
+    if score_payload.get("dnsMos") is None:
+        score_payload["dnsMosStatus"] = dns_mos_status or "unavailable"
+        score_payload["dnsMosReason"] = dns_mos_reason or "语音质量评分尚未生成"
+    quality_score = finite_float(score_payload.get("qualityScore"))
     if quality_score is None:
         quality_level = None
     elif quality_score >= 85:
@@ -329,9 +643,9 @@ def compute_quality_metrics(
         quality_level = "poor"
     sources["protectionQuality.qualityScore"] = metric_source(
         "available" if quality_score is not None else "unavailable",
-        "weighted_available_mean",
-        reason=None if quality_score is not None else "No quality submetrics are available",
-        formula="100*weighted_available_mean(q_snr:.35,q_pesq:.30,q_stoi:.25,q_clip:.10)",
+        "VoiceShield_v2.1_piecewise_quality",
+        reason=score_payload.get("scoreReason"),
+        formula="without DNSMOS: (.40*S_snr+.35*S_stoi+.15*S_pesq)/.90; with DNSMOS: .40*S_snr+.35*S_stoi+.15*S_pesq+.10*S_dnsmos",
     )
     sources["protectionQuality.qualityLevel"] = metric_source(
         "available" if quality_level is not None else "unavailable",
@@ -345,8 +659,17 @@ def compute_quality_metrics(
         "stoi": stoi_value,
         "mos": None,
         "mosLqo": None,
+        "snrScore": score_payload.get("snrScore"),
+        "stoiScore": score_payload.get("stoiScore"),
+        "pesqScore": score_payload.get("pesqScore"),
+        "dnsMos": score_payload.get("dnsMos"),
+        "dnsMosScore": score_payload.get("dnsMosScore"),
+        "dnsMosStatus": score_payload.get("dnsMosStatus"),
+        "dnsMosReason": score_payload.get("dnsMosReason"),
         "qualityScore": quality_score,
         "qualityLevel": quality_level,
+        "scoreStatus": score_payload.get("scoreStatus"),
+        "scoreReason": score_payload.get("scoreReason"),
         "_metricSources": sources,
     }
 
@@ -710,8 +1033,9 @@ def compute_loss_summary(
 
 def _normalize_words(text: str) -> list[str]:
     text = text.lower()
-    text = re.sub(r"[^a-z0-9'\u4e00-\u9fff]+", " ", text)
-    return [item for item in re.sub(r"\s+", " ", text).strip().split(" ") if item]
+    # Latin/digit runs remain word units; CJK characters are individual units
+    # because ordinary Chinese transcripts do not contain whitespace boundaries.
+    return re.findall(r"[a-z0-9]+(?:'[a-z0-9]+)*|[\u4e00-\u9fff]", text)
 
 
 def _normalize_chars(text: str) -> list[str]:
@@ -1277,6 +1601,10 @@ def compute_direct_speaker_metrics(clean_path: Path, protected_path: Path, speak
         "embeddingDistanceAfter": None,
         "simOriginalProtected": None,
         "embeddingDistance": None,
+        "directDistance": None,
+        "directIdentityScore": None,
+        "scoreStatus": "unavailable",
+        "scoreReason": source_info.get("reason") or "直接声音身份指标尚未生成",
         "metric": os.getenv("SEME2E_SPEAKER_METRIC", "ecapa"),
         "source": source,
         "status": source_info["status"],
@@ -1291,6 +1619,7 @@ def compute_direct_speaker_metrics(clean_path: Path, protected_path: Path, speak
         direct_similarity = finite_float(scorer.score(clean_path, protected_path))
         if direct_similarity is None:
             raise ValueError("speaker scorer returned a non-finite similarity")
+        score_payload = compute_direct_identity_score(direct_similarity)
         base.update(
             {
                 "simBefore": 1.0,
@@ -1300,10 +1629,17 @@ def compute_direct_speaker_metrics(clean_path: Path, protected_path: Path, speak
                 "embeddingDistanceAfter": 1.0 - direct_similarity,
                 "simOriginalProtected": direct_similarity,
                 "embeddingDistance": 1.0 - direct_similarity,
+                **score_payload,
                 "status": "available",
             }
         )
-        base["_metricSources"]["speaker.*"] = metric_source("available", source, formula="directSimilarity=cosine(Emb(x),Emb(xp)); simDropRate=1-directSimilarity", metric=source_info.get("metric"))
+        base["_metricSources"]["speaker.*"] = metric_source("available", source, formula="directSimilarity=cosine(Emb(x),Emb(xp)); directDistance=1-directSimilarity", metric=source_info.get("metric"))
+        base["_metricSources"]["speaker.directIdentityScore"] = metric_source(
+            score_payload["scoreStatus"],
+            "VoiceShield_v2.1_phi_calibration",
+            reason=score_payload.get("scoreReason"),
+            formula="100*(1-10^(-directDistance/directDistance90))",
+        )
     except Exception as exc:
         base["status"] = "error"
         base["error"] = str(exc)
@@ -1375,14 +1711,20 @@ def compute_clone_eval(
     protected_audio_path: Path | None = None,
     speaker_model: Any | None = None,
     confidence_calibrator: Any | None = None,
+    clone_transcription: dict[str, Any] | None = None,
+    semantic_metrics: dict[str, Any] | None = None,
+    quality_metrics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    clone_transcription = clone_transcription or {}
+    semantic_metrics = semantic_metrics or {}
+    quality_metrics = quality_metrics or {}
     scorer = speaker_model
     source = "speaker_similarity"
     source_info = metric_source("available", source, formula="SIM(a,b)=cosine(Emb(a),Emb(b))")
     if scorer is None:
         scorer, source, source_info = _build_speaker_scorer()
     request = clone_result.get("request") or {}
-    unavailable_reason = source_info.get("reason") or "speaker similarity is not available"
+    unavailable_reason = source_info.get("reason") or "克隆声音身份结果尚未生成"
     eval_payload = {
         "cloneModel": request.get("model"),
         "speakerEvalModel": source,
@@ -1395,7 +1737,40 @@ def compute_clone_eval(
         "similarityDropRate": None,
         "embeddingDistanceBefore": None,
         "embeddingDistanceAfter": None,
+        "embeddingDistanceDelta": None,
         "embeddingDistanceIncreaseRate": None,
+        "cloneIdentityScore": None,
+        "identityBaselineWeight": None,
+        "cloneIdentityStatus": "unavailable",
+        "cloneIdentityReason": unavailable_reason,
+        "cleanCloneTranscription": clone_transcription.get("originalText"),
+        "protectedCloneTranscription": clone_transcription.get("protectedText"),
+        "cloneAsrModel": clone_transcription.get("model"),
+        "cloneAsrStatus": clone_transcription.get("status") or "unavailable",
+        "cloneAsrReason": clone_transcription.get("reason"),
+        "cleanCloneTextAccuracy": None,
+        "cleanCloneTextError": None,
+        "protectedCloneTextAccuracy": None,
+        "protectedCloneTextError": None,
+        "cloneTextChangeAccuracy": None,
+        "cloneTextChangeRate": None,
+        "semanticBaselineWeight": None,
+        "cloneTokenChangeRate": finite_float(semantic_metrics.get("tokenChangeRate")),
+        "cloneSemanticDrift": finite_float(semantic_metrics.get("semanticDrift")),
+        "cloneTokenScore": None,
+        "cloneDriftScore": None,
+        "cloneSemanticScore": None,
+        "cloneSemanticStatus": "unavailable",
+        "cloneSemanticReason": semantic_metrics.get("reason") or clone_transcription.get("reason") or "克隆语义指标尚未生成",
+        "cleanCloneQualityMos": finite_float(quality_metrics.get("cleanMos")),
+        "protectedCloneQualityMos": finite_float(quality_metrics.get("protectedMos")),
+        "cloneQualityDropRate": None,
+        "cloneQualityScore": None,
+        "qualityBaselineWeight": None,
+        "cloneQualityModel": quality_metrics.get("model") or "DNSMOS P.835 OVRL",
+        "cloneQualityModelPath": quality_metrics.get("modelPath"),
+        "cloneQualityStatus": quality_metrics.get("status") or "unavailable",
+        "cloneQualityReason": quality_metrics.get("reason") or "克隆语音质量结果尚未生成",
         "cloneConfidenceBefore": None,
         "cloneConfidenceAfter": None,
         "cloneConfidenceDropRate": None,
@@ -1413,139 +1788,311 @@ def compute_clone_eval(
         "status": source_info["status"],
         "_metricSources": {
             "cloneEval.*": source_info,
+            "cloneEval.cloneAsr": metric_source(
+                clone_transcription.get("status") or "unavailable",
+                clone_transcription.get("model") or "isolated_asr_worker",
+                reason=clone_transcription.get("reason"),
+                formula="transcribe(cleanCloneAudio), transcribe(protectedCloneAudio)",
+            ),
+            "cloneEval.cloneSemanticScore": metric_source(
+                "unavailable",
+                "semantic_tokenizer + semantic_encoder",
+                reason=semantic_metrics.get("reason") or "克隆语义指标或评分标定尚未完成",
+                formula=".55*Phi(cloneTokenChange)+.45*Phi(cloneSemanticDrift)",
+            ),
+            "cloneEval.cloneQualityScore": metric_source(
+                quality_metrics.get("status") or "unavailable",
+                quality_metrics.get("model") or "DNSMOS P.835 OVRL",
+                reason=quality_metrics.get("reason"),
+                formula="Phi(max(0,(q0-q1)/(q0-1)); cloneQualityDropRate90)",
+            ),
             "cloneEval.cloneConfidenceBefore": metric_source("unavailable", "confidence_calibrator", reason="No confidence calibrator is configured", formula="sigmoid(A*similarity+B)"),
             "cloneEval.cloneConfidenceAfter": metric_source("unavailable", "confidence_calibrator", reason="No confidence calibrator is configured", formula="sigmoid(A*similarity+B)"),
             "cloneEval.cloneConfidenceDropRate": metric_source("unavailable", "confidence_calibrator", reason="No confidence calibrator is configured", formula="(cloneConfidenceBefore-cloneConfidenceAfter)/max(cloneConfidenceBefore,EPS)"),
             "cloneEval.cloneTrend": metric_source("not_run", "multi_checkpoint_clone_eval", reason="clone trend is disabled; only final clone evaluation is reported", formula="None"),
         },
     }
-    if scorer is None:
-        eval_payload["reason"] = source_info.get("reason")
-        return eval_payload
-    try:
-        original_similarity = finite_float(scorer.score(original_audio_path, original_clone_path))
-        protected_similarity = finite_float(scorer.score(original_audio_path, protected_clone_path))
-        direct_similarity = None
-        direct_reason = "protected audio path is not available"
-        if protected_audio_path is not None:
-            direct_similarity = finite_float(scorer.score(original_audio_path, protected_audio_path))
-            direct_reason = None if direct_similarity is not None else "speaker similarity is not available"
-        if original_similarity is None or protected_similarity is None:
-            raise ValueError("speaker scorer returned non-finite clone similarity")
-        similarity_drop_rate = (original_similarity - protected_similarity) / max(original_similarity, EPS)
-        embedding_before = 1.0 - original_similarity
-        embedding_after = 1.0 - protected_similarity
-        embedding_increase = (embedding_after - embedding_before) / max(embedding_before, EPS)
-        conf_before = conf_after = conf_drop = None
-        if confidence_calibrator is not None:
-            conf_before = finite_float(confidence_calibrator(original_similarity))
-            conf_after = finite_float(confidence_calibrator(protected_similarity))
-            if conf_before is not None and conf_after is not None:
-                conf_drop = (conf_before - conf_after) / max(conf_before, EPS)
-        direct_offset = 1.0 - direct_similarity if direct_similarity is not None else None
-        calibrated_protected_distance = calibrate_clone_distance(embedding_after) if embedding_after is not None else None
-        normalized_direct_offset = clamp(direct_offset / 2.0) if direct_offset is not None else None
-        clone_score_base = (
-            0.9 * calibrated_protected_distance + 0.1 * normalized_direct_offset
-            if calibrated_protected_distance is not None and normalized_direct_offset is not None
-            else None
-        )
-        eval_payload.update(
-            {
-                "directSimilarity": direct_similarity,
-                "originalSimilarity": original_similarity,
-                "protectedSimilarity": protected_similarity,
-                "similarityDropRate": similarity_drop_rate,
-                "embeddingDistanceBefore": embedding_before,
-                "embeddingDistanceAfter": embedding_after,
-                "embeddingDistanceIncreaseRate": embedding_increase,
-                "cloneConfidenceBefore": conf_before,
-                "cloneConfidenceAfter": conf_after,
-                "cloneConfidenceDropRate": conf_drop,
-                "cloneRadar": build_clone_radar(
-                    direct_similarity,
-                    similarity_drop_rate,
-                    embedding_increase,
-                    protected_similarity,
-                    direct_reason=direct_reason,
-                ),
-                "cloneDefenseScore": 100.0 * clone_score_base if clone_score_base is not None else None,
-                "status": "available",
-            }
-        )
-        eval_payload["_metricSources"]["cloneEval.*"] = metric_source(
-            "available",
-            source,
-            formula="originalSimilarity=SIM(originalAudio,originalCloneAudio); protectedSimilarity=SIM(originalAudio,protectedCloneAudio); similarityDropRate=(originalSimilarity-protectedSimilarity)/max(originalSimilarity,EPS); embeddingDistanceBefore=1-originalSimilarity; embeddingDistanceAfter=1-protectedSimilarity; embeddingDistanceIncreaseRate=(embeddingDistanceAfter-embeddingDistanceBefore)/max(embeddingDistanceBefore,EPS)",
-            metric=source_info.get("metric"),
-        )
-        eval_payload["_metricSources"]["cloneEval.cloneDefenseScore"] = metric_source(
-            "available" if clone_score_base is not None else "unavailable",
-            source,
-            reason=None if clone_score_base is not None else "protected clone distance or direct voiceprint offset is not available",
-            formula="Delta_distance_mapped=clamp(Delta_distance*(1.26-0.30*Delta_distance),0,1); Delta_protect=100*(0.9*Delta_distance_mapped+0.1*(Delta_direct/2))",
-            metric=source_info.get("metric"),
-        )
-        if conf_drop is not None:
-            eval_payload["_metricSources"]["cloneEval.cloneConfidenceBefore"] = metric_source("available", "confidence_calibrator", formula="sigmoid(A*similarity+B)")
-            eval_payload["_metricSources"]["cloneEval.cloneConfidenceAfter"] = metric_source("available", "confidence_calibrator", formula="sigmoid(A*similarity+B)")
-            eval_payload["_metricSources"]["cloneEval.cloneConfidenceDropRate"] = metric_source("available", "confidence_calibrator", formula="(cloneConfidenceBefore-cloneConfidenceAfter)/max(cloneConfidenceBefore,EPS)")
-    except Exception as exc:
-        eval_payload["status"] = "error"
-        eval_payload["error"] = str(exc)
-        eval_payload["_metricSources"]["cloneEval.*"] = metric_source("error", source, reason=str(exc), formula="SIM(originalAudio,cloneAudio)", metric=source_info.get("metric"))
+    if scorer is not None:
+        try:
+            original_similarity = finite_float(scorer.score(original_audio_path, original_clone_path))
+            protected_similarity = finite_float(scorer.score(original_audio_path, protected_clone_path))
+            direct_similarity = None
+            direct_reason = "protected audio path is not available"
+            if protected_audio_path is not None:
+                direct_similarity = finite_float(scorer.score(original_audio_path, protected_audio_path))
+                direct_reason = None if direct_similarity is not None else "speaker similarity is not available"
+            if original_similarity is None or protected_similarity is None:
+                raise ValueError("speaker scorer returned non-finite clone similarity")
+            similarity_drop_rate = (original_similarity - protected_similarity) / max(original_similarity, EPS)
+            identity = compute_clone_identity_score(original_similarity, protected_similarity)
+            embedding_before = identity["embeddingDistanceBefore"]
+            embedding_after = identity["embeddingDistanceAfter"]
+            embedding_increase = (
+                (embedding_after - embedding_before) / max(embedding_before, EPS)
+                if embedding_before is not None and embedding_after is not None
+                else None
+            )
+            conf_before = conf_after = conf_drop = None
+            if confidence_calibrator is not None:
+                conf_before = finite_float(confidence_calibrator(original_similarity))
+                conf_after = finite_float(confidence_calibrator(protected_similarity))
+                if conf_before is not None and conf_after is not None:
+                    conf_drop = (conf_before - conf_after) / max(conf_before, EPS)
+            eval_payload.update(
+                {
+                    "directSimilarity": direct_similarity,
+                    "originalSimilarity": original_similarity,
+                    "protectedSimilarity": protected_similarity,
+                    "similarityDropRate": similarity_drop_rate,
+                    **identity,
+                    "embeddingDistanceIncreaseRate": embedding_increase,
+                    "cloneConfidenceBefore": conf_before,
+                    "cloneConfidenceAfter": conf_after,
+                    "cloneConfidenceDropRate": conf_drop,
+                    "cloneRadar": build_clone_radar(
+                        direct_similarity,
+                        similarity_drop_rate,
+                        embedding_increase,
+                        protected_similarity,
+                        direct_reason=direct_reason,
+                    ),
+                    # Legacy alias retained for old clients; the main score now uses
+                    # only the v2.1 distance-baseline identity formula.
+                    "cloneDefenseScore": identity.get("cloneIdentityScore"),
+                }
+            )
+            eval_payload["_metricSources"]["cloneEval.*"] = metric_source(
+                "available",
+                source,
+                formula="d0=1-SIM(original,cleanClone); d1=1-SIM(original,protectedClone)",
+                metric=source_info.get("metric"),
+            )
+            eval_payload["_metricSources"]["cloneEval.cloneIdentityScore"] = metric_source(
+                identity["cloneIdentityStatus"],
+                "VoiceShield_v2.1_clone_identity",
+                reason=identity.get("cloneIdentityReason"),
+                formula="95*clip((d1-d0)/(.75-d0),0,1)+5*clip((d1-.75)/.25,0,1)",
+                metric=source_info.get("metric"),
+            )
+            eval_payload["_metricSources"]["cloneEval.cloneDefenseScore"] = eval_payload["_metricSources"]["cloneEval.cloneIdentityScore"]
+            if conf_drop is not None:
+                eval_payload["_metricSources"]["cloneEval.cloneConfidenceBefore"] = metric_source("available", "confidence_calibrator", formula="sigmoid(A*similarity+B)")
+                eval_payload["_metricSources"]["cloneEval.cloneConfidenceAfter"] = metric_source("available", "confidence_calibrator", formula="sigmoid(A*similarity+B)")
+                eval_payload["_metricSources"]["cloneEval.cloneConfidenceDropRate"] = metric_source("available", "confidence_calibrator", formula="(cloneConfidenceBefore-cloneConfidenceAfter)/max(cloneConfidenceBefore,EPS)")
+        except Exception as exc:
+            eval_payload["cloneIdentityStatus"] = "error"
+            eval_payload["cloneIdentityReason"] = str(exc)
+            eval_payload["_metricSources"]["cloneEval.*"] = metric_source("error", source, reason=str(exc), formula="SIM(originalAudio,cloneAudio)", metric=source_info.get("metric"))
+    else:
+        eval_payload["cloneIdentityReason"] = source_info.get("reason") or unavailable_reason
+
+    semantic = compute_clone_semantic_score(
+        eval_payload.get("targetText"),
+        eval_payload.get("cleanCloneTranscription"),
+        eval_payload.get("protectedCloneTranscription"),
+        semantic_metrics.get("tokenChangeRate"),
+        semantic_metrics.get("semanticDrift"),
+    )
+    eval_payload.update(semantic)
+    eval_payload["_metricSources"]["cloneEval.cloneSemanticScore"] = metric_source(
+        semantic["cloneSemanticStatus"],
+        "semantic_tokenizer + semantic_encoder + bounded_text_baseline",
+        reason=semantic.get("cloneSemanticReason"),
+        formula="w_sem=A_clean^2*(3-2*A_clean); score=.55*Phi(tokenChange)+.45*Phi(semanticDrift)",
+    )
+
+    quality = compute_clone_quality_score(quality_metrics.get("cleanMos"), quality_metrics.get("protectedMos"))
+    eval_payload.update(quality)
+    if quality_metrics.get("status") not in {"available", "computed"}:
+        eval_payload["cloneQualityStatus"] = quality_metrics.get("status") or "unavailable"
+        eval_payload["cloneQualityReason"] = quality_metrics.get("reason") or quality.get("cloneQualityReason")
+    eval_payload["_metricSources"]["cloneEval.cloneQualityScore"] = metric_source(
+        eval_payload["cloneQualityStatus"],
+        quality_metrics.get("model") or "DNSMOS P.835 OVRL",
+        reason=eval_payload.get("cloneQualityReason"),
+        formula="w_q=smoothstep((q0-2.5)/(4.0-2.5)); score=Phi(max(0,(q0-q1)/(q0-1));r_q90)",
+    )
+
+    available_dimensions = sum(
+        eval_payload.get(key) == "available"
+        for key in ["cloneIdentityStatus", "cloneSemanticStatus", "cloneQualityStatus"]
+    )
+    eval_payload["status"] = "available" if available_dimensions == 3 else "partial" if available_dimensions else "unavailable"
+    reasons = [
+        eval_payload.get(key)
+        for key in ["cloneIdentityReason", "cloneSemanticReason", "cloneQualityReason"]
+        if eval_payload.get(key)
+    ]
+    if reasons:
+        eval_payload["reason"] = "; ".join(dict.fromkeys(str(item) for item in reasons))
     return eval_payload
 
 
 def compute_overall_score(result: dict[str, Any]) -> dict[str, Any]:
     details = result.get("details") or {}
     perception = details.get("perception") or {}
-    generation = details.get("generation") or {}
-    asr = details.get("asr") or {}
-    clone_results = result.get("cloneResults") or []
-    clone_eval = None
-    if clone_results:
-        clone_eval = (clone_results[-1] or {}).get("cloneEval")
-    quality_score = finite_float(perception.get("qualityScore"))
-    if quality_score is None:
-        quality_score = finite_float((perception.get("protectionQuality") or {}).get("qualityScore"))
-    over_mask_rate = finite_float(perception.get("overMaskRate"))
-    if over_mask_rate is None:
-        over_mask_rate = finite_float(perception.get("psychoacousticViolationRate"))
-    epsilon_usage_rate = finite_float(perception.get("epsilonUsageRate"))
-    if epsilon_usage_rate is None:
-        epsilon_usage_rate = finite_float((perception.get("perturbation") or {}).get("epsilonUsageRate"))
-    asr_score = finite_float(asr.get("asrProtectionScore"))
-    clone_score = finite_float((clone_eval or {}).get("cloneDefenseScore") if isinstance(clone_eval, dict) else None)
-    s_asr = asr_score / 100.0 if asr_score is not None and asr.get("status") in {"available", "computed", "partial", "completed", "success"} else None
-    s_clone = clone_score / 100.0 if clone_score is not None else None
-    s_audio = quality_score / 100.0 if quality_score is not None else None
-    s_psy = 1.0 - clamp(over_mask_rate / 0.2) if over_mask_rate is not None else None
-    s_epsilon = 1.0 - clamp(epsilon_usage_rate) if epsilon_usage_rate is not None else None
-    score_base = weighted_available_mean(
-        {
-            "S_asr": (s_asr, 0.25),
-            "S_clone": (s_clone, 0.35),
-            "S_audio": (s_audio, 0.20),
-            "S_psy": (s_psy, 0.10),
-            "S_epsilon": (s_epsilon, 0.10),
-        }
+    semantic_details = details.get("semantic") or {}
+    speaker_details = details.get("speaker") or {}
+    raw_quality = perception.get("protectionQuality") or {}
+    protection_quality = compute_protection_quality_score(
+        raw_quality.get("snr", perception.get("snr")),
+        raw_quality.get("stoi", perception.get("stoi")),
+        raw_quality.get("pesq", perception.get("pesq")),
+        raw_quality.get("dnsMos", perception.get("dnsMos")),
     )
-    score = 100.0 * score_base if score_base is not None else None
+    protection_semantic = compute_protection_semantic_score(
+        semantic_details.get("tokenChangeRate"),
+        semantic_details.get("semanticDrift"),
+    )
+    primary_metrics = (result.get("summary") or {}).get("primaryMetrics") or {}
+    direct_similarity = finite_float(
+        speaker_details.get("simOriginalProtected", speaker_details.get("simAfter"))
+    )
+    if direct_similarity is None:
+        direct_distance = finite_float(
+            speaker_details.get("embeddingDistanceAfter", speaker_details.get("embeddingDistance"))
+        )
+        if direct_distance is not None:
+            direct_similarity = 1.0 - direct_distance
+    if direct_similarity is None:
+        direct_similarity = finite_float(primary_metrics.get("speakerSimilarity"))
+    direct_identity = compute_direct_identity_score(direct_similarity)
+
+    latest_by_model: dict[str, dict[str, Any]] = {}
+    for index, clone_result in enumerate(result.get("cloneResults") or []):
+        if not isinstance(clone_result, dict):
+            continue
+        clone_eval = clone_result.get("cloneEval")
+        if not isinstance(clone_eval, dict):
+            continue
+        for key in (
+            "cloneIdentityScore",
+            "identityBaselineWeight",
+            "cloneSemanticScore",
+            "semanticBaselineWeight",
+            "cloneQualityScore",
+            "qualityBaselineWeight",
+        ):
+            if clone_eval.get(key) is None and clone_result.get(key) is not None:
+                clone_eval[key] = clone_result.get(key)
+        if clone_eval.get("cloneIdentityScore") is None:
+            clone_eval.update(
+                compute_clone_identity_score(
+                    clone_eval.get("originalSimilarity", clone_result.get("originalSimilarity")),
+                    clone_eval.get("protectedSimilarity", clone_result.get("protectedSimilarity")),
+                )
+            )
+        request = clone_result.get("request") or {}
+        model = str(clone_eval.get("cloneModel") or request.get("model") or f"clone-{index}")
+        latest_by_model[model] = clone_eval
+    clone_evals = list(latest_by_model.values())
+    clone_identity, clone_identity_reason = aggregate_weighted_scores(
+        clone_evals,
+        "cloneIdentityScore",
+        "identityBaselineWeight",
+        "缺少有效的原始克隆身份结果",
+    )
+    clone_semantic, clone_semantic_reason = aggregate_weighted_scores(
+        clone_evals,
+        "cloneSemanticScore",
+        "semanticBaselineWeight",
+        "缺少有效的原始克隆文本结果",
+    )
+    clone_quality, clone_quality_reason = aggregate_weighted_scores(
+        clone_evals,
+        "cloneQualityScore",
+        "qualityBaselineWeight",
+        "缺少有效的原始克隆语音质量结果",
+    )
+    if not clone_evals:
+        clone_identity_reason = clone_semantic_reason = clone_quality_reason = "待完成克隆测试"
+
+    dimension_specs = [
+        ("protectionQuality", "保护音频听感质量", protection_quality.get("qualityScore"), protection_quality.get("scoreReason"), 0.20),
+        ("cloneQuality", "克隆音频质量下降", clone_quality, clone_quality_reason, 0.10),
+        ("protectionSemantic", "保护后音频语义干扰", protection_semantic.get("protectionSemanticScore"), protection_semantic.get("scoreReason"), 0.20),
+        ("cloneSemantic", "克隆后音频语义干扰", clone_semantic, clone_semantic_reason, 0.15),
+        ("directIdentity", "保护后声音身份直接保护效果", direct_identity.get("directIdentityScore"), direct_identity.get("scoreReason"), 0.15),
+        ("cloneIdentity", "克隆声音身份保护效果", clone_identity, clone_identity_reason, 0.20),
+    ]
+    dimensions: list[dict[str, Any]] = []
+    missing_dimensions: list[str] = []
+    for key, label, value, reason, weight in dimension_specs:
+        score_value = finite_float(value)
+        if score_value is None:
+            missing_dimensions.append(key)
+        dimensions.append(
+            {
+                "key": key,
+                "label": label,
+                "score": score_value,
+                "status": "available" if score_value is not None else "pending" if reason == "待完成克隆测试" else "unavailable",
+                "reason": None if score_value is not None else reason,
+                "weight": weight,
+            }
+        )
+
+    score = None
+    if not missing_dimensions:
+        score = math.exp(
+            sum(item["weight"] * math.log(max(float(item["score"]), 1.0)) for item in dimensions)
+        )
     if score is None:
-        verdict = "未生成评分"
+        level = None
+        verdict = "待完整评估"
     elif score >= 85:
-        verdict = "强防护"
+        level = "优秀"
+        verdict = "综合防护效果优秀"
     elif score >= 70:
-        verdict = "有效防护"
-    elif score >= 50:
-        verdict = "部分防护"
+        level = "中等"
+        verdict = "综合防护效果中等"
     else:
-        verdict = "防护完毕"
+        level = "较差"
+        verdict = "综合防护效果较差"
+
+    recommendations: list[dict[str, Any]] = []
+    if finite_float(direct_identity.get("directIdentityScore")) is not None and float(direct_identity["directIdentityScore"]) < 70:
+        recommendations.append({"key": "identity", "message": "直接身份保护偏弱，可适当提高身份保护权重。", "parameters": ["lambdaId"]})
+    if finite_float(protection_semantic.get("protectionSemanticScore")) is not None and float(protection_semantic["protectionSemanticScore"]) < 70:
+        recommendations.append({"key": "semantic", "message": "语义保护偏弱，可适当提高语义保护权重。", "parameters": ["lambdaSem"]})
+    if finite_float(protection_quality.get("qualityScore")) is not None and float(protection_quality["qualityScore"]) < 70:
+        recommendations.append({"key": "quality", "message": "保护音频听感质量偏低，可提高心理声学或 L2 权重，或降低扰动上限。", "parameters": ["lambdaPsy", "lambda2", "epsilon"]})
+    generation = details.get("generation") or {}
+    selected_step = finite_float(generation.get("selectedStep"))
+    max_steps = finite_float(generation.get("maxSteps", generation.get("steps")))
+    if selected_step is not None and max_steps is not None and selected_step >= max_steps:
+        recommendations.append({"key": "convergence", "message": "最优结果出现在迭代末端，可适当增加迭代次数。", "parameters": ["steps"]})
+
+    evaluation = {
+        "status": "complete" if not missing_dimensions else "incomplete",
+        "overallScore": score,
+        "level": level,
+        "verdict": verdict,
+        "dimensions": dimensions,
+        "missingDimensions": missing_dimensions,
+        "recommendations": recommendations,
+        "calibration": dict(SCORE_CALIBRATION),
+        "calibrationSources": dict(SCORE_CALIBRATION_SOURCES),
+        "cloneAggregation": {
+            "modelCount": len(clone_evals),
+            "models": list(latest_by_model),
+            "identityReason": clone_identity_reason,
+            "semanticReason": clone_semantic_reason,
+            "qualityReason": clone_quality_reason,
+        },
+    }
     source = metric_source(
         "available" if score is not None else "unavailable",
-        "weighted_available_mean",
-        reason=None if score is not None else "No score submetrics are available",
-        formula="100*weighted_available_mean(S_asr:.25,S_clone:.35,S_audio:.20,S_psy:.10,S_epsilon:.10)",
+        "VoiceShield_v2.1_weighted_geometric_mean",
+        reason=None if score is not None else f"综合评分仍缺少以下项目：{', '.join(missing_dimensions)}",
+        formula="exp(sum(alpha_i*ln(max(S_i,1)))) with weights [.20,.10,.20,.15,.15,.20]",
     )
-    return {"score": score, "verdict": verdict, "_metricSources": {"score": source, "verdict": source}}
+    return {
+        "score": score,
+        "verdict": verdict,
+        "protectionEvaluation": evaluation,
+        "protectionQuality": protection_quality,
+        "protectionSemantic": protection_semantic,
+        "directIdentity": direct_identity,
+        "_metricSources": {"score": source, "verdict": source, "protectionEvaluation.overallScore": source},
+    }

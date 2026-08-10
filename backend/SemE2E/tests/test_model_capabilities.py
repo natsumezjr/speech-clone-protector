@@ -67,6 +67,17 @@ class ModelCapabilitiesTest(unittest.TestCase):
         )
         self.assertEqual(result_adapter._tts_catalog_entry("XTTS-v1.1")["value"], "XTTS-v1.1")
 
+    def test_visible_tts_language_catalog_matches_supported_model_matrix(self) -> None:
+        languages = {
+            option["value"]: set(option.get("languages") or [])
+            for option in self.config["models"]["tts"]
+        }
+
+        self.assertEqual(languages["XTTS-v2"], {"en", "zh-cn"})
+        self.assertEqual(languages["YourTTS"], {"en"})
+        self.assertEqual(languages["CosyVoice2-0.5B"], {"en", "zh-cn"})
+        self.assertEqual(languages["GPT-SoVITS"], {"en", "zh-cn"})
+
     def test_hidden_tts_environment_default_falls_back_to_visible_available_model(self) -> None:
         def catalog_status(item: dict[str, object], *, coqui_available: bool) -> tuple[str, str | None, str | None]:
             del coqui_available

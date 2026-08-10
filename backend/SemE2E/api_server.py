@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import multiprocessing
+import os
 import re
 import traceback
 import shutil
@@ -23,6 +24,7 @@ from pydantic import BaseModel
 
 from audio_preprocess import probe_audio_metadata
 from capability_cache import get_capabilities_snapshot
+from dnsmos_quality import dnsmos_model_status
 from result_adapter import (
     TASK_DIR,
     UPLOAD_DIR,
@@ -34,10 +36,12 @@ from result_adapter import (
     create_psychoacoustic_slice,
     create_task,
     diagnose_capabilities,
+    ensure_protection_dnsmos,
     ensure_runtime_dirs,
     load_result,
     new_task_id,
     new_file_id,
+    refresh_result_scores,
     runtime_config,
     supported_tts_languages,
     tts_model_requires_prompt,
@@ -68,7 +72,20 @@ TASK_PROCESSES: dict[str, multiprocessing.Process] = {}
 DELETED_TASK_IDS: set[str] = set()
 TASK_REGISTRY_LOCK = threading.Lock()
 TASK_STATUS_WRITE_LOCK = threading.RLock()
-PROTECT_MAX_CONCURRENCY = 4
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+PROTECT_MAX_CONCURRENCY = _positive_env_int("SEME2E_PROTECT_MAX_CONCURRENCY", 4)
 PROTECT_PENDING_TASKS: deque[dict[str, Any]] = deque()
 PROTECT_ACTIVE_TASK_IDS: set[str] = set()
 PROTECT_QUEUE_LOCK = threading.RLock()
@@ -235,6 +252,7 @@ class ProtectTaskRequest(BaseModel):
 class CloneVoiceRequest(BaseModel):
     text: str
     model: str | None = "default"
+    asrModel: str | None = None
     language: str | None = "auto"
     speed: float | None = 1.0
     speakerPrompt: str | None = None
@@ -1046,6 +1064,12 @@ def _frontend_audio(meta: dict[str, Any] | None, fallback_name: str) -> dict[str
 
 
 def _frontend_clone(clone: dict[str, Any]) -> dict[str, Any]:
+    clone_eval = clone.get("cloneEval") if isinstance(clone.get("cloneEval"), dict) else {}
+
+    def clone_metric(key: str) -> Any:
+        nested = clone_eval.get(key)
+        return nested if nested is not None else clone.get(key)
+
     return {
         "cloneId": clone.get("cloneId"),
         "cloneSubId": clone.get("cloneSubId"),
@@ -1056,14 +1080,21 @@ def _frontend_clone(clone: dict[str, Any]) -> dict[str, Any]:
         "request": clone.get("request") or {},
         "originalCloneAudio": _frontend_audio(clone.get("originalCloneAudio"), "original_clone.wav"),
         "protectedCloneAudio": _frontend_audio(clone.get("protectedCloneAudio"), "protected_clone.wav"),
-        "cloneEval": clone.get("cloneEval"),
-        "directSimilarity": clone.get("directSimilarity"),
-        "originalSimilarity": clone.get("originalSimilarity"),
-        "protectedSimilarity": clone.get("protectedSimilarity"),
-        "similarityDropRate": clone.get("similarityDropRate"),
-        "embeddingDistanceBefore": clone.get("embeddingDistanceBefore"),
-        "embeddingDistanceAfter": clone.get("embeddingDistanceAfter"),
-        "embeddingDistanceIncreaseRate": clone.get("embeddingDistanceIncreaseRate"),
+        "cloneEval": clone_eval or None,
+        "directSimilarity": clone_metric("directSimilarity"),
+        "originalSimilarity": clone_metric("originalSimilarity"),
+        "protectedSimilarity": clone_metric("protectedSimilarity"),
+        "similarityDropRate": clone_metric("similarityDropRate"),
+        "embeddingDistanceBefore": clone_metric("embeddingDistanceBefore"),
+        "embeddingDistanceAfter": clone_metric("embeddingDistanceAfter"),
+        "embeddingDistanceDelta": clone_metric("embeddingDistanceDelta"),
+        "embeddingDistanceIncreaseRate": clone_metric("embeddingDistanceIncreaseRate"),
+        "cloneIdentityScore": clone_metric("cloneIdentityScore"),
+        "identityBaselineWeight": clone_metric("identityBaselineWeight"),
+        "cloneSemanticScore": clone_metric("cloneSemanticScore"),
+        "semanticBaselineWeight": clone_metric("semanticBaselineWeight"),
+        "cloneQualityScore": clone_metric("cloneQualityScore"),
+        "qualityBaselineWeight": clone_metric("qualityBaselineWeight"),
         "cloneConfidenceBefore": clone.get("cloneConfidenceBefore"),
         "cloneConfidenceAfter": clone.get("cloneConfidenceAfter"),
         "cloneConfidenceDropRate": clone.get("cloneConfidenceDropRate"),
@@ -1076,6 +1107,7 @@ def _frontend_clone(clone: dict[str, Any]) -> dict[str, Any]:
 
 
 def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
+    refresh_result_scores(result)
     summary = result.get("summary") or {}
     primary = summary.get("primaryMetrics") or {}
     details = result.get("details") or {}
@@ -1198,6 +1230,9 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
             "epsilon": _coalesce(perception.get("epsilon"), optimization.get("epsilon")),
             "epsilonNorm": _coalesce(perception.get("epsilonNorm"), optimization.get("epsilonNorm"), optimization.get("epsilon_norm")),
             "epsilonUsageRate": perception.get("epsilonUsageRate"),
+            "epsilonUsageRateRaw": perception.get("epsilonUsageRateRaw"),
+            "epsilonToleranceRate": perception.get("epsilonToleranceRate"),
+            "epsilonExceeded": perception.get("epsilonExceeded"),
             "snr": snr,
             "clippingRate": perception.get("clippingRate"),
         },
@@ -1208,6 +1243,11 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
             "stoi": perception.get("stoi"),
             "mos": perception.get("mos"),
             "mosLqo": perception.get("mosLqo"),
+            "dnsMos": perception.get("dnsMos"),
+            "dnsMosScore": perception.get("dnsMosScore"),
+            "dnsMosStatus": perception.get("dnsMosStatus"),
+            "dnsMosReason": perception.get("dnsMosReason"),
+            "qualityScore": perception.get("qualityScore"),
             "qualityLevel": perception.get("qualityLevel"),
         },
         "psychoacoustic": perception.get("psychoacoustic")
@@ -1235,6 +1275,7 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
         "asrResults": result.get("asrResults") or [],
         "cloneEval": clone_eval,
         "cloneResults": clone_results,
+        "protectionEvaluation": result.get("protectionEvaluation") or details.get("protectionEvaluation"),
         "asr": {
             "referenceText": asr.get("referenceText") if asr_has_result else None,
             "originalText": asr.get("cleanTranscription") if asr_has_result else None,
@@ -1259,6 +1300,10 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
             "embeddingDistanceAfter": _coalesce((details.get("speaker") or {}).get("embeddingDistanceAfter"), (details.get("speaker") or {}).get("embeddingDistance")),
             "simOriginalProtected": (details.get("speaker") or {}).get("simOriginalProtected"),
             "embeddingDistance": (details.get("speaker") or {}).get("embeddingDistance"),
+            "directDistance": (details.get("speaker") or {}).get("directDistance"),
+            "directIdentityScore": (details.get("speaker") or {}).get("directIdentityScore"),
+            "scoreStatus": (details.get("speaker") or {}).get("scoreStatus"),
+            "scoreReason": (details.get("speaker") or {}).get("scoreReason"),
             "source": ((metric_sources.get("speaker.*") or {}).get("source")),
             "status": (details.get("speaker") or {}).get("status"),
         },
@@ -1334,7 +1379,25 @@ def protect_queue_snapshot() -> dict[str, int]:
 
 
 def cached_capabilities() -> dict[str, Any]:
-    return get_capabilities_snapshot(TASK_DIR.parent, diagnose_capabilities, logger=logger)
+    payload = get_capabilities_snapshot(TASK_DIR.parent, diagnose_capabilities, logger=logger)
+    chains = payload.setdefault("chains", {})
+    perception = dict(chains.get("perception_eval") or {})
+    available = [item for item in perception.get("available", []) if item not in {"mos", "mosLqo", "dnsMos"}]
+    unavailable = [item for item in perception.get("unavailable", []) if item not in {"mos", "mosLqo", "dnsMos"}]
+    quality_model = dnsmos_model_status()
+    target = available if quality_model.get("status") == "available" else unavailable
+    target.append("dnsMos")
+    perception.update(
+        {
+            "status": "available" if not unavailable else "partial",
+            "available": available,
+            "unavailable": unavailable,
+            "qualityModel": quality_model,
+            "reason": None if not unavailable else "部分语音质量指标尚未生成",
+        }
+    )
+    chains["perception_eval"] = perception
+    return payload
 
 
 @app.get("/api/health")
@@ -2367,7 +2430,7 @@ def task_result(task_id: str) -> JSONResponse:
             stage=status.get("stage") or "protect_generation",
             details={"status": status.get("status"), "progress": status.get("progress"), "error": status.get("error")},
         )
-    result = load_result(task_id)
+    result = ensure_protection_dnsmos(task_id, load_result(task_id))
     return JSONResponse(frontend_result(result))
 
 
@@ -2421,7 +2484,9 @@ def task_details(task_id: str) -> JSONResponse:
             stage=status.get("stage") or "protect_generation",
             details={"status": status.get("status"), "progress": status.get("progress"), "error": status.get("error")},
         )
-    return JSONResponse(load_result(task_id))
+    result = ensure_protection_dnsmos(task_id, load_result(task_id))
+    refresh_result_scores(result)
+    return JSONResponse(result)
 
 
 @app.post("/api/tasks/{task_id}/evaluation-batches")
@@ -2529,6 +2594,29 @@ def create_evaluation_batch(task_id: str, payload: EvaluationBatchRequest) -> JS
         current.setdefault("error", None)
         storage_key = _batch_storage_key(batch_type)
         batches = [dict(item) for item in current.get(storage_key, []) if isinstance(item, dict)]
+        active_batch = next(
+            (
+                item
+                for item in reversed(batches)
+                if _normalized_status(item.get("status")) in {"queued", "running"}
+            ),
+            None,
+        )
+        if active_batch is not None:
+            active_status = _normalized_status(active_batch.get("status"))
+            return structured_error(
+                code="EVALUATION_BATCH_ACTIVE",
+                message="An evaluation batch of this type is already queued or running.",
+                status_code=409,
+                request_id_value=request_id(),
+                task_id=task_id,
+                stage="evaluation_batch",
+                details={
+                    "batchId": active_batch.get("batchId"),
+                    "status": active_status,
+                    "type": str(active_batch.get("type") or batch_type),
+                },
+            )
         if any(str(item.get("batchId") or "") == batch_id for item in batches):
             return structured_error(
                 code="EVALUATION_BATCH_EXISTS",
@@ -3049,8 +3137,6 @@ def evidence_zip(task_id: str) -> Response:
 
 
 if __name__ == "__main__":
-    import os
-
     import uvicorn
 
     uvicorn.run("api_server:app", host="0.0.0.0", port=int(os.getenv("SEME2E_API_PORT", "8000")), reload=False)

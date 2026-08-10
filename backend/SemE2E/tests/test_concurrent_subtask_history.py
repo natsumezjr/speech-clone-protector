@@ -50,6 +50,15 @@ def minimal_result(task_id: str) -> dict[str, object]:
 
 
 class ConcurrentSubtaskHistoryTest(unittest.TestCase):
+    def test_positive_env_int_uses_positive_values_and_falls_back_safely(self) -> None:
+        name = "SEME2E_TEST_POSITIVE_ENV_INT"
+        with mock.patch.dict(api_server.os.environ, {name: "3"}):
+            self.assertEqual(api_server._positive_env_int(name, 4), 3)
+
+        for invalid_value in ("", "not-an-int", "0", "-2"):
+            with self.subTest(value=invalid_value), mock.patch.dict(api_server.os.environ, {name: invalid_value}):
+                self.assertEqual(api_server._positive_env_int(name, 4), 4)
+
     def test_xtts_clone_annotation_defaults_to_none_and_clears_irrelevant_fields(self) -> None:
         payload = api_server.CloneVoiceRequest(
             text="clone text",
@@ -127,6 +136,131 @@ class ConcurrentSubtaskHistoryTest(unittest.TestCase):
             self.assertTrue(batch["updatedAt"])
             self.assertEqual([item["batchItemId"] for item in batch["items"]], ["tiny", "base"])
             self.assertTrue(all(item["status"] == "queued" and item["progress"] == 0.0 for item in batch["items"]))
+
+    def test_active_evaluation_batch_rejects_second_batch_of_same_type(self) -> None:
+        for active_status in ("queued", "running"):
+            with self.subTest(status=active_status), tempfile.TemporaryDirectory() as tmp:
+                task_root = Path(tmp)
+                task_id = f"task_active_{active_status}"
+                task_dir = task_root / task_id
+                task_dir.mkdir(parents=True)
+                (task_dir / "result.json").write_text(json.dumps(minimal_result(task_id), ensure_ascii=False), encoding="utf-8")
+                first = api_server.EvaluationBatchRequest(
+                    batchId=f"batch_first_{active_status}",
+                    type="asr",
+                    items=[{"batchItemId": "tiny", "model": "openai-whisper:tiny"}],
+                )
+                second = api_server.EvaluationBatchRequest(
+                    batchId=f"batch_second_{active_status}",
+                    type="asr",
+                    items=[{"batchItemId": "base", "model": "openai-whisper:base"}],
+                )
+
+                with mock.patch.object(api_server, "TASK_DIR", task_root):
+                    first_response = api_server.create_evaluation_batch(task_id, first)
+                    if active_status == "running":
+                        status_path = task_dir / "status.json"
+                        status_document = json.loads(status_path.read_text(encoding="utf-8"))
+                        status_document["asrBatches"][0]["status"] = "running"
+                        status_path.write_text(json.dumps(status_document, ensure_ascii=False), encoding="utf-8")
+                    second_response = api_server.create_evaluation_batch(task_id, second)
+
+                error = json.loads(second_response.body.decode("utf-8"))["error"]
+                self.assertEqual(first_response.status_code, 200)
+                self.assertEqual(second_response.status_code, 409)
+                self.assertEqual(error["code"], "EVALUATION_BATCH_ACTIVE")
+                self.assertEqual(error["details"]["batchId"], first.batchId)
+                self.assertEqual(error["details"]["status"], active_status)
+                self.assertEqual(error["details"]["type"], "asr")
+
+    def test_terminal_evaluation_batches_do_not_block_new_batch(self) -> None:
+        for terminal_status in ("completed", "failed", "partial_failed"):
+            with self.subTest(status=terminal_status), tempfile.TemporaryDirectory() as tmp:
+                task_root = Path(tmp)
+                task_id = f"task_terminal_{terminal_status}"
+                task_dir = task_root / task_id
+                task_dir.mkdir(parents=True)
+                (task_dir / "result.json").write_text(json.dumps(minimal_result(task_id), ensure_ascii=False), encoding="utf-8")
+                first = api_server.EvaluationBatchRequest(
+                    batchId=f"batch_terminal_{terminal_status}",
+                    type="clone",
+                    items=[{"batchItemId": "first", "model": "xtts-v2"}],
+                )
+                second = api_server.EvaluationBatchRequest(
+                    batchId=f"batch_new_{terminal_status}",
+                    type="clone",
+                    items=[{"batchItemId": "second", "model": "xtts-v2"}],
+                )
+
+                with mock.patch.object(api_server, "TASK_DIR", task_root):
+                    first_response = api_server.create_evaluation_batch(task_id, first)
+                    status_path = task_dir / "status.json"
+                    status_document = json.loads(status_path.read_text(encoding="utf-8"))
+                    status_document["cloneBatches"][0]["status"] = terminal_status
+                    status_path.write_text(json.dumps(status_document, ensure_ascii=False), encoding="utf-8")
+                    second_response = api_server.create_evaluation_batch(task_id, second)
+                    status = api_server.read_task_status(task_id)
+
+                self.assertEqual(first_response.status_code, 200)
+                self.assertEqual(second_response.status_code, 200)
+                self.assertEqual([batch["batchId"] for batch in status["cloneBatches"]], [first.batchId, second.batchId])
+
+    def test_asr_and_clone_evaluation_batches_do_not_block_each_other(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp)
+            task_id = "task_cross_type_batches"
+            task_dir = task_root / task_id
+            task_dir.mkdir(parents=True)
+            (task_dir / "result.json").write_text(json.dumps(minimal_result(task_id), ensure_ascii=False), encoding="utf-8")
+            asr_request = api_server.EvaluationBatchRequest(
+                batchId="batch_asr_active",
+                type="asr",
+                items=[{"batchItemId": "tiny", "model": "openai-whisper:tiny"}],
+            )
+            clone_request = api_server.EvaluationBatchRequest(
+                batchId="batch_clone_active",
+                type="clone",
+                items=[{"batchItemId": "xtts", "model": "xtts-v2"}],
+            )
+
+            with mock.patch.object(api_server, "TASK_DIR", task_root):
+                asr_response = api_server.create_evaluation_batch(task_id, asr_request)
+                clone_response = api_server.create_evaluation_batch(task_id, clone_request)
+                status = api_server.read_task_status(task_id)
+
+            self.assertEqual(asr_response.status_code, 200)
+            self.assertEqual(clone_response.status_code, 200)
+            self.assertEqual(status["asrBatches"][0]["status"], "queued")
+            self.assertEqual(status["cloneBatches"][0]["status"], "queued")
+
+    def test_concurrent_same_type_batch_creation_allows_only_one_active_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp)
+            task_id = "task_atomic_batch_create"
+            task_dir = task_root / task_id
+            task_dir.mkdir(parents=True)
+            (task_dir / "result.json").write_text(json.dumps(minimal_result(task_id), ensure_ascii=False), encoding="utf-8")
+            requests = [
+                api_server.EvaluationBatchRequest(
+                    batchId=f"batch_atomic_{index}",
+                    type="asr",
+                    items=[{"batchItemId": f"item_{index}", "model": "openai-whisper:tiny"}],
+                )
+                for index in range(2)
+            ]
+
+            with mock.patch.object(api_server, "TASK_DIR", task_root), ThreadPoolExecutor(max_workers=2) as executor:
+                responses = list(executor.map(lambda request: api_server.create_evaluation_batch(task_id, request), requests))
+                status = api_server.read_task_status(task_id)
+
+            self.assertEqual(sorted(response.status_code for response in responses), [200, 409])
+            self.assertEqual(len(status["asrBatches"]), 1)
+            rejected = next(response for response in responses if response.status_code == 409)
+            error = json.loads(rejected.body.decode("utf-8"))["error"]
+            self.assertEqual(error["code"], "EVALUATION_BATCH_ACTIVE")
+            self.assertEqual(error["details"]["batchId"], status["asrBatches"][0]["batchId"])
+            self.assertEqual(error["details"]["status"], "queued")
+            self.assertEqual(error["details"]["type"], "asr")
 
     def test_clone_batch_clears_annotations_for_models_without_required_prompts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -535,7 +669,10 @@ class ConcurrentSubtaskHistoryTest(unittest.TestCase):
             stdout='VOICE_SHIELD_COSYVOICE_RESULT={"ok": true}\n',
             stderr='',
         )
-        with mock.patch.object(result_adapter, "_cosyvoice_model_status", return_value=("available", None, None)), mock.patch.object(result_adapter.subprocess, "run", return_value=completed) as run:
+        with (
+            mock.patch.object(result_adapter, "_cosyvoice_model_status", return_value=("available", None, None)),
+            mock.patch.object(result_adapter, "_run_cancellable_subprocess", return_value=completed) as runner,
+        ):
             result = result_adapter._cosyvoice_clone_pair(
                 Path("original.wav"),
                 Path("protected.wav"),
@@ -548,7 +685,7 @@ class ConcurrentSubtaskHistoryTest(unittest.TestCase):
                 device="cpu",
             )
 
-        command = run.call_args.args[0]
+        command = runner.call_args.args[0]
         self.assertEqual(command[command.index("--original-prompt-text") + 1], "原始音频转写")
         self.assertEqual(command[command.index("--protected-prompt-text") + 1], "保护音频转写")
         self.assertTrue(result["ok"])

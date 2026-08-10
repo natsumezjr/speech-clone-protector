@@ -197,6 +197,11 @@ export interface SharedSemanticMetrics {
   tokenChangeCount?: number | null
   tokenTotal?: number | null
   semanticDrift?: number | null
+  tokenScore?: number | null
+  driftScore?: number | null
+  protectionSemanticScore?: number | null
+  scoreStatus?: string | null
+  scoreReason?: string | null
   encoderDistances?: Array<Record<string, unknown>> | null
   reason?: string | null
   error?: string | null
@@ -210,6 +215,10 @@ export interface SpeakerMetrics {
   embeddingDistanceAfter: number | null
   simOriginalProtected?: number | null
   embeddingDistance?: number | null
+  directDistance?: number | null
+  directIdentityScore?: number | null
+  scoreStatus?: string | null
+  scoreReason?: string | null
   source?: string
   status?: string
 }
@@ -299,6 +308,9 @@ export interface PerturbationMetrics {
   epsilon?: number | null
   epsilonNorm?: 'l2' | 'linf' | string | null
   epsilonUsageRate?: number | null
+  epsilonUsageRateRaw?: number | null
+  epsilonToleranceRate?: number | null
+  epsilonExceeded?: boolean | null
   snr?: number | null
   clippingRate?: number | null
 }
@@ -309,6 +321,17 @@ export interface ProtectionQuality {
   stoi?: number | null
   mos?: number | null
   mosLqo?: number | null
+  dnsMos?: number | null
+  snrScore?: number | null
+  stoiScore?: number | null
+  pesqScore?: number | null
+  mosScore?: number | null
+  dnsMosScore?: number | null
+  qualityScore?: number | null
+  dnsMosStatus?: string | null
+  dnsMosReason?: string | null
+  scoreStatus?: string | null
+  scoreReason?: string | null
   qualityLevel?: string | null
 }
 
@@ -356,6 +379,7 @@ export interface CloneEval {
   similarityDropRate?: number | null
   embeddingDistanceBefore?: number | null
   embeddingDistanceAfter?: number | null
+  embeddingDistanceDelta?: number | null
   embeddingDistanceIncreaseRate?: number | null
   cloneConfidenceBefore?: number | null
   cloneConfidenceAfter?: number | null
@@ -363,9 +387,42 @@ export interface CloneEval {
   cloneRadar?: RadarPoint[] | null
   cloneTrend?: Array<Record<string, number>> | null
   cloneDefenseScore?: number | null
+  cloneIdentityScore?: number | null
+  identityBaselineWeight?: number | null
+  cloneIdentityStatus?: string | null
+  cloneIdentityReason?: string | null
+  cleanCloneTranscription?: string | null
+  protectedCloneTranscription?: string | null
+  cloneAsrModel?: string | null
+  cloneAsrStatus?: string | null
+  cloneAsrReason?: string | null
+  cleanCloneTextAccuracy?: number | null
+  cleanCloneTextError?: number | null
+  protectedCloneTextAccuracy?: number | null
+  protectedCloneTextError?: number | null
+  cloneTextChangeAccuracy?: number | null
+  cloneTextChangeRate?: number | null
+  semanticBaselineWeight?: number | null
+  cloneTokenChangeRate?: number | null
+  cloneSemanticDrift?: number | null
+  cloneTokenScore?: number | null
+  cloneDriftScore?: number | null
+  cloneSemanticScore?: number | null
+  cloneSemanticStatus?: string | null
+  cloneSemanticReason?: string | null
+  cleanCloneQualityMos?: number | null
+  protectedCloneQualityMos?: number | null
+  cloneQualityDropRate?: number | null
+  cloneQualityScore?: number | null
+  qualityBaselineWeight?: number | null
+  cloneQualityModel?: string | null
+  cloneQualityModelPath?: string | null
+  cloneQualityStatus?: string | null
+  cloneQualityReason?: string | null
   createdAt?: string | null
   status?: string | null
   reason?: string | null
+  metricSources?: Record<string, MetricSource>
 }
 
 export interface MetricSource {
@@ -374,6 +431,49 @@ export interface MetricSource {
   reason?: string
   formula?: string
   metric?: string
+}
+
+export type ProtectionEvaluationDimensionKey =
+  | 'protectionQuality'
+  | 'cloneQuality'
+  | 'protectionSemantic'
+  | 'cloneSemantic'
+  | 'directIdentity'
+  | 'cloneIdentity'
+
+export interface ProtectionEvaluationDimension {
+  key: ProtectionEvaluationDimensionKey
+  label: string
+  score: number | null
+  status: 'available' | 'unavailable' | 'pending' | 'error' | string
+  reason?: string | null
+  weight: number
+}
+
+export interface ProtectionEvaluationRecommendation {
+  key: string
+  message: string
+  parameters: string[]
+}
+
+export interface ProtectionEvaluationCalibration {
+  tokenChangeRate90?: number | null
+  semanticDrift90?: number | null
+  directDistance90?: number | null
+  cloneTokenChangeRate90?: number | null
+  cloneSemanticDrift90?: number | null
+  cloneQualityDropRate90?: number | null
+}
+
+export interface ProtectionEvaluation {
+  status: 'complete' | 'incomplete' | string
+  overallScore: number | null
+  level: '优秀' | '中等' | '较差' | string | null
+  verdict: string
+  dimensions: ProtectionEvaluationDimension[]
+  missingDimensions: string[]
+  recommendations: ProtectionEvaluationRecommendation[]
+  calibration?: ProtectionEvaluationCalibration | null
 }
 
 export interface ApiErrorPayload {
@@ -542,6 +642,7 @@ export interface TaskResult {
   protectedAudio: AudioFileMeta
   perturbation?: PerturbationMetrics | null
   protectionQuality?: ProtectionQuality | null
+  protectionEvaluation?: ProtectionEvaluation | null
   psychoacoustic?: PsychoacousticMetrics | null
   lossFinal?: LossFinal | null
   lossWeights?: LossWeights | null

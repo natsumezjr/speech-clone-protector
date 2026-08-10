@@ -1,13 +1,15 @@
 import ReactECharts from 'echarts-for-react'
+import katex from 'katex'
+import 'katex/dist/katex.min.css'
 import { useAppStore } from '@/store/appStore'
 import type { LossTrendPoint } from '@/types/task'
 
 const lossSeries = [
-  { key: 'Lid', legacyKey: 'Lfeat', tooltipName: 'L<sub>id</sub>', color: '#22d3ee' },
-  { key: 'Lsem', tooltipName: 'L<sub>sem</sub>', color: '#22c55e' },
-  { key: 'Lpsy', tooltipName: 'L<sub>psy</sub>', color: '#f59e0b' },
-  { key: 'L2', tooltipName: 'L<sub>2</sub>', color: '#a78bfa' },
-  { key: 'total', tooltipName: 'L<sub>total</sub>', color: '#fb7185' },
+  { key: 'Lid', legacyKey: 'Lfeat', formula: 'L_{\\mathrm{id}}', color: '#22d3ee' },
+  { key: 'Lsem', formula: 'L_{\\mathrm{sem}}', color: '#22c55e' },
+  { key: 'Lpsy', formula: 'L_{\\mathrm{psy}}', color: '#f59e0b' },
+  { key: 'L2', formula: 'L_2', color: '#a78bfa' },
+  { key: 'total', formula: 'L_{\\mathrm{total}}', color: '#fb7185' },
 ] as const
 
 function lossValue(point: LossTrendPoint, series: (typeof lossSeries)[number]) {
@@ -18,6 +20,10 @@ function formatLossValue(value: unknown) {
   const numberValue = typeof value === 'number' ? value : Number(value)
   if (!Number.isFinite(numberValue)) return '未生成'
   return numberValue.toFixed(2)
+}
+
+function renderFormula(formula: string) {
+  return katex.renderToString(formula, { throwOnError: false, displayMode: false })
 }
 
 export function TrendChart({ data }: { data: LossTrendPoint[] }) {
@@ -55,7 +61,7 @@ export function TrendChart({ data }: { data: LossTrendPoint[] }) {
       formatter: (params: Array<{ axisValue: number | string; seriesName: string; marker: string; value: unknown }>) => {
         const step = params[0]?.axisValue ?? '-'
         const rows = params
-          .map((item) => `${item.marker}${item.seriesName}: ${formatLossValue(item.value)}`)
+          .map((item) => `${item.marker}${renderFormula(item.seriesName)}: ${formatLossValue(item.value)}`)
           .join('<br/>')
         return `step: ${step}<br/>${rows}`
       },
@@ -88,7 +94,7 @@ export function TrendChart({ data }: { data: LossTrendPoint[] }) {
       splitLine: { lineStyle: { color: chartTheme.gridColor } },
     })),
     series: lossSeries.map((series, index) => ({
-      name: series.tooltipName,
+      name: series.formula,
       type: 'line',
       xAxisIndex: index,
       yAxisIndex: index,

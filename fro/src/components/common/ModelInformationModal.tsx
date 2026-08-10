@@ -1,4 +1,5 @@
 import { useEffect } from 'react'
+import { createPortal } from 'react-dom'
 import { X } from 'lucide-react'
 
 import type { RuntimeModelOption, RuntimeModelType } from '@/types/task'
@@ -19,9 +20,9 @@ export function ModelInformationModal({ model, modelTypes, onClose }: Props) {
   const typeDefinitions = Object.values(modelTypes ?? {}).flat()
   const resolvedTypes = (model.type ?? []).map((value) => typeDefinitions.find((item) => item.value === value) ?? { value, name: value, information: '' })
 
-  return (
-    <div className="fixed inset-0 z-[220] grid place-items-center bg-slate-950/72 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label={`${model.name ?? model.label ?? model.value} 模型信息`}>
-      <div className="ui-card max-h-[76vh] w-full max-w-[520px] overflow-y-auto p-5 shadow-[0_28px_80px_rgba(0,0,0,0.5)]">
+  return createPortal(
+    <div className="fixed inset-0 z-[220] grid place-items-center bg-slate-950/80 px-4" role="dialog" aria-modal="true" aria-label={`${model.name ?? model.label ?? model.value} 模型信息`} onClick={onClose}>
+      <div className="ui-card max-h-[76vh] w-full max-w-[520px] overflow-y-auto !bg-[#061426] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.56)]" onClick={(event) => event.stopPropagation()}>
         <div className="flex items-start justify-between gap-4">
           <div>
             <p className="text-xs font-bold tracking-[0.12em] text-cyan-300">模型信息</p>
@@ -54,6 +55,7 @@ export function ModelInformationModal({ model, modelTypes, onClose }: Props) {
           ) : null}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   )
 }

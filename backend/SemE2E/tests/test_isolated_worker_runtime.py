@@ -61,6 +61,45 @@ class IsolatedWorkerRuntimeTest(unittest.TestCase):
             result_adapter.ROOT,
         )
 
+    def test_isolated_json_worker_applies_child_only_environment_overrides(self) -> None:
+        temporary, worker = self._worker(
+            """
+            import json
+            import os
+            import sys
+
+            json.load(sys.stdin)
+            print(json.dumps({
+                "ok": True,
+                "fixtureValue": os.environ.get("VOICE_SHIELD_FIXTURE_ENV"),
+                "removedValue": os.environ.get("VOICE_SHIELD_REMOVED_ENV"),
+            }), flush=True)
+            """
+        )
+        self.addCleanup(temporary.cleanup)
+
+        with mock.patch.dict(
+            result_adapter.os.environ,
+            {
+                "VOICE_SHIELD_FIXTURE_ENV": "parent",
+                "VOICE_SHIELD_REMOVED_ENV": "parent-only",
+            },
+        ):
+            response = result_adapter._run_isolated_json_worker(
+                worker,
+                {"value": "environment"},
+                timeout_seconds=5,
+                env_overrides={
+                    "VOICE_SHIELD_FIXTURE_ENV": "child",
+                    "VOICE_SHIELD_REMOVED_ENV": None,
+                },
+            )
+            self.assertEqual(result_adapter.os.environ["VOICE_SHIELD_FIXTURE_ENV"], "parent")
+            self.assertEqual(result_adapter.os.environ["VOICE_SHIELD_REMOVED_ENV"], "parent-only")
+
+        self.assertEqual(response["fixtureValue"], "child")
+        self.assertIsNone(response["removedValue"])
+
     def test_isolated_json_worker_preserves_nonzero_error_diagnostics(self) -> None:
         temporary, worker = self._worker(
             """
@@ -154,6 +193,58 @@ class IsolatedWorkerRuntimeTest(unittest.TestCase):
         self.assertTrue(cancel_event.is_set())
         self.assertLess(time.monotonic() - started, 10)
 
+    def test_cancellable_subprocess_cancel_stops_active_process_tree(self) -> None:
+        temporary, worker = self._worker(
+            """
+            import time
+
+            time.sleep(30)
+            """
+        )
+        self.addCleanup(temporary.cleanup)
+        cancel_event = threading.Event()
+        timer = threading.Timer(0.3, cancel_event.set)
+        timer.start()
+        self.addCleanup(timer.cancel)
+
+        started = time.monotonic()
+        with mock.patch.object(
+            result_adapter,
+            "_stop_isolated_worker",
+            wraps=result_adapter._stop_isolated_worker,
+        ) as stop_worker:
+            with self.assertRaisesRegex(RuntimeError, "TASK_CANCELLED"):
+                result_adapter._run_cancellable_subprocess(
+                    [sys.executable, str(worker)],
+                    cwd=worker.parent,
+                    env=result_adapter.os.environ.copy(),
+                    timeout_seconds=10,
+                    cancel_event=cancel_event,
+                )
+
+        stop_worker.assert_called_once()
+        self.assertTrue(cancel_event.is_set())
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_windows_worker_stop_uses_taskkill_process_tree(self) -> None:
+        process = mock.Mock()
+        process.pid = 43210
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        taskkill_result = mock.Mock(returncode=0)
+
+        with (
+            mock.patch.object(result_adapter.os, "name", "nt"),
+            mock.patch.object(result_adapter.subprocess, "run", return_value=taskkill_result) as taskkill,
+        ):
+            result_adapter._stop_isolated_worker(process, grace_seconds=0.5)
+
+        command = taskkill.call_args.args[0]
+        self.assertEqual(command[:3], ["taskkill.exe", "/PID", "43210"])
+        self.assertIn("/T", command)
+        self.assertIn("/F", command)
+        process.wait.assert_called_once_with(timeout=0.5)
+
     def test_coqui_pair_runs_once_in_isolated_worker_with_explicit_model_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_name:
             root = Path(temporary_name)
@@ -169,7 +260,13 @@ class IsolatedWorkerRuntimeTest(unittest.TestCase):
                 mock.patch.object(result_adapter, "_local_tts_model_files", return_value=(model_dir, config_path)),
                 mock.patch.object(result_adapter, "_run_isolated_json_worker", return_value=worker_response) as worker,
                 mock.patch.object(result_adapter, "COQUI_TTS_WORKER_SLOTS", threading.BoundedSemaphore(1)),
-                mock.patch.dict(result_adapter.os.environ, {"SEME2E_COQUI_TTS_WORKER_TIMEOUT_SECONDS": "33"}),
+                mock.patch.dict(
+                    result_adapter.os.environ,
+                    {
+                        "SEME2E_COQUI_TTS_WORKER_TIMEOUT_SECONDS": "33",
+                        "SEME2E_COQUI_TTS_CUDA_VISIBLE_DEVICES": "4",
+                    },
+                ),
             ):
                 response = result_adapter._coqui_tts_clone_pair(
                     original_reference,
@@ -197,8 +294,367 @@ class IsolatedWorkerRuntimeTest(unittest.TestCase):
         self.assertEqual(payload["protectedReferencePath"], str(protected_reference.resolve()))
         self.assertEqual(payload["originalOutputPath"], str(original_output.resolve()))
         self.assertEqual(payload["protectedOutputPath"], str(protected_output.resolve()))
+        self.assertEqual(payload["device"], "cuda:0")
         self.assertEqual(worker.call_args.kwargs["timeout_seconds"], 33)
         self.assertIs(worker.call_args.kwargs["cancel_event"], cancel_event)
+        self.assertEqual(worker.call_args.kwargs["env_overrides"], {"CUDA_VISIBLE_DEVICES": "4"})
+
+    def test_asr_and_clone_asr_visible_devices_use_logical_cuda_zero(self) -> None:
+        worker_response = {
+            "ok": True,
+            "model": "openai-whisper:base",
+            "language": "en",
+            "originalText": "original transcript",
+            "protectedText": "protected transcript",
+        }
+        with (
+            mock.patch.object(result_adapter, "_run_isolated_json_worker", return_value=worker_response) as worker,
+            mock.patch.object(result_adapter, "ASR_WORKER_SLOTS", threading.BoundedSemaphore(1)),
+            mock.patch.dict(
+                result_adapter.os.environ,
+                {
+                    "SEME2E_API_DEVICE": "cuda:7",
+                    "SEME2E_ASR_CUDA_VISIBLE_DEVICES": "2",
+                },
+            ),
+        ):
+            result_adapter.maybe_asr_eval(
+                Path("original.wav"),
+                Path("protected.wav"),
+                {
+                    "semantic": {"asrModel": "openai-whisper:base"},
+                    "language": "en",
+                    "forceAsrEval": True,
+                },
+            )
+
+        asr_payload = worker.call_args.args[1]
+        self.assertEqual(asr_payload["device"], "cuda:0")
+        self.assertEqual(worker.call_args.kwargs["env_overrides"], {"CUDA_VISIBLE_DEVICES": "2"})
+
+        with (
+            mock.patch.object(result_adapter, "_run_isolated_json_worker", return_value=worker_response) as worker,
+            mock.patch.object(result_adapter, "ASR_WORKER_SLOTS", threading.BoundedSemaphore(1)),
+            mock.patch.dict(
+                result_adapter.os.environ,
+                {
+                    "SEME2E_CLONE_ASR_DEVICE": "cuda:6",
+                    "SEME2E_CLONE_ASR_CUDA_VISIBLE_DEVICES": "3",
+                },
+            ),
+        ):
+            response = result_adapter._transcribe_clone_pair_isolated(
+                Path("original_clone.wav"),
+                Path("protected_clone.wav"),
+                {"asrModel": "openai-whisper:base", "language": "en", "text": "target"},
+            )
+
+        clone_payload = worker.call_args.args[1]
+        self.assertEqual(clone_payload["device"], "cuda:0")
+        self.assertEqual(worker.call_args.kwargs["env_overrides"], {"CUDA_VISIBLE_DEVICES": "3"})
+        self.assertEqual(response["status"], "available")
+
+    def test_cosyvoice_visible_device_uses_logical_cuda_zero(self) -> None:
+        completed = mock.Mock(
+            returncode=0,
+            stdout='VOICE_SHIELD_COSYVOICE_RESULT={"ok": true}\n',
+            stderr="",
+        )
+        with (
+            mock.patch.object(result_adapter, "_cosyvoice_model_status", return_value=("available", None, None)),
+            mock.patch.object(result_adapter, "_run_cancellable_subprocess", return_value=completed) as runner,
+            mock.patch.object(result_adapter, "COSYVOICE_WORKER_SLOTS", threading.BoundedSemaphore(1)),
+            mock.patch.dict(
+                result_adapter.os.environ,
+                {"SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES": "4"},
+            ),
+        ):
+            response = result_adapter._cosyvoice_clone_pair(
+                Path("original.wav"),
+                Path("protected.wav"),
+                Path("original_clone.wav"),
+                Path("protected_clone.wav"),
+                text="target text",
+                original_prompt_text="original transcript",
+                protected_prompt_text="protected transcript",
+                speed=1.0,
+                device="cuda:6",
+            )
+
+        command = runner.call_args.args[0]
+        self.assertEqual(command[command.index("--device") + 1], "cuda:0")
+        self.assertEqual(runner.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"], "4")
+        self.assertEqual(runner.call_args.kwargs["timeout_seconds"], 900)
+        self.assertTrue(response["ok"])
+
+    def test_gpt_sovits_visible_device_routes_training_and_worker_consistently(self) -> None:
+        completed = mock.Mock(
+            returncode=0,
+            stdout='VOICE_SHIELD_GPT_SOVITS_LIVE_RESULT={"ok": true}\n',
+            stderr="",
+        )
+        with (
+            mock.patch.object(result_adapter, "_gpt_sovits_model_status", return_value=("available", None, None)),
+            mock.patch.object(result_adapter, "_run_cancellable_subprocess", return_value=completed) as runner,
+            mock.patch.object(result_adapter, "GPT_SOVITS_WORKER_SLOTS", threading.BoundedSemaphore(1)),
+            mock.patch.dict(
+                result_adapter.os.environ,
+                {"SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES": "5"},
+            ),
+        ):
+            response = result_adapter._gpt_sovits_clone_pair(
+                Path("original.wav"),
+                Path("protected.wav"),
+                Path("original_clone.wav"),
+                Path("protected_clone.wav"),
+                original_transcript="original transcript",
+                protected_transcript="protected transcript",
+                text="target text",
+                language="en",
+                speed=1.0,
+                device="cuda:3",
+            )
+
+        command = runner.call_args.args[0]
+        self.assertEqual(command[command.index("--device") + 1], "cuda:0")
+        self.assertEqual(command[command.index("--gpu-numbers") + 1], "5")
+        self.assertEqual(command[command.index("--cuda-visible-devices") + 1], "5")
+        self.assertEqual(runner.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"], "5")
+        self.assertEqual(runner.call_args.kwargs["timeout_seconds"], 2700)
+        self.assertTrue(response["ok"])
+
+    def test_expensive_clone_worker_concurrency_defaults_to_one(self) -> None:
+        if "SEME2E_COSYVOICE_WORKER_MAX_CONCURRENCY" not in result_adapter.os.environ:
+            self.assertEqual(result_adapter.COSYVOICE_WORKER_MAX_CONCURRENCY, 1)
+        if "SEME2E_GPT_SOVITS_WORKER_MAX_CONCURRENCY" not in result_adapter.os.environ:
+            self.assertEqual(result_adapter.GPT_SOVITS_WORKER_MAX_CONCURRENCY, 1)
+        if "SEME2E_CLONE_GPU_MAX_CONCURRENCY" not in result_adapter.os.environ:
+            self.assertEqual(result_adapter.CLONE_GPU_MAX_CONCURRENCY, 1)
+
+    def test_worker_slot_wait_honors_cancellation_without_consuming_slot(self) -> None:
+        semaphore = threading.BoundedSemaphore(1)
+        semaphore.acquire()
+        cancel_event = threading.Event()
+        timer = threading.Timer(0.05, cancel_event.set)
+        timer.start()
+        self.addCleanup(timer.cancel)
+
+        with self.assertRaisesRegex(RuntimeError, "TASK_CANCELLED"):
+            result_adapter._acquire_worker_slot(semaphore, cancel_event)
+
+        semaphore.release()
+        self.assertTrue(semaphore.acquire(blocking=False))
+        semaphore.release()
+
+        already_cancelled = threading.Event()
+        already_cancelled.set()
+        with self.assertRaisesRegex(RuntimeError, "TASK_CANCELLED"):
+            result_adapter._acquire_worker_slot(semaphore, already_cancelled)
+        self.assertTrue(semaphore.acquire(blocking=False))
+        semaphore.release()
+
+    def test_clone_gpu_slot_keys_resolve_explicit_and_parent_visible_devices(self) -> None:
+        with mock.patch.dict(
+            result_adapter.os.environ,
+            {
+                "SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES": "5, 2, 5",
+                "CUDA_VISIBLE_DEVICES": "8,7",
+            },
+        ):
+            self.assertEqual(
+                result_adapter._clone_gpu_slot_keys(
+                    "cuda:1",
+                    "SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES",
+                ),
+                ("2", "5"),
+            )
+
+        with mock.patch.dict(
+            result_adapter.os.environ,
+            {
+                "SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES": "",
+                "CUDA_VISIBLE_DEVICES": "8,7",
+            },
+        ):
+            self.assertEqual(
+                result_adapter._clone_gpu_slot_keys(
+                    "cuda:1",
+                    "SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES",
+                ),
+                ("7",),
+            )
+            self.assertEqual(
+                result_adapter._clone_gpu_slot_keys(
+                    "cpu",
+                    "SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES",
+                ),
+                (),
+            )
+
+    def test_different_clone_models_share_one_physical_gpu_slot(self) -> None:
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+        errors: list[BaseException] = []
+
+        def occupy_first_model() -> None:
+            slots: list[threading.BoundedSemaphore] = []
+            try:
+                slots = result_adapter._acquire_clone_worker_slots(
+                    threading.BoundedSemaphore(1),
+                    ("4",),
+                    None,
+                )
+                first_entered.set()
+                release_first.wait(timeout=3)
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+            finally:
+                result_adapter._release_worker_slots(slots)
+
+        def occupy_second_model() -> None:
+            slots: list[threading.BoundedSemaphore] = []
+            try:
+                slots = result_adapter._acquire_clone_worker_slots(
+                    threading.BoundedSemaphore(1),
+                    ("4",),
+                    None,
+                )
+                second_entered.set()
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+            finally:
+                result_adapter._release_worker_slots(slots)
+
+        with (
+            mock.patch.object(result_adapter, "CLONE_GPU_MAX_CONCURRENCY", 1),
+            mock.patch.object(result_adapter, "CLONE_GPU_SLOTS", {}),
+        ):
+            first_thread = threading.Thread(target=occupy_first_model)
+            second_thread = threading.Thread(target=occupy_second_model)
+            first_thread.start()
+            self.assertTrue(first_entered.wait(timeout=1))
+            second_thread.start()
+            self.assertFalse(second_entered.wait(timeout=0.15))
+            release_first.set()
+            self.assertTrue(second_entered.wait(timeout=1))
+            first_thread.join(timeout=1)
+            second_thread.join(timeout=1)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_clone_workers_on_different_physical_gpus_can_enter_together(self) -> None:
+        with (
+            mock.patch.object(result_adapter, "CLONE_GPU_MAX_CONCURRENCY", 1),
+            mock.patch.object(result_adapter, "CLONE_GPU_SLOTS", {}),
+        ):
+            first_slots = result_adapter._acquire_clone_worker_slots(
+                threading.BoundedSemaphore(1),
+                ("4",),
+                None,
+            )
+            try:
+                second_slots = result_adapter._acquire_clone_worker_slots(
+                    threading.BoundedSemaphore(1),
+                    ("5",),
+                    None,
+                )
+                result_adapter._release_worker_slots(second_slots)
+            finally:
+                result_adapter._release_worker_slots(first_slots)
+
+    def test_clone_gpu_slot_wait_cancellation_releases_model_slot(self) -> None:
+        with (
+            mock.patch.object(result_adapter, "CLONE_GPU_MAX_CONCURRENCY", 1),
+            mock.patch.object(result_adapter, "CLONE_GPU_SLOTS", {}),
+        ):
+            first_slots = result_adapter._acquire_clone_worker_slots(
+                threading.BoundedSemaphore(1),
+                ("4",),
+                None,
+            )
+            second_model_slot = threading.BoundedSemaphore(1)
+            cancel_event = threading.Event()
+            timer = threading.Timer(0.05, cancel_event.set)
+            timer.start()
+            try:
+                with self.assertRaisesRegex(RuntimeError, "TASK_CANCELLED"):
+                    result_adapter._acquire_clone_worker_slots(
+                        second_model_slot,
+                        ("4",),
+                        cancel_event,
+                    )
+            finally:
+                timer.cancel()
+
+            self.assertTrue(second_model_slot.acquire(blocking=False))
+            second_model_slot.release()
+            result_adapter._release_worker_slots(first_slots)
+            shared_gpu_slot = result_adapter._clone_gpu_slot("4")
+            self.assertTrue(shared_gpu_slot.acquire(blocking=False))
+            shared_gpu_slot.release()
+
+    def test_cosyvoice_and_gpt_sovits_cancel_while_waiting_for_worker_slots(self) -> None:
+        cosy_slots = threading.BoundedSemaphore(1)
+        cosy_slots.acquire()
+        cosy_cancel = threading.Event()
+        cosy_timer = threading.Timer(0.05, cosy_cancel.set)
+        cosy_timer.start()
+        try:
+            with (
+                mock.patch.object(result_adapter, "_cosyvoice_model_status", return_value=("available", None, None)),
+                mock.patch.object(result_adapter, "COSYVOICE_WORKER_SLOTS", cosy_slots),
+                mock.patch.object(result_adapter, "_run_cancellable_subprocess") as runner,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "TASK_CANCELLED"):
+                    result_adapter._cosyvoice_clone_pair(
+                        Path("original.wav"),
+                        Path("protected.wav"),
+                        Path("original_clone.wav"),
+                        Path("protected_clone.wav"),
+                        text="target text",
+                        original_prompt_text="original transcript",
+                        protected_prompt_text="protected transcript",
+                        speed=1.0,
+                        device="cuda:0",
+                        cancel_event=cosy_cancel,
+                    )
+                runner.assert_not_called()
+        finally:
+            cosy_timer.cancel()
+            cosy_slots.release()
+
+        gpt_slots = threading.BoundedSemaphore(1)
+        gpt_slots.acquire()
+        gpt_cancel = threading.Event()
+        gpt_timer = threading.Timer(0.05, gpt_cancel.set)
+        gpt_timer.start()
+        try:
+            with (
+                mock.patch.object(result_adapter, "_gpt_sovits_model_status", return_value=("available", None, None)),
+                mock.patch.object(result_adapter, "GPT_SOVITS_WORKER_SLOTS", gpt_slots),
+                mock.patch.object(result_adapter, "_run_cancellable_subprocess") as runner,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "TASK_CANCELLED"):
+                    result_adapter._gpt_sovits_clone_pair(
+                        Path("original.wav"),
+                        Path("protected.wav"),
+                        Path("original_clone.wav"),
+                        Path("protected_clone.wav"),
+                        original_transcript="original transcript",
+                        protected_transcript="protected transcript",
+                        text="target text",
+                        language="en",
+                        speed=1.0,
+                        device="cuda:0",
+                        cancel_event=gpt_cancel,
+                    )
+                runner.assert_not_called()
+        finally:
+            gpt_timer.cancel()
+            gpt_slots.release()
 
 
 class TaskRuntimeRegistryTest(unittest.TestCase):

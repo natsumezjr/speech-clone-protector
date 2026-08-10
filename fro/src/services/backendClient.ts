@@ -2,8 +2,9 @@ import axios from 'axios'
 import { apiBaseUrl } from '@/config/runtime'
 import type { ApiClient } from '@/types/api'
 import type { AudioFileMeta } from '@/types/audio'
-import type { ApiErrorPayload, AsrEvalRequest, AsrEvalResponse, CapabilitiesResponse, CloneVoiceRequest, CloneVoiceResult, CreateEvaluationBatchRequest, EvaluationBatch, HistoryTask, ProtectionTaskRequest, PsychoacousticSliceResponse, TaskDetailsResponse, TaskResult, TaskStatusResponse } from '@/types/task'
+import type { ApiErrorPayload, AsrEvalRequest, AsrEvalResponse, CapabilitiesResponse, CloneVoiceRequest, CloneVoiceResult, CreateEvaluationBatchRequest, EvaluationBatch, HistoryTask, MetricSource, ProtectionEvaluation, ProtectionEvaluationDimension, ProtectionEvaluationDimensionKey, ProtectionTaskRequest, PsychoacousticSliceResponse, TaskDetailsResponse, TaskResult, TaskStatusResponse } from '@/types/task'
 import { formatStructuredApiError } from '@/utils/apiError'
+import { layeredMetricNumber } from '@/utils/metricNormalization'
 
 const http = axios.create({
   baseURL: apiBaseUrl,
@@ -241,6 +242,13 @@ function normalizePerturbation(value: unknown): TaskResult['perturbation'] {
     epsilon: firstNumber(record, ['epsilon', 'eps']),
     epsilonNorm: firstString(record, ['epsilonNorm', 'epsilon_norm']) ?? null,
     epsilonUsageRate: firstNumber(record, ['epsilonUsageRate', 'epsilon_usage_rate']),
+    epsilonUsageRateRaw: firstNumber(record, ['epsilonUsageRateRaw', 'epsilon_usage_rate_raw']),
+    epsilonToleranceRate: firstNumber(record, ['epsilonToleranceRate', 'epsilon_tolerance_rate']),
+    epsilonExceeded: typeof record.epsilonExceeded === 'boolean'
+      ? record.epsilonExceeded
+      : typeof record.epsilon_exceeded === 'boolean'
+        ? record.epsilon_exceeded
+        : null,
     snr: firstNumber(record, ['snr', 'SNR']),
     clippingRate: firstNumber(record, ['clippingRate', 'clipping_rate']),
   }
@@ -254,7 +262,88 @@ function normalizeProtectionQuality(value: unknown): TaskResult['protectionQuali
     stoi: firstNumber(record, ['stoi', 'STOI']),
     mos: firstNumber(record, ['mos', 'MOS']),
     mosLqo: firstNumber(record, ['mosLqo', 'mos_lqo', 'MOSLQO']),
+    dnsMos: firstNumber(record, ['dnsMos', 'dns_mos', 'dnsmos']),
+    snrScore: firstNumber(record, ['snrScore', 'snr_score']),
+    stoiScore: firstNumber(record, ['stoiScore', 'stoi_score']),
+    pesqScore: firstNumber(record, ['pesqScore', 'pesq_score']),
+    mosScore: firstNumber(record, ['mosScore', 'mos_score']),
+    dnsMosScore: firstNumber(record, ['dnsMosScore', 'dns_mos_score']),
+    qualityScore: firstNumber(record, ['qualityScore', 'quality_score']),
+    dnsMosStatus: firstString(record, ['dnsMosStatus', 'dns_mos_status']),
+    dnsMosReason: firstString(record, ['dnsMosReason', 'dns_mos_reason']),
+    scoreStatus: firstString(record, ['scoreStatus', 'score_status']),
+    scoreReason: firstString(record, ['scoreReason', 'score_reason']),
     qualityLevel: firstString(record, ['qualityLevel', 'quality_level']) ?? null,
+  }
+}
+
+const protectionDimensionKeys = new Set<ProtectionEvaluationDimensionKey>([
+  'protectionQuality',
+  'cloneQuality',
+  'protectionSemantic',
+  'cloneSemantic',
+  'directIdentity',
+  'cloneIdentity',
+])
+
+function normalizeProtectionDimension(value: unknown): ProtectionEvaluationDimension | null {
+  const record = asRecord(value)
+  const key = firstString(record, ['key'])
+  if (!key || !protectionDimensionKeys.has(key as ProtectionEvaluationDimensionKey)) return null
+  return {
+    key: key as ProtectionEvaluationDimensionKey,
+    label: firstString(record, ['label', 'name']) ?? key,
+    score: firstNumber(record, ['score', 'value']),
+    status: firstString(record, ['status']) ?? 'unavailable',
+    reason: firstString(record, ['reason']),
+    weight: firstNumber(record, ['weight']) ?? 0,
+  }
+}
+
+function normalizeProtectionEvaluation(value: unknown): ProtectionEvaluation | null {
+  const record = asRecord(value)
+  if (Object.keys(record).length === 0) return null
+  const dimensions = Array.isArray(record.dimensions)
+    ? record.dimensions.map(normalizeProtectionDimension).filter((item): item is ProtectionEvaluationDimension => item !== null)
+    : []
+  const recommendations = Array.isArray(record.recommendations)
+    ? record.recommendations.map((item) => {
+        const recommendation = asRecord(item)
+        const message = firstString(recommendation, ['message'])
+        if (!message) return null
+        return {
+          key: firstString(recommendation, ['key']) ?? message,
+          message,
+          parameters: Array.isArray(recommendation.parameters)
+            ? recommendation.parameters.filter((parameter): parameter is string => typeof parameter === 'string')
+            : [],
+        }
+      }).filter((item): item is NonNullable<ProtectionEvaluation['recommendations']>[number] => item !== null)
+    : []
+  const calibrationRecord = asRecord(record.calibration)
+  const calibration = Object.keys(calibrationRecord).length
+    ? {
+        tokenChangeRate90: firstNumber(calibrationRecord, ['tokenChangeRate90', 'token_change_rate_90']),
+        semanticDrift90: firstNumber(calibrationRecord, ['semanticDrift90', 'semantic_drift_90']),
+        directDistance90: firstNumber(calibrationRecord, ['directDistance90', 'direct_distance_90']),
+        cloneTokenChangeRate90: firstNumber(calibrationRecord, ['cloneTokenChangeRate90', 'clone_token_change_rate_90']),
+        cloneSemanticDrift90: firstNumber(calibrationRecord, ['cloneSemanticDrift90', 'clone_semantic_drift_90']),
+        cloneQualityDropRate90: firstNumber(calibrationRecord, ['cloneQualityDropRate90', 'clone_quality_drop_rate_90']),
+      }
+    : null
+  const overallScore = firstNumber(record, ['overallScore', 'overall_score'])
+  const status = firstString(record, ['status']) ?? (overallScore === null ? 'incomplete' : 'complete')
+  return {
+    status,
+    overallScore,
+    level: firstString(record, ['level']),
+    verdict: firstString(record, ['verdict']) ?? (status === 'complete' ? '' : '待完整评估'),
+    dimensions,
+    missingDimensions: Array.isArray(record.missingDimensions)
+      ? record.missingDimensions.filter((item): item is string => typeof item === 'string')
+      : [],
+    recommendations,
+    calibration,
   }
 }
 
@@ -336,6 +425,11 @@ function normalizeSemanticEval(value: unknown): TaskResult['semanticEval'] {
     tokenChangeCount: firstNumber(data, ['tokenChangeCount', 'token_change_count']),
     tokenTotal: firstNumber(data, ['tokenTotal', 'token_total']),
     semanticDrift: firstNumber(data, ['semanticDrift', 'semantic_drift']),
+    tokenScore: firstNumber(data, ['tokenScore', 'token_score']),
+    driftScore: firstNumber(data, ['driftScore', 'drift_score']),
+    protectionSemanticScore: firstNumber(data, ['protectionSemanticScore', 'protection_semantic_score']),
+    scoreStatus: firstString(data, ['scoreStatus', 'score_status']),
+    scoreReason: firstString(data, ['scoreReason', 'score_reason']),
     encoderDistances: Array.isArray(data.encoderDistances) ? data.encoderDistances as Array<Record<string, unknown>> : null,
     reason: firstString(data, ['reason']),
     error: firstString(data, ['error']),
@@ -345,34 +439,98 @@ function normalizeSemanticEval(value: unknown): TaskResult['semanticEval'] {
 function normalizeCloneEval(value: unknown): TaskResult['cloneEval'] {
   const data = asRecord(value)
   const nestedEval = asRecord(data.cloneEval)
+  const metricLayers = [nestedEval, data]
+  const metricNumber = (keys: string[]) => layeredMetricNumber(metricLayers, keys)
+  const metricString = (keys: string[]) => {
+    for (const layer of metricLayers) {
+      const result = firstString(layer, keys)
+      if (result !== null) return result
+    }
+    return null
+  }
+  const metricValue = (keys: string[]) => {
+    for (const layer of metricLayers) {
+      const result = firstValue(layer, keys)
+      if (result !== undefined) return result
+    }
+    return undefined
+  }
+  const rawMetricSources = asRecord(metricValue(['metricSources', '_metricSources']))
+  const metricSources = Object.keys(rawMetricSources).length > 0
+    ? rawMetricSources as Record<string, MetricSource>
+    : undefined
+  const metricSourceReason = (...keys: string[]) => {
+    for (const key of keys) {
+      const reason = metricSources?.[key]?.reason
+      if (typeof reason === 'string' && reason.length > 0) return reason
+    }
+    return null
+  }
   const request = asRecord(data.request)
-  const originalCloneAudio = data.originalCloneAudio ? normalizeAudio(data.originalCloneAudio, 'original_clone.wav') : null
-  const protectedCloneAudio = data.protectedCloneAudio ? normalizeAudio(data.protectedCloneAudio, 'protected_clone.wav') : null
-  const hasMetric = hasAnyNumber(data, ['directSimilarity', 'direct_similarity', 'originalSimilarity', 'simBefore', 'similarityBefore', 'protectedSimilarity', 'simAfter', 'similarityAfter', 'embeddingDistanceBefore', 'distanceBefore', 'embeddingDistanceAfter', 'distanceAfter', 'cloneConfidenceBefore', 'confidenceBefore', 'cloneConfidenceAfter', 'confidenceAfter'])
+  const originalCloneAudioValue = metricValue(['originalCloneAudio'])
+  const protectedCloneAudioValue = metricValue(['protectedCloneAudio'])
+  const originalCloneAudio = originalCloneAudioValue ? normalizeAudio(originalCloneAudioValue, 'original_clone.wav') : null
+  const protectedCloneAudio = protectedCloneAudioValue ? normalizeAudio(protectedCloneAudioValue, 'protected_clone.wav') : null
+  const metricKeys = ['directSimilarity', 'direct_similarity', 'originalSimilarity', 'simBefore', 'similarityBefore', 'protectedSimilarity', 'simAfter', 'similarityAfter', 'embeddingDistanceBefore', 'distanceBefore', 'embeddingDistanceAfter', 'distanceAfter', 'cloneConfidenceBefore', 'confidenceBefore', 'cloneConfidenceAfter', 'confidenceAfter', 'cloneIdentityScore', 'cloneSemanticScore', 'cloneQualityScore']
+  const hasMetric = metricLayers.some((layer) => hasAnyNumber(layer, metricKeys))
   if (!originalCloneAudio && !protectedCloneAudio && !hasMetric && !data.cloneEval) return null
   return {
-    cloneModel: firstString(data, ['cloneModel', 'clone_model']) ?? firstString(request, ['model']),
-    speakerEvalModel: firstString(data, ['speakerEvalModel', 'speaker_eval_model']),
-    speakerModel: firstString(data, ['speakerModel', 'speaker_model']),
-    targetText: firstString(data, ['targetText', 'target_text']) ?? firstString(request, ['text']),
+    cloneModel: metricString(['cloneModel', 'clone_model']) ?? firstString(request, ['model']),
+    speakerEvalModel: metricString(['speakerEvalModel', 'speaker_eval_model']),
+    speakerModel: metricString(['speakerModel', 'speaker_model']),
+    targetText: metricString(['targetText', 'target_text']) ?? firstString(request, ['text']),
     originalCloneAudio,
     protectedCloneAudio,
-    directSimilarity: firstNumber(data, ['directSimilarity', 'direct_similarity']) ?? firstNumber(nestedEval, ['directSimilarity', 'direct_similarity']),
-    originalSimilarity: firstNumber(data, ['originalSimilarity', 'simBefore', 'similarityBefore']),
-    protectedSimilarity: firstNumber(data, ['protectedSimilarity', 'simAfter', 'similarityAfter']),
-    similarityDropRate: firstNumber(data, ['similarityDropRate', 'similarity_drop_rate', 'simDropRate']),
-    embeddingDistanceBefore: firstNumber(data, ['embeddingDistanceBefore', 'distanceBefore']),
-    embeddingDistanceAfter: firstNumber(data, ['embeddingDistanceAfter', 'distanceAfter']),
-    embeddingDistanceIncreaseRate: firstNumber(data, ['embeddingDistanceIncreaseRate', 'embedding_distance_increase_rate']),
-    cloneConfidenceBefore: firstNumber(data, ['cloneConfidenceBefore', 'confidenceBefore']),
-    cloneConfidenceAfter: firstNumber(data, ['cloneConfidenceAfter', 'confidenceAfter']),
-    cloneConfidenceDropRate: firstNumber(data, ['cloneConfidenceDropRate', 'confidenceDropRate']),
-    cloneRadar: normalizeRadarPoints(data.cloneRadar),
-    cloneTrend: null,
-    cloneDefenseScore: firstNumber(data, ['cloneDefenseScore', 'clone_defense_score']),
-    createdAt: firstString(data, ['createdAt', 'created_at']),
-    status: firstString(data, ['status']),
-    reason: firstString(data, ['reason', 'error']),
+    directSimilarity: metricNumber(['directSimilarity', 'direct_similarity']),
+    originalSimilarity: metricNumber(['originalSimilarity', 'simBefore', 'similarityBefore']),
+    protectedSimilarity: metricNumber(['protectedSimilarity', 'simAfter', 'similarityAfter']),
+    similarityDropRate: metricNumber(['similarityDropRate', 'similarity_drop_rate', 'simDropRate']),
+    embeddingDistanceBefore: metricNumber(['embeddingDistanceBefore', 'distanceBefore']),
+    embeddingDistanceAfter: metricNumber(['embeddingDistanceAfter', 'distanceAfter']),
+    embeddingDistanceDelta: metricNumber(['embeddingDistanceDelta', 'embedding_distance_delta']),
+    embeddingDistanceIncreaseRate: metricNumber(['embeddingDistanceIncreaseRate', 'embedding_distance_increase_rate']),
+    cloneConfidenceBefore: metricNumber(['cloneConfidenceBefore', 'confidenceBefore']),
+    cloneConfidenceAfter: metricNumber(['cloneConfidenceAfter', 'confidenceAfter']),
+    cloneConfidenceDropRate: metricNumber(['cloneConfidenceDropRate', 'confidenceDropRate']),
+    cloneRadar: normalizeRadarPoints(metricValue(['cloneRadar'])),
+    cloneTrend: Array.isArray(metricValue(['cloneTrend'])) ? metricValue(['cloneTrend']) as Array<Record<string, number>> : null,
+    cloneDefenseScore: metricNumber(['cloneDefenseScore', 'clone_defense_score']),
+    cloneIdentityScore: metricNumber(['cloneIdentityScore', 'clone_identity_score']),
+    identityBaselineWeight: metricNumber(['identityBaselineWeight', 'identity_baseline_weight']),
+    cloneIdentityStatus: metricString(['cloneIdentityStatus', 'clone_identity_status']),
+    cloneIdentityReason: metricString(['cloneIdentityReason', 'clone_identity_reason']) ?? metricSourceReason('cloneEval.cloneIdentityScore', 'cloneEval.*'),
+    cleanCloneTranscription: metricString(['cleanCloneTranscription', 'clean_clone_transcription']),
+    protectedCloneTranscription: metricString(['protectedCloneTranscription', 'protected_clone_transcription']),
+    cloneAsrModel: metricString(['cloneAsrModel', 'clone_asr_model']),
+    cloneAsrStatus: metricString(['cloneAsrStatus', 'clone_asr_status']),
+    cloneAsrReason: metricString(['cloneAsrReason', 'clone_asr_reason']) ?? metricSourceReason('cloneEval.cloneAsr'),
+    cleanCloneTextAccuracy: metricNumber(['cleanCloneTextAccuracy', 'clean_clone_text_accuracy']),
+    cleanCloneTextError: metricNumber(['cleanCloneTextError', 'clean_clone_text_error']),
+    protectedCloneTextAccuracy: metricNumber(['protectedCloneTextAccuracy', 'protected_clone_text_accuracy']),
+    protectedCloneTextError: metricNumber(['protectedCloneTextError', 'protected_clone_text_error']),
+    cloneTextChangeAccuracy: metricNumber(['cloneTextChangeAccuracy', 'clone_text_change_accuracy']),
+    cloneTextChangeRate: metricNumber(['cloneTextChangeRate', 'clone_text_change_rate']),
+    semanticBaselineWeight: metricNumber(['semanticBaselineWeight', 'semantic_baseline_weight']),
+    cloneTokenChangeRate: metricNumber(['cloneTokenChangeRate', 'clone_token_change_rate']),
+    cloneSemanticDrift: metricNumber(['cloneSemanticDrift', 'clone_semantic_drift']),
+    cloneTokenScore: metricNumber(['cloneTokenScore', 'clone_token_score']),
+    cloneDriftScore: metricNumber(['cloneDriftScore', 'clone_drift_score']),
+    cloneSemanticScore: metricNumber(['cloneSemanticScore', 'clone_semantic_score']),
+    cloneSemanticStatus: metricString(['cloneSemanticStatus', 'clone_semantic_status']),
+    cloneSemanticReason: metricString(['cloneSemanticReason', 'clone_semantic_reason']) ?? metricSourceReason('cloneEval.cloneSemanticScore'),
+    cleanCloneQualityMos: metricNumber(['cleanCloneQualityMos', 'clean_clone_quality_mos']),
+    protectedCloneQualityMos: metricNumber(['protectedCloneQualityMos', 'protected_clone_quality_mos']),
+    cloneQualityDropRate: metricNumber(['cloneQualityDropRate', 'clone_quality_drop_rate']),
+    cloneQualityScore: metricNumber(['cloneQualityScore', 'clone_quality_score']),
+    qualityBaselineWeight: metricNumber(['qualityBaselineWeight', 'quality_baseline_weight']),
+    cloneQualityModel: metricString(['cloneQualityModel', 'clone_quality_model']),
+    cloneQualityModelPath: metricString(['cloneQualityModelPath', 'clone_quality_model_path']),
+    cloneQualityStatus: metricString(['cloneQualityStatus', 'clone_quality_status']),
+    cloneQualityReason: metricString(['cloneQualityReason', 'clone_quality_reason']) ?? metricSourceReason('cloneEval.cloneQualityScore'),
+    createdAt: metricString(['createdAt', 'created_at']),
+    status: metricString(['status']),
+    reason: metricString(['reason', 'error']),
+    metricSources,
   }
 }
 
@@ -531,6 +689,7 @@ function normalizeTaskResult(payload: unknown): TaskResult {
       elapsedSec: normalizeElapsedSec(data),
       perturbation: normalizePerturbation(data.perturbation ?? asRecord(details.perception)),
       protectionQuality: normalizeProtectionQuality(data.protectionQuality ?? data.quality ?? asRecord(details.perception)),
+      protectionEvaluation: normalizeProtectionEvaluation(data.protectionEvaluation ?? details.protectionEvaluation),
       psychoacoustic: normalizePsychoacoustic(data.psychoacoustic ?? asRecord(details.perception)),
       lossFinal: normalizeLossFinal(data.lossFinal ?? generation.lossFinal),
       lossWeights: normalizeLossWeights(data.lossWeights ?? generation.lossWeights),
@@ -604,6 +763,7 @@ function normalizeTaskResult(payload: unknown): TaskResult {
   const asrEval = normalizeAsrEval(asrResults?.at(-1)?.asr ?? detailAsr)
   const asrHasResult = asrEval !== null
   const cloneEval = normalizeCloneEval(data.cloneEval) ?? cloneResults?.at(-1)?.cloneEval ?? null
+  const protectionEvaluation = normalizeProtectionEvaluation(data.protectionEvaluation ?? details.protectionEvaluation)
   const perturbation = normalizePerturbation({
     ...asRecord(details.perception),
     ...asRecord(details.perturbation),
@@ -649,6 +809,7 @@ function normalizeTaskResult(payload: unknown): TaskResult {
     protectedAudio: normalizeAudio(protectedRaw, 'protected.wav'),
     perturbation,
     protectionQuality,
+    protectionEvaluation,
     psychoacoustic,
     lossFinal,
     lossWeights,
@@ -685,6 +846,10 @@ function normalizeTaskResult(payload: unknown): TaskResult {
       embeddingDistanceAfter: firstNumber(detailSpeaker, ['embeddingDistanceAfter', 'embeddingDistance']),
       simOriginalProtected: firstNumber(detailSpeaker, ['simOriginalProtected', 'simAfter']),
       embeddingDistance: firstNumber(detailSpeaker, ['embeddingDistance', 'embeddingDistanceAfter']),
+      directDistance: firstNumber(detailSpeaker, ['directDistance', 'direct_distance', 'embeddingDistance', 'embeddingDistanceAfter']),
+      directIdentityScore: firstNumber(detailSpeaker, ['directIdentityScore', 'direct_identity_score']),
+      scoreStatus: firstString(detailSpeaker, ['scoreStatus', 'score_status']),
+      scoreReason: firstString(detailSpeaker, ['scoreReason', 'score_reason']),
       source: typeof asRecord(metricSources['speaker.*']).source === 'string' ? asRecord(metricSources['speaker.*']).source as string : undefined,
       status: typeof detailSpeaker.status === 'string' ? detailSpeaker.status : undefined,
     },

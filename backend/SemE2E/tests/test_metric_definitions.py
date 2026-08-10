@@ -94,6 +94,35 @@ class MetricDefinitionsTest(unittest.TestCase):
             self.assertEqual(result["clippingRate"], 0.25)
             self.assertIsNotNone(result["snr"])
 
+    def test_linf_epsilon_usage_absorbs_only_pcm16_quantization_tolerance(self) -> None:
+        epsilon = 4 / 255
+        within_tolerance = epsilon + metrics.PCM16_QUANTIZATION_STEP * 0.99
+        result = metrics.compute_perturbation_metrics(
+            np.zeros(2, dtype=np.float32),
+            np.array([within_tolerance, 0.0], dtype=np.float32),
+            np.array([within_tolerance, 0.0], dtype=np.float32),
+            24_000,
+            epsilon=epsilon,
+            epsilon_norm="linf",
+        )
+
+        self.assertGreater(result["epsilonUsageRateRaw"], 1.0)
+        self.assertEqual(result["epsilonUsageRate"], 1.0)
+        self.assertFalse(result["epsilonExceeded"])
+
+        real_overrun = epsilon + metrics.PCM16_QUANTIZATION_STEP * 1.5
+        exceeded = metrics.compute_perturbation_metrics(
+            np.zeros(2, dtype=np.float32),
+            np.array([real_overrun, 0.0], dtype=np.float32),
+            np.array([real_overrun, 0.0], dtype=np.float32),
+            24_000,
+            epsilon=epsilon,
+            epsilon_norm="linf",
+        )
+
+        self.assertGreater(exceeded["epsilonUsageRate"], 1.0)
+        self.assertTrue(exceeded["epsilonExceeded"])
+
     def _fake_psycho_state(self) -> dict[str, object]:
         theta = np.array([[1.0, 3.0, 5.0], [10.0, 14.0, 18.0]], dtype=np.float64)
         psd_delta = np.array([[0.0, 4.0, 8.0], [20.0, 22.0, 24.0]], dtype=np.float64)
@@ -614,7 +643,7 @@ class MetricDefinitionsTest(unittest.TestCase):
         self.assertIsNone(result["cloneConfidenceDropRate"])
         self.assertEqual(result["_metricSources"]["cloneEval.cloneConfidenceDropRate"]["status"], "unavailable")
 
-    def test_clone_defense_score_uses_soft_mapped_distance_and_direct_offset(self) -> None:
+    def test_clone_defense_score_aliases_v21_distance_progress_score(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             original = root / "original.wav"
@@ -641,21 +670,22 @@ class MetricDefinitionsTest(unittest.TestCase):
                 speaker_model=FakeSpeaker(),
             )
 
-        distance = 1.0 - 0.6
-        mapped_distance = distance * (1.26 - 0.30 * distance)
-        expected = 100.0 * (0.9 * mapped_distance + 0.1 * ((1.0 - 0.5) / 2.0))
+        distance_before = 1.0 - 0.8
+        distance_after = 1.0 - 0.6
+        expected = 95.0 * ((distance_after - distance_before) / (0.75 - distance_before))
         self.assertTrue(math.isclose(result["cloneDefenseScore"], expected, rel_tol=1e-6))
+        self.assertEqual(result["cloneDefenseScore"], result["cloneIdentityScore"])
         self.assertEqual(
             result["_metricSources"]["cloneEval.cloneDefenseScore"]["formula"],
-            "Delta_distance_mapped=clamp(Delta_distance*(1.26-0.30*Delta_distance),0,1); Delta_protect=100*(0.9*Delta_distance_mapped+0.1*(Delta_direct/2))",
+            "95*clip((d1-d0)/(.75-d0),0,1)+5*clip((d1-.75)/.25,0,1)",
         )
 
-    def test_clone_distance_soft_mapping_matches_score_targets(self) -> None:
-        targets = ((0.50, 49.95), (0.75, 69.8625), (0.90, 80.19))
-        for distance, expected_main_score in targets:
-            with self.subTest(distance=distance):
-                main_score = 100.0 * 0.9 * metrics.calibrate_clone_distance(distance)
-                self.assertTrue(math.isclose(main_score, expected_main_score, rel_tol=1e-6))
+    def test_clone_identity_score_reaches_95_at_excellent_threshold_and_adds_bonus(self) -> None:
+        at_threshold = metrics.compute_clone_identity_score(0.8, 0.25)
+        beyond_threshold = metrics.compute_clone_identity_score(0.8, 0.0)
+        self.assertTrue(math.isclose(at_threshold["cloneIdentityScore"], 95.0, rel_tol=1e-6))
+        self.assertTrue(math.isclose(beyond_threshold["cloneIdentityScore"], 100.0, rel_tol=1e-6))
+        self.assertGreater(at_threshold["identityBaselineWeight"], 0.0)
 
     def test_create_asr_eval_preserves_shared_semantic_metrics_without_recomputing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -754,6 +784,9 @@ class MetricDefinitionsTest(unittest.TestCase):
                 mock.patch.object(adapter, "_module_available", return_value=True),
                 mock.patch.object(adapter, "_tts_catalog_status", return_value=("available", None, "fake-model")),
                 mock.patch.object(adapter, "_coqui_tts_clone_pair", side_effect=fake_clone_pair) as clone_pair,
+                mock.patch.object(adapter, "_transcribe_clone_pair_isolated", return_value={"status": "unavailable", "reason": "not run"}),
+                mock.patch.object(adapter, "_compute_clone_semantic_isolated", return_value={"status": "unavailable", "tokenChangeRate": None, "semanticDrift": None}),
+                mock.patch.object(adapter, "_evaluate_dnsmos_pair_isolated", return_value={"status": "unavailable", "reason": "not run"}),
                 mock.patch.object(adapter, "compute_clone_eval", return_value=fake_clone_eval),
             ):
                 response = adapter.create_clone_voice("task_test", {"text": "hello", "model": "xtts-v2"})

@@ -70,7 +70,7 @@ export function AudioPlayer({
   const progress = playableDuration > 0 ? (currentTime / playableDuration) * 100 : 0
 
   return (
-    <div className="audio-player rounded-[8px] border border-cyan-300/12 bg-slate-950/18 p-3">
+    <div className="audio-player rounded-[8px] border border-cyan-300/12 bg-slate-950/18 p-3" data-playing={playing ? 'true' : 'false'}>
       <div className="flex flex-wrap items-center gap-3">
         <Button
           variant="secondary"
@@ -104,8 +104,8 @@ export function AudioPlayer({
       <div className="mt-3 grid grid-cols-[44px_minmax(0,1fr)_44px] items-center gap-3">
         <span className="font-mono text-[10px] text-slate-500">{formatDurationSeconds(currentTime)}</span>
         <div className="relative h-5">
-          <div className="absolute left-0 right-0 top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-slate-800">
-            <div className="h-full rounded-full bg-cyan-400" style={{ width: `${Math.min(100, Math.max(0, progress))}%` }} />
+          <div className="audio-progress-track absolute left-0 right-0 top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-slate-800">
+            <div className="audio-progress-fill h-full rounded-full bg-cyan-400" style={{ width: `${Math.min(100, Math.max(0, progress))}%` }} />
           </div>
           <input
             className="absolute inset-0 h-5 w-full cursor-pointer opacity-0 disabled:cursor-not-allowed"

@@ -54,6 +54,84 @@ port_is_listening() {
   ss -ltnH "sport = :$port" 2>/dev/null | grep -q .
 }
 
+descendant_pids() {
+  local parent_pid="$1"
+  local children
+  local child_pid
+  children="$(ps -eo pid=,ppid= | awk -v parent="$parent_pid" '$2 == parent {print $1}')"
+  for child_pid in $children; do
+    descendant_pids "$child_pid"
+    printf '%s\n' "$child_pid"
+  done
+}
+
+normalize_pid_lines() {
+  awk '/^[0-9]+$/ && $1 > 0 && !seen[$1]++ {print $1}'
+}
+
+managed_tree_pids() {
+  local root_pid="$1"
+  {
+    descendant_pids "$root_pid"
+    printf '%s\n' "$root_pid"
+  } | normalize_pid_lines
+}
+
+signal_pid_lines() {
+  local signal_name="$1"
+  local pid_lines="$2"
+  local candidate_pid
+  printf '%s\n' "$pid_lines" | while IFS= read -r candidate_pid; do
+    case "$candidate_pid" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    kill -"$signal_name" "$candidate_pid" 2>/dev/null || true
+  done
+}
+
+living_pid_lines() {
+  local pid_lines="$1"
+  local candidate_pid
+  printf '%s\n' "$pid_lines" | while IFS= read -r candidate_pid; do
+    case "$candidate_pid" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    if kill -0 "$candidate_pid" 2>/dev/null; then
+      printf '%s\n' "$candidate_pid"
+    fi
+  done
+}
+
+stop_pid_tree_snapshot() {
+  local tree_pids="$1"
+  local remaining
+  local unused
+  [ -n "$tree_pids" ] || return 0
+
+  signal_pid_lines TERM "$tree_pids"
+  remaining="$tree_pids"
+  for unused in 1 2 3 4 5 6 7 8 9 10; do
+    remaining="$(living_pid_lines "$tree_pids")"
+    [ -n "$remaining" ] || break
+    sleep 1
+  done
+
+  if [ -n "$remaining" ]; then
+    printf 'Backend tree did not stop after 10 seconds; sending SIGKILL to remaining PIDs: %s\n' \
+      "$(printf '%s' "$remaining" | tr '\n' ' ')" >&2
+    signal_pid_lines KILL "$remaining"
+    sleep 1
+  fi
+
+  remaining="$(living_pid_lines "$tree_pids")"
+  if [ -n "$remaining" ]; then
+    printf 'Failed to stop backend tree PIDs: %s\n' \
+      "$(printf '%s' "$remaining" | tr '\n' ' ')" >&2
+    return 1
+  fi
+  return 0
+}
+
 managed_pid=""
 if [ -f "$pidfile" ]; then
   candidate="$(cat "$pidfile")"
@@ -96,25 +174,13 @@ if [ -z "$managed_pid" ]; then
     printf 'Remote port %s is occupied by an unmanaged process; nothing was stopped.\n' "$port" >&2
     exit 23
   fi
-  printf 'Remote backend is already stopped; port %s is free.\n' "$port"
+  printf 'Managed remote backend is already stopped; port %s is free.\n' "$port"
   exit 0
 fi
 
-printf 'Stopping managed remote backend: PID %s, port %s\n' "$managed_pid" "$port"
-kill "$managed_pid"
-for unused in 1 2 3 4 5 6 7 8 9 10; do
-  kill -0 "$managed_pid" 2>/dev/null || break
-  sleep 1
-done
-
-if kill -0 "$managed_pid" 2>/dev/null; then
-  printf 'Backend did not stop after 10 seconds; sending SIGKILL.\n' >&2
-  kill -KILL "$managed_pid"
-  sleep 1
-fi
-
-if kill -0 "$managed_pid" 2>/dev/null; then
-  printf 'Failed to stop remote backend PID %s.\n' "$managed_pid" >&2
+printf 'Stopping managed remote backend tree: root PID %s, port %s\n' "$managed_pid" "$port"
+managed_tree="$(managed_tree_pids "$managed_pid")"
+if ! stop_pid_tree_snapshot "$managed_tree"; then
   exit 24
 fi
 
@@ -124,7 +190,7 @@ if port_is_listening; then
   exit 25
 fi
 
-printf 'Remote backend stopped; port %s is free.\n' "$port"
+printf 'Managed remote backend tree stopped; port %s is free.\n' "$port"
 exit 0
 # end
 '@

@@ -1,15 +1,18 @@
 ﻿import { useQuery } from '@tanstack/react-query'
 import { useNavigate, useParams } from 'react-router-dom'
+import { useQueryClient } from '@tanstack/react-query'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import {
+  BrainCircuit,
   CheckCircle2,
   ChevronDown,
   ClipboardList,
   Clock3,
   Copy,
   Download,
+  Fingerprint,
   Info,
   Loader2,
   RefreshCw,
@@ -18,23 +21,26 @@ import {
   Sparkles,
   TestTube2,
   Volume2,
+  Waves,
   X,
 } from 'lucide-react'
 import { cloneVoice, downloadProtectedAudio, getPsychoacousticSlice, getTaskResult, getTaskStatus, listTasks, runAsrEval } from '@/services/apiClient'
 import { useCapabilitiesQuery } from '@/hooks/useCapabilitiesQuery'
 import { useAppStore } from '@/store/appStore'
 import { useTaskStore } from '@/store/taskStore'
-import type { AsrEval, AsrEvalResponse, AsrMetrics, CapabilitiesResponse, CloneEval, CloneVoiceRequest, CloneVoiceResult, DiffOp, EvaluationBatch, LossFinal, LossTrendPoint, ProtectionRuntimeConfig, PsychoacousticPoint, PsychoacousticSliceResponse, RadarPoint, RuntimeModelOption, SubtaskStatusSnapshot, TaskResult, TaskStatusResponse } from '@/types/task'
+import type { AsrEval, AsrEvalResponse, AsrMetrics, CapabilitiesResponse, CloneEval, CloneVoiceRequest, CloneVoiceResult, DiffOp, EvaluationBatch, LossFinal, LossTrendPoint, ProtectionEvaluation, ProtectionEvaluationDimension, ProtectionEvaluationDimensionKey, ProtectionRuntimeConfig, PsychoacousticPoint, PsychoacousticSliceResponse, RuntimeModelOption, SubtaskStatusSnapshot, TaskResult, TaskStatusResponse } from '@/types/task'
 import type { AudioFileMeta } from '@/types/audio'
 import { downloadBlob } from '@/utils/download'
 import { cn } from '@/lib/utils'
 import { AudioPlayer } from '@/components/audio/AudioPlayer'
 import { formatDurationSeconds, getAudioDuration, getAudioSource } from '@/utils/audio'
 import { TrendChart } from '@/components/charts/TrendChart'
-import { MathText } from '@/components/common/MathText'
+import { MathBlock, MathText } from '@/components/common/MathText'
 import { ModelInformationModal } from '@/components/common/ModelInformationModal'
-import { computeAbsoluteDrop, formatCloneMetricNumber, generateCloneMetricInsights } from '@/utils/cloneMetricDisplay'
+import { computeAbsoluteDelta, formatCloneMetricNumber, generateCloneMetricInsights } from '@/utils/cloneMetricDisplay'
 import { analyzeLossConvergence, analyzeLossTrend, type TrendDirection } from '@/utils/resultMetrics'
+import { resolveEpsilonUsageRate } from '@/utils/perturbationMetrics'
+import { resolveAsrErrorShares } from '@/utils/metricNormalization'
 import { seconds } from '@/utils/format'
 
 const statusText: Record<TaskResult['status'], string> = {
@@ -127,17 +133,16 @@ function hasRunningLinkedEvaluation(status?: TaskStatusResponse) {
 
 function computeCloneDefenseScore(cloneEval?: CloneEval | null) {
   if (!cloneEval) return null
-  const embeddingDistance = optionalNumber(cloneEval.embeddingDistanceAfter)
-  const directSimilarity = optionalNumber(cloneEval.directSimilarity)
-  if (embeddingDistance !== null && directSimilarity !== null) {
-    const calibratedDistance = clamp(embeddingDistance * (1.26 - 0.3 * embeddingDistance), 0, 1)
-    const directShift = 1 - directSimilarity
-    return 100 * (0.9 * calibratedDistance + 0.1 * clamp(directShift / 2, 0, 1))
-  }
-  return optionalNumber(cloneEval.cloneDefenseScore)
+  return optionalNumber(cloneEval.cloneIdentityScore) ?? optionalNumber(cloneEval.cloneDefenseScore)
 }
 
 function summarizeCloneDefenseScore(result: TaskResult, status?: TaskStatusResponse) {
+  const aggregate = result.protectionEvaluation?.dimensions.find((dimension) => dimension.key === 'cloneIdentity')
+  const aggregateScore = optionalNumber(aggregate?.score)
+  if (aggregateScore !== null) {
+    const count = (result.cloneResults ?? []).filter((item) => computeCloneDefenseScore(item.cloneEval ?? cloneResultToEval(item)) !== null).length
+    return { count: Math.max(1, count), score: aggregateScore }
+  }
   const candidates = [
     ...(result.cloneResults ?? []),
     ...(status?.cloneTasks ?? []).map((task) => task.cloneResult),
@@ -262,7 +267,7 @@ function SummaryBar({ result, onTaskInfoClick, onDownloadClick }: { result: Task
       <button
         type="button"
         onClick={onDownloadClick}
-        title={hasCloneScore ? `基于 ${cloneScore.count} 次可用克隆评估的平均分` : '等待语音克隆测试'}
+        title={hasCloneScore ? `基于 ${cloneScore.count} 次可用克隆评估的综合结果` : '等待语音克隆测试'}
         className="flex h-full min-h-[58px] items-center justify-center gap-3 border-l border-cyan-300/10 pl-5 transition hover:bg-cyan-400/[0.035]"
       >
         {hasCloneScore ? <ShieldCheck className="h-11 w-11 text-cyan-300" /> : null}
@@ -370,7 +375,9 @@ function MetricInfoButton({ title, children }: { title: ReactNode; children: Rea
                 <X className="h-4 w-4" />
               </button>
             </div>
-            <div className="mt-5 rounded-[8px] border border-cyan-300/12 bg-slate-950 p-4 text-sm leading-7 text-slate-300">{children}</div>
+            <div className="mt-5 rounded-[8px] border border-cyan-300/12 bg-slate-950 p-4 text-sm leading-7 text-slate-300">
+              {typeof children === 'string' ? <RichMathText text={children} /> : children}
+            </div>
           </div>
         </div>,
         document.body,
@@ -419,6 +426,7 @@ type CloneHistoryEntry = {
 function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdated: (asr: AsrMetrics) => void }) {
   const uploadedFile = useTaskStore((state) => state.uploadedFile)
   const pushToast = useAppStore((state) => state.pushToast)
+  const queryClient = useQueryClient()
   const initialEvaluationLanguage = normalizeEvaluationLanguage(result.asr.language ?? result.cloneResults?.at(-1)?.request?.language)
   const [activePanel, setActivePanel] = useState<ComparePanel>('protect')
   const [protectedObjectUrl, setProtectedObjectUrl] = useState<string>()
@@ -471,7 +479,6 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
   const ttsModelOptions = configuredTtsOptions
   const ttsOptions = useMemo(() => ttsModelOptions.filter(isAvailableModel).map((option) => option.value), [ttsModelOptions])
   const selectedTtsOption = ttsModelOptions.find((option) => option.value === cloneForm.model) ?? ttsModelOptions[0]
-  const evaluationModel = useMemo(() => backendOptionItems(runtimeConfig?.models.evaluation)[0] ?? null, [runtimeConfig?.models.evaluation])
   const oneClickAsrLimit = Math.max(1, asrOptions.filter(isAvailableModel).length)
   const oneClickCloneLimit = Math.max(1, ttsModelOptions.filter(isAvailableModel).reduce((count, option) => count + (option.promptRequired ? 2 : 1), 0))
   const cloneLanguages = useMemo(
@@ -585,12 +592,14 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
   const asrLevel = activeAsrEval?.metricLevel === 'word' || activeAsrEval?.metricLevel === 'char' ? activeAsrEval.metricLevel : chooseEditLevel(referenceText, protectedText)
   const asrEditStats = activeAsrEval && referenceText && protectedText ? computeEditMetrics(referenceText, protectedText, asrLevel) : null
   const selectedCloneEntry = selectedCloneKey ? cloneHistory.find((item) => item.key === selectedCloneKey) : undefined
-  const latestCompletedCloneEntry = [...cloneHistory].reverse().find((item) => item.result)
-  const activeCloneEntry = selectedCloneKey ? selectedCloneEntry : latestCompletedCloneEntry
+  const activeCloneEntry = selectedCloneKey ? selectedCloneEntry : cloneHistory.at(-1)
   const activeCloneResult = activeCloneEntry?.result
-  const activeCloneEval = selectedCloneKey
-    ? activeCloneResult?.cloneEval ?? cloneResultToEval(activeCloneResult) ?? null
-    : activeCloneResult?.cloneEval ?? cloneResultToEval(activeCloneResult) ?? result.cloneEval ?? null
+  // Clone detail cards intentionally read one active history result. The
+  // aggregated protectionEvaluation dimensions never participate here.
+  const activeCloneEval = activeCloneResult?.cloneEval
+    ?? cloneResultToEval(activeCloneResult)
+    ?? (activeCloneEntry ? null : result.cloneEval ?? null)
+  const activeCloneKey = selectedCloneKey ?? activeCloneEntry?.key
   const completedCloneHistory = cloneHistory.map((item) => item.result).filter((item): item is CloneVoiceResult => Boolean(item))
   const compareTabs = [
     {
@@ -699,6 +708,7 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
       const asr = response.asr ?? (await waitForAsrEvalResult(result.taskId, response.asrSubId))
       await refetchLinkedTaskStatus()
       onAsrUpdated(asr)
+      await queryClient.invalidateQueries({ queryKey: ['task-result', result.taskId] })
       pushToast({ kind: 'success', title: 'ASR 测试完成', description: asr.model ?? modelOverride })
     } catch (error) {
       const message = error instanceof Error ? error.message : 'ASR 测试失败，请检查服务状态。'
@@ -739,6 +749,17 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
       }
       if (asrTaskStatus === 'completed' || asrTaskStatus === 'success') {
         const latest = await getTaskResult(taskId)
+        if (asrSubId) {
+          const matchingAsr = latest.asrResults?.find((item) => item.asrSubId === asrSubId)?.asr
+          if (matchingAsr) {
+            if (matchingAsr.status === 'unavailable' || matchingAsr.status === 'failed' || matchingAsr.status === 'error') {
+              throw new Error(matchingAsr.error || 'ASR 测试失败，请检查模型或依赖。')
+            }
+            return matchingAsr
+          }
+          await delay(250)
+          continue
+        }
         return latest.asr
       }
       await delay(1000)
@@ -795,6 +816,7 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
       setCloneResult(nextResult)
       setSelectedCloneKey(nextResult.cloneSubId ? `sub:${nextResult.cloneSubId}` : `clone:${nextResult.cloneId}`)
       await refetchLinkedTaskStatus()
+      await queryClient.invalidateQueries({ queryKey: ['task-result', result.taskId] })
       pushToast({ kind: 'success', title: '语音克隆测试完成', description: nextResult.message ?? nextResult.cloneId })
     } catch (error) {
       const message = error instanceof Error ? error.message : '语音克隆测试失败，请检查表单或服务状态。'
@@ -911,7 +933,7 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
           />
         ) : null}
         {activePanel === 'clone' ? (
-          <CloneTab result={result} cloneResult={activeCloneResult} cloneEval={activeCloneEval} cloneHistory={cloneHistory} cloneBatches={linkedTaskStatus?.cloneBatches ?? []} selectedCloneKey={selectedCloneKey} onSelectClone={openCloneHistoryResult} onOpenAsr={openAsrHistoryResult} loading={cloneLoading} status={cloneTaskStatus} evaluationModel={evaluationModel} cloneModelOptions={ttsModelOptions} modelTypes={runtimeConfig?.modelTypes} asrEval={activeAsrEval} asrEditStats={asrEditStats} asrHistory={asrHistory} asrBatches={linkedTaskStatus?.asrBatches ?? []} selectedAsrSubId={selectedAsrSubId ?? activeAsrResult?.asrSubId} asrHistoryLimit={oneClickAsrLimit} cloneHistoryLimit={oneClickCloneLimit} />
+          <CloneTab result={result} cloneResult={activeCloneResult} cloneEval={activeCloneEval} cloneHistory={cloneHistory} cloneBatches={linkedTaskStatus?.cloneBatches ?? []} selectedCloneKey={activeCloneKey} onSelectClone={openCloneHistoryResult} onOpenAsr={openAsrHistoryResult} loading={cloneLoading} status={cloneTaskStatus} cloneModelOptions={ttsModelOptions} modelTypes={runtimeConfig?.modelTypes} asrEval={activeAsrEval} asrEditStats={asrEditStats} asrHistory={asrHistory} asrBatches={linkedTaskStatus?.asrBatches ?? []} selectedAsrSubId={selectedAsrSubId ?? activeAsrResult?.asrSubId} asrHistoryLimit={oneClickAsrLimit} cloneHistoryLimit={oneClickCloneLimit} />
         ) : null}
       </div>
       {cloneModalOpen ? (
@@ -976,9 +998,24 @@ function ProtectTab({
   onProtectedPlayRequest: () => Promise<string | undefined>
 }) {
   const perturbation = result.perturbation
-  const quality = result.protectionQuality ?? result.quality
-  const snr = optionalNumber(perturbation?.snr) ?? optionalNumber(quality?.snr)
-  const epsilonUsageRate = optionalNumber(perturbation?.epsilonUsageRate) ?? computeEpsilonUsageRate(perturbation)
+  const epsilonUsageRate = resolveEpsilonUsageRate(perturbation)
+  const directDistance = optionalNumber(result.speaker.directDistance)
+    ?? optionalNumber(result.speaker.embeddingDistance)
+    ?? optionalNumber(result.speaker.embeddingDistanceAfter)
+  const hasEvaluationExperiment = Boolean(
+    asrEval
+      || cloneEval
+      || asrHistory?.length
+      || cloneHistory?.length
+      || linkedTaskStatus?.asrResult
+      || linkedTaskStatus?.cloneResult
+      || linkedTaskStatus?.asrTask
+      || linkedTaskStatus?.cloneTask
+      || linkedTaskStatus?.asrTasks?.length
+      || linkedTaskStatus?.cloneTasks?.length
+      || linkedTaskStatus?.asrBatches?.length
+      || linkedTaskStatus?.cloneBatches?.length,
+  )
 
   return (
     <div className="space-y-5">
@@ -990,11 +1027,47 @@ function ProtectTab({
       <div className="grid grid-cols-[minmax(360px,0.86fr)_minmax(520px,1.14fr)] items-stretch gap-5 max-xl:grid-cols-1">
         <div className="min-h-0">
           <section className="flex min-h-0 flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
-            <SectionTitle>扰动与可听性分析</SectionTitle>
+            <SectionTitle>扰动与直接保护效果</SectionTitle>
             <div className="mt-5 grid grid-cols-[repeat(auto-fit,minmax(170px,1fr))] gap-3">
-              <ScoreBox label={<span className="inline-flex items-center justify-center gap-0.5">扰动强度</span>} value={formatMetricValue(perturbation?.l2Norm ?? result.quality.l2Norm, 'loss')} foot="整段音频的总体改动量，数值越小表示越接近原始音频。" />
-              <ScoreBox label="扰动上限利用率" value={formatMetricValue(epsilonUsageRate, 'percent')} foot="已使用的扰动预算比例，越接近 100% 表示越接近设定上限。" />
-              <ScoreBox label="信噪比（SNR）" value={formatMetricValue(snr, 'db')} foot="原始语音与扰动噪声的强弱比；数值越高，音频越接近原音。" />
+              <ScoreBox
+                label={<span className="inline-flex items-center justify-center gap-0.5">扰动强度</span>}
+                value={formatMetricValue(perturbation?.l2Norm ?? result.quality.l2Norm, 'loss')}
+                foot={(
+                  <MetricFormulaContent
+                    description="先计算保护音频与原始音频的逐点差值，再统计整段音频的总体改动量。"
+                    formulas={[
+                      '\\delta=x_{\\mathrm{protected}}-x_{\\mathrm{original}}',
+                      '\\lVert\\delta\\rVert_2=\\sqrt{\\sum_{n=1}^{N}\\delta_n^2}',
+                    ]}
+                    note="数值越小，表示保护音频整体越接近原始音频。"
+                  />
+                )}
+              />
+              <ScoreBox
+                label="扰动上限利用率"
+                value={formatRatioPercent(epsilonUsageRate)}
+                foot={(
+                  <MetricFormulaContent
+                    description={<>在 <MathText formula={'L_{\\infty}'} className="mx-0.5 align-[-1px]" /> 模式下，使用最大单点扰动与设定上限的比值。</>}
+                    formulas={['U_{\\epsilon}=\\frac{\\lVert x_{\\mathrm{protected}}-x_{\\mathrm{original}}\\rVert_{\\infty}}{\\epsilon}\\times 100\\%']}
+                    note={<>即采样点扰动幅度与设定上限的最大比值。</>}
+                  />
+                )}
+              />
+              <ScoreBox
+                label="直接声纹偏移"
+                value={formatMetricValue(directDistance, 'number')}
+                foot={(
+                  <MetricFormulaContent
+                    description="独立声纹模型先计算原音频与保护音频的声音身份相似度，再转换为距离。"
+                    formulas={[
+                      '\\operatorname{SIM}(x,x^{\\prime})=\\cos(\\operatorname{Emb}(x),\\operatorname{Emb}(x^{\\prime}))',
+                      'D_{\\mathrm{direct}}=1-\\operatorname{SIM}(x,x^{\\prime})',
+                    ]}
+                    note="距离越大，表示两段音频的声音身份越分离。"
+                  />
+                )}
+              />
             </div>
             <QualityPanel result={result} embedded />
           </section>
@@ -1017,6 +1090,255 @@ function ProtectTab({
           </div>
         </div>
       </div>
+      {hasEvaluationExperiment ? <ComprehensiveProtectionEvaluation evaluation={result.protectionEvaluation} /> : null}
+    </div>
+  )
+}
+
+const protectionDimensionOrder: ProtectionEvaluationDimensionKey[] = [
+  'protectionQuality',
+  'cloneQuality',
+  'protectionSemantic',
+  'cloneSemantic',
+  'directIdentity',
+  'cloneIdentity',
+]
+
+const protectionDimensionLabels: Record<ProtectionEvaluationDimensionKey, string> = {
+  protectionQuality: '保护音频听感质量',
+  cloneQuality: '克隆音频质量下降',
+  protectionSemantic: '保护后音频语义干扰',
+  cloneSemantic: '克隆后音频语义干扰',
+  directIdentity: '保护后声音身份直接保护效果',
+  cloneIdentity: '克隆声音身份保护效果',
+}
+
+const protectionRadarLabels: Record<ProtectionEvaluationDimensionKey, string> = {
+  protectionQuality: '保护听感质量',
+  cloneQuality: '克隆质量下降',
+  protectionSemantic: '保护语义干扰',
+  cloneSemantic: '克隆语义干扰',
+  directIdentity: '直接身份保护',
+  cloneIdentity: '克隆身份保护',
+}
+
+const protectionDimensionWeights: Record<ProtectionEvaluationDimensionKey, number> = {
+  protectionQuality: 0.2,
+  cloneQuality: 0.1,
+  protectionSemantic: 0.2,
+  cloneSemantic: 0.15,
+  directIdentity: 0.15,
+  cloneIdentity: 0.2,
+}
+
+function protectionDimensionIcon(key: ProtectionEvaluationDimensionKey) {
+  if (key === 'protectionQuality') return <Volume2 className="h-4 w-4" />
+  if (key === 'cloneQuality') return <Waves className="h-4 w-4" />
+  if (key === 'protectionSemantic') return <BrainCircuit className="h-4 w-4" />
+  if (key === 'cloneSemantic') return <Sparkles className="h-4 w-4" />
+  if (key === 'directIdentity') return <Fingerprint className="h-4 w-4" />
+  return <ShieldCheck className="h-4 w-4" />
+}
+
+function completeProtectionDimensions(evaluation?: ProtectionEvaluation | null) {
+  const byKey = new Map((evaluation?.dimensions ?? []).map((dimension) => [dimension.key, dimension]))
+  return protectionDimensionOrder.map((key): ProtectionEvaluationDimension => byKey.get(key) ?? {
+    key,
+    label: protectionDimensionLabels[key],
+    score: null,
+    status: 'pending',
+    reason: '待生成',
+    weight: protectionDimensionWeights[key],
+  })
+}
+
+function useAnimatedScore(value: number | null, duration = 500) {
+  const [display, setDisplay] = useState<number | null>(() => {
+    if (value === null) return null
+    return window.matchMedia('(prefers-reduced-motion: reduce)').matches ? value : 0
+  })
+
+  useEffect(() => {
+    let frame = 0
+    if (value === null) {
+      frame = window.requestAnimationFrame(() => setDisplay(null))
+      return () => window.cancelAnimationFrame(frame)
+    }
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      frame = window.requestAnimationFrame(() => setDisplay(value))
+      return () => window.cancelAnimationFrame(frame)
+    }
+    const startedAt = performance.now()
+    const tick = (now: number) => {
+      const progress = clamp((now - startedAt) / duration, 0, 1)
+      const eased = 1 - (1 - progress) ** 3
+      setDisplay(value * eased)
+      if (progress < 1) frame = window.requestAnimationFrame(tick)
+    }
+    frame = window.requestAnimationFrame(tick)
+    return () => window.cancelAnimationFrame(frame)
+  }, [duration, value])
+
+  return display
+}
+
+function ComprehensiveProtectionEvaluation({ evaluation }: { evaluation?: ProtectionEvaluation | null }) {
+  const dimensions = completeProtectionDimensions(evaluation)
+  const overallScore = optionalNumber(evaluation?.overallScore)
+  const complete = evaluation?.status === 'complete' && overallScore !== null && dimensions.every((dimension) => optionalNumber(dimension.score) !== null)
+  const animatedOverall = useAnimatedScore(overallScore)
+  const missing = dimensions.filter((dimension) => optionalNumber(dimension.score) === null)
+  const recommendations = evaluation?.recommendations ?? []
+
+  return (
+    <section className="relative overflow-hidden rounded-[11px] border border-cyan-300/16 bg-slate-950/16 p-5 shadow-[0_18px_60px_rgba(2,132,199,0.06)] transition duration-200 ease-out hover:-translate-y-0.5 hover:border-cyan-300/26 hover:shadow-[0_22px_70px_rgba(2,132,199,0.1)] motion-reduce:transform-none motion-reduce:transition-none">
+      <div className="pointer-events-none absolute inset-x-12 top-0 h-px bg-gradient-to-r from-transparent via-cyan-200/55 to-transparent" />
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2">
+            <SectionTitle>综合防护评估</SectionTitle>
+            <MetricInfoButton title="综合防护评分">
+              <MetricFormulaContent
+                description="六项对应测试均生成后，使用加权几何平均计算综合分数。"
+                formulas={[
+                  'S_{\\mathrm{overall}}=\\exp\\!\\left(\\sum_{i=1}^{6}\\alpha_i\\ln(\\max(S_i,1))\\right)',
+                  '(\\alpha_1,\\ldots,\\alpha_6)=(0.20,0.10,0.20,0.15,0.15,0.20)',
+                ]}
+                note="任一必需分数缺失时不以 0 或 100 代替，综合分数保持待生成。"
+              />
+            </MetricInfoButton>
+          </div>
+          <p className="mt-2 text-xs leading-5 text-slate-500">六项分数均来自实际测试结果，分数越高表示对应防护效果越强。</p>
+        </div>
+        <span className={cn('rounded-full border px-3 py-1 text-xs font-black', complete ? 'border-emerald-300/20 bg-emerald-400/10 text-emerald-300' : 'border-amber-300/20 bg-amber-400/10 text-amber-200')}>
+          {complete ? evaluation?.verdict || '评估已完成' : evaluation?.verdict || '待完整评估'}
+        </span>
+      </div>
+
+      <div className="mt-5 grid min-h-[390px] grid-cols-[minmax(300px,1fr)_minmax(230px,0.72fr)_minmax(330px,1.12fr)] gap-5 max-xl:grid-cols-1">
+        <div className="rounded-[9px] border border-cyan-300/12 bg-slate-950/24 p-3">
+          <ProtectionHexRadar dimensions={dimensions} />
+        </div>
+        <div className="flex flex-col items-center justify-center rounded-[9px] border border-cyan-300/12 bg-[radial-gradient(circle_at_50%_18%,rgba(34,211,238,0.11),transparent_58%)] px-5 py-7 text-center">
+          <p className="text-xs font-black tracking-[0.14em] text-cyan-200/80">综合防护评分</p>
+          <p className={cn('mt-5 bg-gradient-to-r from-cyan-200 via-emerald-200 to-violet-200 bg-clip-text font-mono text-[42px] font-black leading-none text-transparent drop-shadow-[0_0_18px_rgba(103,232,249,0.12)]', overallScore === null && 'text-slate-500')}>
+            {animatedOverall === null ? '待生成' : <MathText formula={`${animatedOverall.toFixed(2)}\\,/\\,100`} />}
+          </p>
+          <p className={cn('mt-4 text-xl font-black', complete ? 'text-emerald-300' : 'text-amber-200')}>{complete ? evaluation?.level : '待完整评估'}</p>
+          <div className="mt-6 w-full">
+            <div className="relative h-2 rounded-full bg-gradient-to-r from-rose-400 via-amber-300 to-emerald-300">
+              {animatedOverall !== null ? <span className="absolute top-1/2 h-4 w-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white/80 bg-slate-950 shadow-[0_0_10px_rgba(255,255,255,0.35)]" style={{ left: `${clamp(animatedOverall, 0, 100)}%` }} /> : null}
+            </div>
+            <div className="mt-1.5 flex justify-between font-mono text-[10px] text-slate-500"><span>0</span><span>50</span><span>100</span></div>
+          </div>
+          {missing.length ? (
+            <p className="mt-5 text-xs leading-5 text-slate-500">尚缺 {missing.map((dimension) => dimension.label).join('、')}，不会以 0 或 100 代替。</p>
+          ) : null}
+        </div>
+        <div className="rounded-[9px] border border-cyan-300/12 bg-slate-950/24 p-4">
+          <h3 className="text-sm font-black text-white">六维得分明细</h3>
+          <div className="mt-4 space-y-4">
+            {dimensions.map((dimension) => <ProtectionDimensionRow key={dimension.key} dimension={dimension} />)}
+          </div>
+        </div>
+      </div>
+      <div className="mt-4 rounded-[9px] border border-cyan-300/12 bg-slate-950/20 px-4 py-3">
+        <h3 className="text-xs font-black tracking-[0.08em] text-cyan-100">调参建议</h3>
+        {recommendations.length ? (
+          <div className="mt-2 flex flex-wrap gap-2">
+            {recommendations.map((recommendation) => (
+              <span key={`${recommendation.key}-${recommendation.message}`} className="rounded-[6px] border border-cyan-300/12 bg-cyan-400/[0.055] px-3 py-2 text-xs leading-5 text-slate-300">
+                <RichMathText text={recommendation.message} />
+              </span>
+            ))}
+          </div>
+        ) : (
+          <p className="mt-2 text-xs leading-5 text-slate-500">{complete ? '当前各项没有触发明确的调参建议。' : '待生成更多对应测试结果后给出调参建议。'}</p>
+        )}
+      </div>
+    </section>
+  )
+}
+
+function MetricFormulaContent({ description, formulas, note }: { description: ReactNode; formulas: string[]; note?: ReactNode }) {
+  return (
+    <div className="space-y-3">
+      <p>{description}</p>
+      {formulas.map((formula) => (
+        <MathBlock key={formula} formula={formula} className="rounded-[6px] border border-cyan-300/10 bg-cyan-400/[0.035] px-2 text-[13px] text-cyan-50" />
+      ))}
+      {note ? <p>{note}</p> : null}
+    </div>
+  )
+}
+
+function ProtectionDimensionRow({ dimension }: { dimension: ProtectionEvaluationDimension }) {
+  const score = optionalNumber(dimension.score)
+  const animatedScore = useAnimatedScore(score)
+  return (
+    <div title={dimension.reason ? friendlyCloneMetricReason(dimension.reason) : undefined}>
+      <div className="mb-1.5 flex items-center gap-2 text-xs">
+        <span className={cn('grid h-6 w-6 shrink-0 place-items-center rounded-[6px]', score === null ? 'bg-slate-800 text-slate-500' : 'bg-cyan-400/10 text-cyan-300')}>{protectionDimensionIcon(dimension.key)}</span>
+        <span className="min-w-0 flex-1 truncate font-bold text-slate-300">{dimension.label || protectionDimensionLabels[dimension.key]}</span>
+        <span className={cn('shrink-0 font-mono font-black', score === null ? 'text-slate-500' : 'text-cyan-200')}>{animatedScore === null ? '待生成' : <MathText formula={`${animatedScore.toFixed(2)}\\,/\\,100`} />}</span>
+      </div>
+      <div className="h-1.5 overflow-hidden rounded-full bg-slate-800">
+        {animatedScore !== null ? <div className="h-full rounded-full bg-gradient-to-r from-cyan-400 via-sky-300 to-emerald-300" style={{ width: `${clamp(animatedScore, 0, 100)}%` }} /> : null}
+      </div>
+    </div>
+  )
+}
+
+function ProtectionHexRadar({ dimensions }: { dimensions: ProtectionEvaluationDimension[] }) {
+  const width = 440
+  const height = 330
+  const centerX = width / 2
+  const centerY = height / 2
+  const radius = 108
+  const scores = dimensions.map((dimension) => optionalNumber(dimension.score))
+  const ready = scores.every((score): score is number => score !== null)
+  const axes = dimensions.map((dimension, index) => {
+    const angle = -Math.PI / 2 + (index / dimensions.length) * Math.PI * 2
+    return {
+      dimension,
+      angle,
+      x: centerX + Math.cos(angle) * radius,
+      y: centerY + Math.sin(angle) * radius,
+      labelX: centerX + Math.cos(angle) * (radius + 52),
+      labelY: centerY + Math.sin(angle) * (radius + 32),
+    }
+  })
+  const polygon = ready
+    ? axes.map((axis, index) => {
+        const normalized = clamp(scores[index] / 100, 0, 1)
+        return `${(centerX + Math.cos(axis.angle) * radius * normalized).toFixed(1)},${(centerY + Math.sin(axis.angle) * radius * normalized).toFixed(1)}`
+      }).join(' ')
+    : ''
+
+  return (
+    <div className="relative grid h-full min-h-[350px] place-items-center overflow-hidden">
+      <svg viewBox={`0 0 ${width} ${height}`} className="h-full w-full max-w-[500px]">
+        {[0.25, 0.5, 0.75, 1].map((scale) => (
+          <polygon key={scale} points={axes.map((axis) => `${(centerX + Math.cos(axis.angle) * radius * scale).toFixed(1)},${(centerY + Math.sin(axis.angle) * radius * scale).toFixed(1)}`).join(' ')} fill="none" stroke="rgba(148,163,184,.16)" strokeWidth="1" />
+        ))}
+        {axes.map((axis) => <line key={axis.dimension.key} x1={centerX} y1={centerY} x2={axis.x} y2={axis.y} stroke="rgba(148,163,184,.18)" strokeWidth="1" />)}
+        {ready ? (
+          <g className="origin-center motion-safe:animate-[pulse_500ms_ease-out_1] motion-reduce:animate-none" style={{ transformOrigin: `${centerX}px ${centerY}px` }}>
+            <polygon points={polygon} fill="rgba(34,211,238,.17)" stroke="#67e8f9" strokeWidth="2" />
+            {axes.map((axis, index) => {
+              const normalized = clamp(scores[index] / 100, 0, 1)
+              return <circle key={axis.dimension.key} cx={centerX + Math.cos(axis.angle) * radius * normalized} cy={centerY + Math.sin(axis.angle) * radius * normalized} r="3.5" fill="#a7f3d0" />
+            })}
+          </g>
+        ) : null}
+        {axes.map((axis) => (
+          <g key={`label-${axis.dimension.key}`}>
+            <text x={axis.labelX} y={axis.labelY} textAnchor={axis.labelX < centerX - 15 ? 'end' : axis.labelX > centerX + 15 ? 'start' : 'middle'} fontSize="11" fontWeight="700" fill="#cbd5e1">{protectionRadarLabels[axis.dimension.key]}</text>
+            <text x={axis.labelX} y={axis.labelY + 16} textAnchor={axis.labelX < centerX - 15 ? 'end' : axis.labelX > centerX + 15 ? 'start' : 'middle'} fontSize="11" fill={optionalNumber(axis.dimension.score) === null ? '#64748b' : '#67e8f9'}>{optionalNumber(axis.dimension.score) === null ? '待生成' : optionalNumber(axis.dimension.score)?.toFixed(2)}</text>
+          </g>
+        ))}
+      </svg>
+      {!ready ? <div className="pointer-events-none absolute inset-x-1/4 top-1/2 -translate-y-1/2 rounded-[7px] border border-dashed border-cyan-300/14 bg-slate-950/90 px-3 py-2 text-center text-xs leading-5 text-slate-400">完成六项对应测试后生成雷达图</div> : null}
     </div>
   )
 }
@@ -1124,8 +1446,8 @@ function AsrTab({ result, asrEval, editStats, history, batches = [], selectedAsr
     ? sharedSemantic?.error || sharedSemantic?.reason || metricReason(result, ['semanticEval.tokenChangeRate', 'semanticEval.tokenErrorRate', 'asrEval.tokenChangeRate', 'asrEval.tokenErrorRate'])
     : ''
   const tokenFormulaText = tokenUsesEditDistance
-    ? '当前回退值为保护前后离散语音 Token 序列的编辑距离除以原始序列长度。'
-    : '后端使用语义 tokenizer 编码保护前后音频，在两侧较短序列长度内统计同位置离散语音 Token 不同的比例。'
+    ? '当前回退值为 \\(R_{\\mathrm{token}}=\\frac{D_{\\mathrm{edit}}(z,z^{\\prime})}{\\max(|z|,1)}\\)，即保护前后离散语音 Token 序列的编辑距离除以原始序列长度。'
+    : '后端使用语义 tokenizer 编码保护前后音频，并按 \\(R_{\\mathrm{token}}=\\frac{1}{\\max(L,1)}\\sum_{i=1}^{L}\\mathbf{1}[z_i\\ne z_i^{\\prime}],\\ L=\\min(|z|,|z^{\\prime}|)\\) 统计两侧较短序列内同位置离散语音 Token 不同的比例。'
   const tokenFoot = `${tokenUnavailableReason ? `${tokenUnavailableReason}。` : ''}${tokenFormulaText}该指标不按 ASR 文本的字符或单词切分。`
   const metricLevelFoot = textMetricLevel === 'char'
     ? '中文按字/字符（char）作为 CER 与文本编辑操作的统计单位。'
@@ -1135,10 +1457,10 @@ function AsrTab({ result, asrEval, editStats, history, batches = [], selectedAsr
   const semanticFoot = sharedSemantic?.semanticDrift == null
     ? sharedSemantic?.error || sharedSemantic?.reason || metricReason(result, ['semanticEval.semanticDrift', 'asrEval.semanticDrift'])
     : semanticIsMfccProxy
-      ? '1 − 平均余弦值；当前为 MFCC 声学特征代理，不等同于深度语义表示。'
-      : '1 − 多个语义编码器的平均加权余弦值，越高表示语义表示变化越大。'
+      ? '\\(D_{\\mathrm{sem}}=1-\\overline{\\cos(F(x),F(x^{\\prime}))}\\)；当前为 MFCC 声学特征代理，不等同于深度语义表示。'
+      : '\\(D_{\\mathrm{sem}}=\\frac{\\sum_k w_k\\left(1-\\operatorname{mean}_t\\cos(F_k(x)_t,F_k(x^{\\prime})_t)\\right)}{\\sum_k w_k}\\)。数值越高，表示语义表示变化越大。'
   const semanticDetailLabel = semanticIsMfccProxy ? 'MFCC 代理漂移' : '语义表示漂移'
-  const errorShares = asrErrorShares(asrEval, editStats)
+  const errorShares = resolveAsrErrorShares(asrEval.errorShares, asrEval.editCounts, editStats?.errorShares)
   const asrFailureReason = ['unavailable', 'failed', 'error'].includes(String(asrEval.status ?? '').toLowerCase())
     ? friendlyAsrFailure(asrEval.error || asrEval.reason)
     : null
@@ -1151,10 +1473,10 @@ function AsrTab({ result, asrEval, editStats, history, batches = [], selectedAsr
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_288px_minmax(0,1fr)]">
         <TextBox title="参考文本 / 原始转写（ASR）" text={referenceText || '未生成'} foot="用于 WER/CER 与 diff 的参考文本" />
         <div className="grid grid-cols-2 content-center gap-3">
-          <ScoreBox label="WER（词错率）" value={formatMetricValue(wer, 'percent')} red compact />
-          <ScoreBox label="CER（字错率）" value={formatMetricValue(cer, 'percent')} red compact />
-          <ScoreBox label="IR（插入率）" value={formatMetricValue(insertRate, 'percent')} red compact />
-          <ScoreBox label="SR（替换率）" value={formatMetricValue(substituteRate, 'percent')} red compact />
+          <ScoreBox label={<>WER<br />词错率</>} value={formatMetricValue(wer, 'percent')} red compact foot={'词级识别错误率：\\(\\mathrm{WER}=\\frac{S_w+D_w+I_w}{\\max(N_w,1)}\\)。其中 \\(S_w\\)、\\(D_w\\)、\\(I_w\\) 分别为词级替换、删除和插入数量，\\(N_w\\) 为参考文本词数。'} />
+          <ScoreBox label={<>CER<br />字错率</>} value={formatMetricValue(cer, 'percent')} red compact foot={'字符级识别错误率：\\(\\mathrm{CER}=\\frac{S_c+D_c+I_c}{\\max(N_c,1)}\\)。其中 \\(S_c\\)、\\(D_c\\)、\\(I_c\\) 分别为字符级替换、删除和插入数量，\\(N_c\\) 为参考文本字符数。'} />
+          <ScoreBox label={<>IR<br />插入率</>} value={formatMetricValue(insertRate, 'percent')} red compact foot={'插入率：\\(\\mathrm{IR}=\\frac{I}{\\max(N,1)}\\)。其中 \\(I\\) 为新增单位数，\\(N\\) 为参考文本在当前统计层级下的单位数。'} />
+          <ScoreBox label={<>SR<br />替换率</>} value={formatMetricValue(substituteRate, 'percent')} red compact foot={'替换率：\\(\\mathrm{SR}=\\frac{S}{\\max(N,1)}\\)。其中 \\(S\\) 为替换单位数，\\(N\\) 为参考文本在当前统计层级下的单位数。'} />
         </div>
         <TextBox title="保护音频转写（ASR）" text={protectedText || '未生成'} foot="红色为新增内容，绿色删除线为原文缺失内容" content={diffOps.length ? renderDiffOps(diffOps) : undefined} />
       </div>
@@ -1171,14 +1493,12 @@ function AsrTab({ result, asrEval, editStats, history, batches = [], selectedAsr
   )
 }
 
-function CloneTab({ result, cloneResult, cloneEval, cloneHistory, cloneBatches, selectedCloneKey, onSelectClone, onOpenAsr, loading, status, evaluationModel, cloneModelOptions, modelTypes, asrEval, asrEditStats, asrHistory, asrBatches, selectedAsrSubId, asrHistoryLimit, cloneHistoryLimit }: { result: TaskResult; cloneResult?: CloneVoiceResult; cloneEval?: CloneEval | null; cloneHistory: CloneHistoryEntry[]; cloneBatches: EvaluationBatch[]; selectedCloneKey?: string; onSelectClone: (cloneKey: string) => void; onOpenAsr: (asrSubId?: string) => void; loading: boolean; status: TaskStatusResponse | null; evaluationModel: BackendSelectOption | null; cloneModelOptions: BackendSelectOption[]; modelTypes?: CapabilitiesResponse['modelTypes']; asrEval?: AsrEval | null; asrEditStats: EditMetrics | null; asrHistory: AsrHistoryEntry[]; asrBatches: EvaluationBatch[]; selectedAsrSubId?: string; asrHistoryLimit: number; cloneHistoryLimit: number }) {
+function CloneTab({ result, cloneResult, cloneEval, cloneHistory, cloneBatches, selectedCloneKey, onSelectClone, onOpenAsr, loading, status, cloneModelOptions, modelTypes, asrEval, asrEditStats, asrHistory, asrBatches, selectedAsrSubId, asrHistoryLimit, cloneHistoryLimit }: { result: TaskResult; cloneResult?: CloneVoiceResult; cloneEval?: CloneEval | null; cloneHistory: CloneHistoryEntry[]; cloneBatches: EvaluationBatch[]; selectedCloneKey?: string; onSelectClone: (cloneKey: string) => void; onOpenAsr: (asrSubId?: string) => void; loading: boolean; status: TaskStatusResponse | null; cloneModelOptions: BackendSelectOption[]; modelTypes?: CapabilitiesResponse['modelTypes']; asrEval?: AsrEval | null; asrEditStats: EditMetrics | null; asrHistory: AsrHistoryEntry[]; asrBatches: EvaluationBatch[]; selectedAsrSubId?: string; asrHistoryLimit: number; cloneHistoryLimit: number }) {
   const [manualAnnotation, setManualAnnotation] = useState<CloneHistoryEntry | null>(null)
-  const [fineTuneReport, setFineTuneReport] = useState<CloneHistoryEntry | null>(null)
   const [informationModel, setInformationModel] = useState<BackendSelectOption | null>(null)
   const [batchDetail, setBatchDetail] = useState<EvaluationBatch | null>(null)
   const openBatch = (batch: EvaluationBatch) => {
     setManualAnnotation(null)
-    setFineTuneReport(null)
     setBatchDetail(batch)
   }
   const liveBatchDetail = batchDetail
@@ -1203,8 +1523,7 @@ function CloneTab({ result, cloneResult, cloneEval, cloneHistory, cloneBatches, 
       onSelect={onSelectClone}
       onOpenBatch={openBatch}
       onOpenAsr={onOpenAsr}
-      onOpenManual={(item) => { setBatchDetail(null); setFineTuneReport(null); setManualAnnotation(item) }}
-      onOpenFineTune={(item) => { setBatchDetail(null); setManualAnnotation(null); setFineTuneReport(item) }}
+      onOpenManual={(item) => { setBatchDetail(null); setManualAnnotation(item) }}
       maxVisible={cloneHistoryLimit}
     />
   ) : null
@@ -1215,9 +1534,9 @@ function CloneTab({ result, cloneResult, cloneEval, cloneHistory, cloneBatches, 
     const liveStatus = selectedCloneEntry?.taskStatus ?? status
     cloneDetail = (
       <div className="grid items-center gap-6 pl-1 lg:grid-cols-[minmax(0,1fr)_58px_minmax(0,1fr)]">
-        <LoadingCard title="克隆原语音" progress={optionalNumber(liveStatus?.progress) ?? undefined} message={liveStatus?.message ?? undefined} />
+        <LoadingCard title="原始克隆语音" progress={optionalNumber(liveStatus?.progress) ?? undefined} message={liveStatus?.message ?? undefined} />
         <div className="compare-badge mx-auto grid h-12 w-12 place-items-center rounded-full border border-violet-300/28 bg-slate-950/70 text-[18px] font-black text-white">VS</div>
-        <LoadingCard title="克隆保护语音" progress={optionalNumber(liveStatus?.progress) ?? undefined} message={liveStatus?.message ?? undefined} />
+        <LoadingCard title="保护后克隆语音" progress={optionalNumber(liveStatus?.progress) ?? undefined} message={liveStatus?.message ?? undefined} />
       </div>
     )
   } else if (selectedCloneFailed) {
@@ -1225,36 +1544,25 @@ function CloneTab({ result, cloneResult, cloneEval, cloneHistory, cloneBatches, 
   } else if (!cloneEval) {
     cloneDetail = <EmptyState title="未执行语音克隆测试" text="请在防护工作台选择已完成的保护任务并开始语音克隆测试。" />
   } else {
-    const cloneReason = cloneEval.reason ? shortMetricReason(cloneEval.reason) : metricReason(result, ['cloneEval.*'])
+    const cloneReason = cloneEval.reason ? shortMetricReason(cloneEval.reason) : ''
     const cloneModelLabel = shortCloneModelName(cloneEval.cloneModel ?? cloneResult?.request.model)
-    const speakerModelLabel = evaluationModel?.label ?? shortCloneModelName(cloneEval.speakerEvalModel ?? cloneEval.speakerModel ?? undefined)
     const cloneModelValue = cloneEval.cloneModel ?? cloneResult?.request.model
     const cloneModelOption = cloneModelOptions.find((item) => item.value === cloneModelValue || item.backendValue === cloneModelValue) ?? null
-    const activeFineTuneEntry = selectedCloneEntry?.result?.fineTune ? selectedCloneEntry : cloneHistory.find((item) => item.result === cloneResult && item.result?.fineTune)
     cloneDetail = (
       <>
         <div className="flex flex-wrap items-center justify-center gap-2 text-center text-sm font-black text-violet-100">
           <span>TTS 克隆 · {cloneModelLabel}</span>
           {cloneModelOption ? <ModelInfoButton model={cloneModelOption} onOpen={setInformationModel} /> : null}
-          <span>· 评估 {speakerModelLabel}</span>
-          {evaluationModel ? <ModelInfoButton model={evaluationModel} onOpen={setInformationModel} /> : null}
-          {activeFineTuneEntry ? <button type="button" onClick={() => setFineTuneReport(activeFineTuneEntry)} className="inline-flex h-7 items-center gap-1 rounded-[6px] border border-amber-300/18 px-2 text-[11px] font-black text-amber-200 hover:bg-amber-300/10"><Search className="h-3.5 w-3.5" />微调报告</button> : null}
         </div>
         <div id="clone-result-detail" className="scroll-mt-24 space-y-5">
-          {cloneReason ? <MetricNotice text={`克隆指标未生成原因：${cloneReason}`} /> : null}
+          {cloneReason ? <MetricNotice text={`克隆指标未生成原因：${friendlyCloneMetricReason(cloneReason)}`} /> : null}
         <div className="grid items-center gap-6 pl-1 lg:grid-cols-[minmax(0,1fr)_58px_minmax(0,1fr)]">
-          {cloneEval.originalCloneAudio ? <AudioCard title="克隆原语音" audio={cloneEval.originalCloneAudio} color="#a78bfa" /> : <EmptyMetricCard title="克隆原语音" text="暂未生成克隆原语音" />}
+          {cloneEval.originalCloneAudio ? <AudioCard title="原始克隆语音" audio={cloneEval.originalCloneAudio} color="#a78bfa" /> : <EmptyMetricCard title="原始克隆语音" text="暂未生成原始克隆语音" />}
           <div className="compare-badge mx-auto grid h-12 w-12 place-items-center rounded-full border border-violet-300/28 bg-slate-950/70 text-[18px] font-black text-white">VS</div>
-          {cloneEval.protectedCloneAudio ? <AudioCard title="克隆保护语音" audio={cloneEval.protectedCloneAudio} color="#f59e0b" /> : <EmptyMetricCard title="克隆保护语音" text="暂未生成克隆保护语音" />}
+          {cloneEval.protectedCloneAudio ? <AudioCard title="保护后克隆语音" audio={cloneEval.protectedCloneAudio} color="#f59e0b" /> : <EmptyMetricCard title="保护后克隆语音" text="暂未生成保护后克隆语音" />}
         </div>
-        <div className="grid items-stretch grid-cols-[minmax(420px,0.96fr)_minmax(520px,1.04fr)] gap-5 max-xl:grid-cols-1">
-          <CloneIdentityPanel cloneEval={cloneEval} evaluationModel={evaluationModel} />
-          <div className="relative min-h-0 max-xl:min-h-[330px]">
-            <div className="absolute inset-0 max-xl:static max-xl:h-[330px]">
-              <CloneVisualizationPanel result={result} cloneEval={cloneEval} />
-            </div>
-          </div>
-        </div>
+        <CloneCoreMetricCards cloneEval={cloneEval} />
+        <CloneSemanticExpressionPanel cloneEval={cloneEval} />
         <div className="grid grid-cols-1 gap-5">
           <InsightPanel title="克隆结果解读" items={generateCloneInsights(cloneEval)} />
         </div>
@@ -1269,7 +1577,6 @@ function CloneTab({ result, cloneResult, cloneEval, cloneHistory, cloneBatches, 
       {cloneHistorySection}
       {cloneDetail}
       <ManualAnnotationModal item={manualAnnotation} onClose={() => setManualAnnotation(null)} />
-      <FineTuneReportModal item={fineTuneReport} onClose={() => setFineTuneReport(null)} />
       <BatchProgressModal batch={liveBatchDetail} cloneModelOptions={cloneModelOptions} onClose={() => setBatchDetail(null)} />
       <ModelInformationModal model={informationModel} modelTypes={modelTypes} onClose={() => setInformationModel(null)} />
     </div>
@@ -1277,17 +1584,18 @@ function CloneTab({ result, cloneResult, cloneEval, cloneHistory, cloneBatches, 
 }
 
 function LoadingCard({ title, progress, message }: { title: string; progress?: number; message?: string }) {
+  const normalizedProgress = progress === undefined ? undefined : clamp(progress, 0, 1)
   return (
     <div className="grid h-[252px] place-items-center rounded-[9px] border border-violet-300/18 bg-violet-400/8 p-5 text-center">
       <div className="w-full">
         <Loader2 className="mx-auto h-9 w-9 animate-spin text-violet-200" />
         <p className="mt-4 text-sm font-black text-slate-100">{title}</p>
-        {progress !== undefined ? (
+        {normalizedProgress !== undefined ? (
           <div className="mt-3 mx-auto max-w-[180px]">
             <div className="h-1.5 overflow-hidden rounded-full bg-slate-800">
-              <div className="h-full rounded-full bg-violet-400 transition-all duration-500" style={{ width: `${Math.max(4, Math.round(progress * 100))}%` }} />
+              <div className="h-full rounded-full bg-violet-400 transition-all duration-500" style={{ width: `${Math.round(normalizedProgress * 100)}%` }} />
             </div>
-            <p className="mt-1 font-mono text-[10px] text-slate-400">{Math.round(progress * 100)}%</p>
+            <p className="mt-1 font-mono text-[10px] text-slate-400">{Math.round(normalizedProgress * 100)}%</p>
           </div>
         ) : null}
         {message ? <p className="mt-2 text-xs text-slate-400">{message}</p> : <p className="mt-2 text-xs text-slate-400">正在等待克隆音频...</p>}
@@ -1344,7 +1652,16 @@ function RateBreakdown({ substituteShare, insertShare }: { substituteShare?: num
     <section className="rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
       <div className="flex items-start justify-between gap-3">
         <SectionTitle>错误类型占比</SectionTitle>
-        <MetricInfoButton title="错误类型占比">分别统计替换与插入在全部编辑错误中的占比，用于判断保护音频主要通过哪类文本变化干扰识别。</MetricInfoButton>
+        <MetricInfoButton title="错误类型占比">
+          <MetricFormulaContent
+            description="分别统计替换与插入在全部编辑错误中的占比，用于判断保护音频主要通过哪类文本变化干扰识别。"
+            formulas={[
+              'p_{\\mathrm{sub}}=\\frac{S}{\\max(S+D+I,1)}',
+              'p_{\\mathrm{ins}}=\\frac{I}{\\max(S+D+I,1)}',
+            ]}
+            note="分母中的删除数量仍参与总错误数计算；页面只单独展示替换与插入两类占比。"
+          />
+        </MetricInfoButton>
       </div>
       <div className="mt-5 space-y-4">
         {rows.map(([label, value, color]) => {
@@ -1370,207 +1687,167 @@ function RateBreakdown({ substituteShare, insertShare }: { substituteShare?: num
   )
 }
 
-function CloneIdentityPanel({ cloneEval, evaluationModel }: { cloneEval: CloneEval; evaluationModel: BackendSelectOption | null }) {
-  const originalSimilarity = optionalNumber(cloneEval.originalSimilarity)
-  const protectedSimilarity = optionalNumber(cloneEval.protectedSimilarity)
-  const embeddingDistanceBefore = optionalNumber(cloneEval.embeddingDistanceBefore)
-  const embeddingDistance = optionalNumber(cloneEval.embeddingDistanceAfter)
-  const similarityDrop = computeAbsoluteDrop(cloneEval.originalSimilarity, cloneEval.protectedSimilarity)
-  const similarityDelta = similarityDrop === null ? null : Math.abs(similarityDrop)
-  const similarityDecreased = originalSimilarity !== null && protectedSimilarity !== null ? protectedSimilarity <= originalSimilarity : true
-  const embeddingDelta = embeddingDistanceBefore === null || embeddingDistance === null ? null : Math.abs(embeddingDistance - embeddingDistanceBefore)
-  const embeddingIncreased = embeddingDistanceBefore !== null && embeddingDistance !== null ? embeddingDistance >= embeddingDistanceBefore : true
-  const directSimilarity = optionalNumber(cloneEval.directSimilarity)
-  const directShift = directSimilarity === null ? null : 1 - directSimilarity
-  const defenseScore = computeCloneDefenseScore(cloneEval)
-
+function CloneCoreMetricCards({ cloneEval }: { cloneEval: CloneEval }) {
+  const before = optionalNumber(cloneEval.embeddingDistanceBefore)
+  const after = optionalNumber(cloneEval.embeddingDistanceAfter)
+  const delta = optionalNumber(cloneEval.embeddingDistanceDelta) ?? computeAbsoluteDelta(before, after)
   return (
-    <section className="flex flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
-      <div className="flex items-center justify-between gap-3">
-        <SectionTitle>声音身份特征链路分析</SectionTitle>
-        {evaluationModel ? <span className="text-xs font-bold text-cyan-200">{evaluationModel.label}</span> : null}
-      </div>
-      <div className="mt-4 grid min-h-0 grid-cols-2 gap-3 max-sm:grid-cols-1">
-        <IdentityTransformCard
-          title="说话人相似度"
-          before={formatCloneMetricNumber(originalSimilarity)}
-          after={formatCloneMetricNumber(protectedSimilarity)}
-          delta={similarityDelta}
-          changeLabel={similarityDecreased ? '下降' : '上升'}
-          foot={<div className="space-y-1"><p>比较原语音与保护前后两种克隆语音的声纹相似程度。</p><p>范围为 [-1, 1]，保护后越低越好。</p></div>}
-          tone={similarityDecreased ? 'green' : 'red'}
-        />
-        <IdentityTransformCard
-          title="声纹嵌入距离"
-          before={formatCloneMetricNumber(embeddingDistanceBefore)}
-          after={formatCloneMetricNumber(embeddingDistance)}
-          delta={embeddingDelta}
-          changeLabel={embeddingIncreased ? '增加' : '减少'}
-          foot={<div className="space-y-1"><p>用 1 减去克隆语音与原语音的声纹相似度。</p><p>范围为 [0, 2]，距离越大表示保护效果越好。</p></div>}
-          tone={embeddingIncreased ? 'red' : 'green'}
-        />
-        <IdentityValueCard
-          title="直接声纹偏移"
-          value={formatCloneMetricNumber(directShift)}
-          foot={<div className="space-y-1"><p>用 1 减去原语音与保护语音的声纹相似度。</p><p>范围为 [0, 2]，越大越好；它不直接比较克隆结果，因此只作为低权重参考。</p></div>}
-          tone="green"
-        />
-        <IdentityValueCard
-          title="保护效果评估"
-          value={defenseScore === null ? '不可用' : `${defenseScore.toFixed(2)} 分`}
-          foot={<div className="space-y-1"><p>以保护后克隆语音的声纹距离为主要依据，并参考少量直接声纹偏移。两项经过归一化和软映射后得到 0–100 分，分数越高表示保护效果越好。</p></div>}
-          tone="green"
-        />
-      </div>
-    </section>
-  )
-}
-
-function IdentityTransformCard({ title, before, after, delta, changeLabel, foot, tone }: { title: string; before: string; after: string; delta: number | null; changeLabel: string; foot: ReactNode; tone: 'green' | 'red' }) {
-  return (
-    <div className="relative flex flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/22 px-4 py-5">
-      <div className="relative min-h-8">
-        <p className="absolute inset-x-0 top-1/2 -translate-y-1/2 px-9 text-center text-[14px] font-black leading-5 text-slate-100">{title}</p>
-        <div className="absolute right-0 top-1/2 -translate-y-1/2"><MetricInfoButton title={title}>{foot}</MetricInfoButton></div>
-      </div>
-      <div className="my-auto grid grid-cols-[minmax(0,1fr)_30px_minmax(0,1fr)] items-center py-3 text-center font-mono text-[26px] font-black">
-        <span className="text-slate-200">{before}</span>
-        <span className="text-slate-500">→</span>
-        <span className={tone === 'green' ? 'text-emerald-300' : 'text-rose-300'}>{after}</span>
-      </div>
-      <div className={cn('mb-3 rounded-[6px] border py-1.5 text-center text-sm font-black', tone === 'green' ? 'border-emerald-300/18 bg-emerald-400/10 text-emerald-300' : 'border-red-300/18 bg-red-400/10 text-red-300')}>
-        {changeLabel} {delta === null ? '不可用' : delta.toFixed(2)}
-      </div>
-    </div>
-  )
-}
-
-function IdentityValueCard({ title, value, foot, tone }: { title: string; value: string; foot: ReactNode; tone: 'green' | 'red' }) {
-  return (
-    <div className="relative flex flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/22 px-4 py-5">
-      <div className="relative min-h-8">
-        <p className="absolute inset-x-0 top-1/2 -translate-y-1/2 px-9 text-center text-[14px] font-black leading-5 text-slate-100">{title}</p>
-        <div className="absolute right-0 top-1/2 -translate-y-1/2"><MetricInfoButton title={title}>{foot}</MetricInfoButton></div>
-      </div>
-      <p className={cn('my-auto py-5 text-center font-mono text-[34px] font-black', tone === 'green' ? 'text-emerald-300' : 'text-rose-300')}>{value}</p>
-    </div>
-  )
-}
-
-function CloneVisualizationPanel({ result, cloneEval }: { result: TaskResult; cloneEval: CloneEval }) {
-  const radar = cloneEval.cloneRadar ?? result.speakerFeatureMap?.radar ?? result.charts?.speakerRadar ?? null
-  const displayRadar = normalizeCloneRadarForDisplay(radar ?? [], cloneEval)
-  const availableRadar = displayRadar.filter((item) => typeof item.value === 'number' && Number.isFinite(item.value))
-
-  return (
-    <section className="flex h-full flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
-      <div className="flex items-center justify-between gap-4">
-        <SectionTitle>说话人防护雷达图</SectionTitle>
-        <MetricInfoButton title="说话人防护雷达图">将直接声纹偏移、相似度下降、嵌入距离增加和保护效果评估映射到统一的 0–100 分尺度；面积越大表示综合防护效果越明显。</MetricInfoButton>
-      </div>
-      <div className="mt-4 min-h-0 flex-1 overflow-hidden rounded-[9px] border border-cyan-300/12 bg-slate-950/16 p-2">
-        {!displayRadar.length ? (
-          <ChartEmptyState text="暂未生成说话人防护雷达数据" />
-        ) : availableRadar.length < 3 ? (
-          <ChartEmptyState text="可用雷达指标不足，至少需要 3 个真实指标" />
-        ) : (
-          <CloneRadarPreview radar={displayRadar} availableRadar={availableRadar} />
+    <div className="grid grid-cols-4 gap-3 max-lg:grid-cols-2 max-sm:grid-cols-1">
+      <CloneDistanceCoreCard before={before} after={after} delta={delta} reason={cloneEval.cloneIdentityReason ?? cloneEval.reason} />
+      <CloneScoreCoreCard
+        title="克隆身份保护评分"
+        score={optionalNumber(cloneEval.cloneIdentityScore)}
+        reason={cloneEval.cloneIdentityReason ?? cloneEval.reason}
+        detail="声音身份分离效果"
+        icon={<Fingerprint className="h-4 w-4" />}
+        tone="cyan"
+        info={(
+          <MetricFormulaContent
+            description="针对当前选中的单个克隆结果，先比较保护前后的声纹距离，再转换为单模型身份保护分数。"
+            formulas={[
+              'd^0=1-\\operatorname{SIM}(x,c^0),\\qquad d^1=1-\\operatorname{SIM}(x,c^1)',
+              'P=\\operatorname{clip}\\!\\left(\\frac{d^1-d^0}{0.75-d^0},0,1\\right)',
+              'B=5\\,\\operatorname{clip}\\!\\left(\\frac{d^1-0.75}{0.25},0,1\\right)',
+              'S_{\\mathrm{clone\\_id}}=95P+B',
+            ]}
+            note="分数越高，表示保护后克隆声音越难保持原说话人的声音身份。"
+          />
         )}
+      />
+      <CloneScoreCoreCard
+        title="克隆后语义干扰评分"
+        score={optionalNumber(cloneEval.cloneSemanticScore)}
+        reason={cloneEval.cloneSemanticReason ?? cloneEval.cloneAsrReason}
+        detail={optionalNumber(cloneEval.cloneTextChangeRate) === null ? '表达内容变化效果' : `文本变化 ${formatMetricValue(cloneEval.cloneTextChangeRate, 'percent')}`}
+        icon={<BrainCircuit className="h-4 w-4" />}
+        tone="violet"
+        info={(
+          <MetricFormulaContent
+            description="针对当前选中的单个克隆结果，使用离散语音 Token 变化与语义表示漂移共同计算分数。"
+            formulas={[
+              '\\Phi(x;x_{90})=100\\left(1-10^{-x/x_{90}}\\right)',
+              'S_{\\mathrm{clone\\_sem}}=0.55\\,\\Phi(R_{\\mathrm{clone\\_token}};R_{90}^{\\mathrm{clone}})+0.45\\,\\Phi(D_{\\mathrm{clone\\_sem}};D_{90}^{\\mathrm{clone}})',
+            ]}
+            note="分数越高，表示保护后克隆语音的表达内容受到的干扰越明显。"
+          />
+        )}
+      />
+      <CloneScoreCoreCard
+        title="克隆音频质量退化评分"
+        score={optionalNumber(cloneEval.cloneQualityScore)}
+        reason={cloneEval.cloneQualityReason}
+        detail={optionalNumber(cloneEval.cloneQualityDropRate) === null ? '语音质量变化效果' : `质量下降 ${formatMetricValue(cloneEval.cloneQualityDropRate, 'percent')}`}
+        icon={<Waves className="h-4 w-4" />}
+        tone="amber"
+        info={(
+          <MetricFormulaContent
+            description="针对当前选中的单个克隆结果，比较两段克隆音频的 DNSMOS 语音质量评分。"
+            formulas={[
+              'r_q=\\max\\!\\left(0,\\frac{q^0-q^1}{q^0-1}\\right)',
+              'S_{\\mathrm{clone\\_quality}}=\\Phi(r_q;r_{90}^{q})',
+            ]}
+            note="分数越高，表示保护后克隆音频的听感质量下降越明显。"
+          />
+        )}
+      />
+    </div>
+  )
+}
+
+function CloneCoreCardHeader({ children, action, className }: { children: ReactNode; action: ReactNode; className?: string }) {
+  return (
+    <div className="relative min-h-7 pr-9">
+      <div className={cn('flex min-h-7 items-center gap-2 text-xs font-black', className)}>{children}</div>
+      <div className="absolute right-0 top-0">{action}</div>
+    </div>
+  )
+}
+
+function CloneDistanceCoreCard({ before, after, delta, reason }: { before: number | null; after: number | null; delta: number | null; reason?: string | null }) {
+  const available = before !== null && after !== null
+  const infoAction = (
+    <MetricInfoButton title="指标信息">
+      <MetricFormulaContent
+        description="ECAPA-TDNN 是用于表示说话人声音身份的声纹模型。这里分别计算原音频与两段克隆语音的声纹距离。"
+        formulas={[
+          '\\operatorname{SIM}(a,b)=\\cos(\\operatorname{Emb}(a),\\operatorname{Emb}(b))',
+          'd^0=1-\\operatorname{SIM}(x,c^0),\\qquad d^1=1-\\operatorname{SIM}(x,c^1)',
+          '\\Delta d=d^1-d^0',
+        ]}
+        note="右侧距离越大，表示保护后的克隆声音越远离原说话人。"
+      />
+    </MetricInfoButton>
+  )
+  return (
+    <div className="relative min-h-[154px] overflow-hidden rounded-[9px] border border-cyan-300/14 bg-slate-950/22 p-4 transition duration-200 ease-out hover:-translate-y-0.5 hover:border-cyan-300/30 hover:shadow-[0_14px_36px_rgba(34,211,238,0.08)] motion-reduce:transform-none motion-reduce:transition-none" title={!available ? friendlyCloneMetricReason(reason) : undefined}>
+      <CloneCoreCardHeader action={infoAction} className="text-cyan-100"><Fingerprint className="h-4 w-4 text-cyan-300" />克隆后身份差异（核心）</CloneCoreCardHeader>
+      {available ? (
+        <>
+          <div className="mt-6 flex items-center justify-center gap-2 font-mono text-[25px] font-black"><span className="text-slate-200">{before.toFixed(2)}</span><MathText formula={'\\longrightarrow'} className="text-slate-500" /><span className="text-emerald-300">{after.toFixed(2)}</span></div>
+          <p className={cn('mt-3 text-center font-mono text-sm font-black', (delta ?? 0) >= 0 ? 'text-emerald-300' : 'text-rose-300')}>{delta === null ? '变化未生成' : <MathText formula={`\\Delta d=${delta >= 0 ? '+' : ''}${delta.toFixed(2)}`} />}</p>
+        </>
+      ) : <p className="mt-7 text-center text-sm font-bold text-slate-500">待生成</p>}
+    </div>
+  )
+}
+
+function CloneScoreCoreCard({ title, score, reason, detail, icon, tone, info }: { title: string; score: number | null; reason?: string | null; detail: string; icon: ReactNode; tone: 'cyan' | 'violet' | 'amber'; info: ReactNode }) {
+  const animatedScore = useAnimatedScore(score)
+  const toneClass = tone === 'violet' ? 'text-violet-300' : tone === 'amber' ? 'text-amber-300' : 'text-cyan-300'
+  const barClass = tone === 'violet' ? 'from-violet-400 to-fuchsia-300' : tone === 'amber' ? 'from-amber-400 to-orange-300' : 'from-cyan-400 to-emerald-300'
+  return (
+    <div className="min-h-[154px] rounded-[9px] border border-cyan-300/14 bg-slate-950/22 p-4 transition duration-200 ease-out hover:-translate-y-0.5 hover:border-cyan-300/30 hover:shadow-[0_14px_36px_rgba(34,211,238,0.08)] motion-reduce:transform-none motion-reduce:transition-none" title={score === null ? friendlyCloneMetricReason(reason) : undefined}>
+      <CloneCoreCardHeader action={<MetricInfoButton title={title}>{info}</MetricInfoButton>} className="text-slate-200"><span className={toneClass}>{icon}</span>{title}</CloneCoreCardHeader>
+      <p className={cn('mt-5 text-center font-mono text-[30px] font-black leading-none', score === null ? 'text-slate-500' : toneClass)}>{animatedScore === null ? '待生成' : `${animatedScore.toFixed(2)} 分`}</p>
+      <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-slate-800">{animatedScore !== null ? <div className={cn('h-full rounded-full bg-gradient-to-r', barClass)} style={{ width: `${clamp(animatedScore, 0, 100)}%` }} /> : null}</div>
+      <p className="mt-2 truncate text-center text-[11px] text-slate-500">{score === null ? friendlyCloneMetricReason(reason) : detail}</p>
+    </div>
+  )
+}
+
+function CloneSemanticExpressionPanel({ cloneEval }: { cloneEval: CloneEval }) {
+  const targetText = cloneEval.targetText ?? ''
+  const cleanText = cloneEval.cleanCloneTranscription ?? ''
+  const protectedText = cloneEval.protectedCloneTranscription ?? ''
+  return (
+    <section className="rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div><SectionTitle>克隆后表达的实际语义</SectionTitle><p className="mt-2 text-xs text-slate-500">查看两段克隆语音最终表达了什么，以及保护前后的文本变化。</p></div>
+        {cloneEval.cloneAsrStatus && !metricStatusAvailable(cloneEval.cloneAsrStatus) ? <span className="rounded-full border border-amber-300/18 bg-amber-400/8 px-2.5 py-1 text-[11px] font-bold text-amber-200">文本尚未完整生成</span> : null}
       </div>
+      <div className="mt-4 grid grid-cols-3 gap-3 max-lg:grid-cols-1">
+        <CloneTranscriptColumn title="目标文本（输入）" text={targetText} />
+        <CloneTranscriptColumn title="原始克隆语音文本（自动转写）" text={cleanText} reference={targetText} />
+        <CloneTranscriptColumn title="保护后克隆语音文本（自动转写）" text={protectedText} reference={targetText} />
+      </div>
+      <div className="mt-4 grid grid-cols-3 gap-3 max-lg:grid-cols-1">
+        <CloneTextMetric label="原始克隆文本误差" value={cloneEval.cleanCloneTextError} />
+        <CloneTextMetric label="保护后克隆文本误差" value={cloneEval.protectedCloneTextError} />
+        <CloneTextMetric label="文本变化率" value={cloneEval.cloneTextChangeRate} />
+      </div>
+      {(!cleanText || !protectedText) && cloneEval.cloneAsrReason ? <p className="mt-3 text-xs leading-5 text-slate-500">未生成原因：{friendlyCloneMetricReason(cloneEval.cloneAsrReason)}</p> : null}
     </section>
   )
 }
 
-function ChartEmptyState({ text }: { text: string }) {
-  return <div className="grid h-full min-h-[110px] place-items-center text-center text-xs leading-5 text-slate-500">{text}</div>
-}
-
-function normalizeCloneRadarForDisplay(radar: RadarPoint[], cloneEval: CloneEval) {
-  const hasRealCloneConfidence = optionalNumber(cloneEval.cloneConfidenceDropRate) !== null
-  const defenseScore = computeCloneDefenseScore(cloneEval)
-  return radar
-    .filter((item) => hasRealCloneConfidence || !/置信|confidence/i.test(item.name))
-    .map((item) => {
-      const name = normalizeCloneRadarName(item.name)
-      return {
-        ...item,
-        name,
-        value: name === '保护效果评估' && defenseScore !== null ? defenseScore : item.value,
-      }
-    })
-}
-
-function normalizeCloneRadarName(name: string) {
-  if (/直接|direct/i.test(name)) return '直接声纹偏移'
-  if (/相似|similar/i.test(name)) return '相似度下降'
-  if (/嵌入|embedding|距离/i.test(name)) return '嵌入距离增加'
-  if (/保护后|防护|protected/i.test(name)) return '保护效果评估'
-  if (/置信|confidence/i.test(name)) return '克隆置信度下降'
-  return name
-}
-
-function CloneRadarPreview({ radar, availableRadar }: { radar: RadarPoint[]; availableRadar: RadarPoint[] }) {
-  const width = 620
-  const height = 340
-  const centerX = width / 2
-  const centerY = height / 2
-  const radius = 105
-  const axisPoints = availableRadar.map((item, index) => {
-    const angle = -Math.PI / 2 + (index / availableRadar.length) * Math.PI * 2
-    const normalized = Math.max(0, Math.min(100, item.value ?? 0)) / 100
-    return {
-      item,
-      angle,
-      axisX: centerX + Math.cos(angle) * radius,
-      axisY: centerY + Math.sin(angle) * radius,
-      valueX: centerX + Math.cos(angle) * radius * normalized,
-      valueY: centerY + Math.sin(angle) * radius * normalized,
-      labelX: centerX + Math.cos(angle) * (radius + 58),
-      labelY: centerY + Math.sin(angle) * (radius + 42),
-    }
-  })
-  const polygon = axisPoints.map((point) => `${point.valueX.toFixed(1)},${point.valueY.toFixed(1)}`).join(' ')
-  const missing = radar.filter((item) => !(typeof item.value === 'number' && Number.isFinite(item.value)))
-  const missingNames = missing.map((item) => item.reason ? `${item.name}（${item.reason}）` : item.name).filter(Boolean)
-
+function CloneTranscriptColumn({ title, text, reference }: { title: string; text: string; reference?: string }) {
+  const editMetrics = text && reference ? computeEditMetrics(reference, text, chooseEditLevel(reference, text)) : null
+  const content = editMetrics ? renderDiffOps(editMetrics.diffOps) : text
   return (
-    <div className="flex h-full flex-col">
-      <div className="grid min-h-0 flex-1 place-items-center">
-        <svg viewBox={`0 0 ${width} ${height}`} className="h-full min-h-0 w-full max-w-none">
-          {[0.25, 0.5, 0.75, 1].map((scale) => (
-            <polygon
-              key={scale}
-              points={axisPoints.map((point) => `${(centerX + Math.cos(point.angle) * radius * scale).toFixed(1)},${(centerY + Math.sin(point.angle) * radius * scale).toFixed(1)}`).join(' ')}
-              fill="none"
-              stroke="rgba(148,163,184,.16)"
-              strokeWidth="1"
-            />
-          ))}
-          {axisPoints.map((point) => (
-            <line key={point.item.name} x1={centerX} y1={centerY} x2={point.axisX} y2={point.axisY} stroke="rgba(148,163,184,.18)" strokeWidth="1" />
-          ))}
-          <polygon points={polygon} fill="rgba(34,211,238,.18)" stroke="#67e8f9" strokeWidth="2" />
-          {axisPoints.map((point) => (
-            <g key={point.item.name}>
-              <circle cx={point.valueX} cy={point.valueY} r="3.5" fill="#fcd34d" />
-              <text x={point.labelX} y={point.labelY} textAnchor={point.labelX < centerX - 12 ? 'end' : point.labelX > centerX + 12 ? 'start' : 'middle'} fontSize="13" fontWeight="700" fill="#cbd5e1">
-                {point.item.name}
-              </text>
-              <text x={point.labelX} y={point.labelY + 17} textAnchor={point.labelX < centerX - 12 ? 'end' : point.labelX > centerX + 12 ? 'start' : 'middle'} fontSize="12" fill="#67e8f9">
-                {formatRadarScore(point.item.value)}
-              </text>
-            </g>
-          ))}
-        </svg>
-      </div>
-      {missingNames.length ? (
-        <div className="overflow-hidden rounded-[9px] border border-cyan-300/12 bg-slate-950/16 p-4">
-          <p className="text-xs font-bold text-slate-400">部分指标未生成</p>
-          <ul className="mt-1 space-y-1 text-xs leading-5 text-slate-500">
-            {missingNames.map((name) => <li key={name}>• {name}</li>)}
-          </ul>
-        </div>
-      ) : null}
+    <div className="min-h-[166px] rounded-[9px] border border-cyan-300/12 bg-slate-950/22 p-4">
+      <h3 className="text-center text-sm font-black text-cyan-100">{title}</h3>
+      <div className="mt-3 max-h-[132px] min-h-[92px] overflow-y-auto rounded-[7px] border border-cyan-300/8 bg-slate-950/30 p-3 text-sm leading-7 text-slate-200">{content || <span className="text-slate-500">暂未生成</span>}</div>
+    </div>
+  )
+}
+
+function CloneTextMetric({ label, value }: { label: string; value?: number | null }) {
+  const numberValue = optionalNumber(value)
+  return (
+    <div className="rounded-[8px] border border-cyan-300/10 bg-slate-950/22 px-4 py-3 text-center">
+      <p className="text-xs font-bold text-slate-400">{label}</p>
+      <p className={cn('mt-2 font-mono text-xl font-black', numberValue === null ? 'text-slate-500' : 'text-cyan-200')}>{numberValue === null ? '待生成' : formatMetricValue(numberValue, 'percent')}</p>
+      <p className="mt-1 text-[10px] text-slate-600">结果范围为 <MathText formula={'[0\\%,100\\%]'} className="align-[-1px]" /></p>
     </div>
   )
 }
@@ -1811,7 +2088,7 @@ function AsrHistoryPanel({ history, batches, selectedAsrSubId, onSelect, onOpenB
   )
 }
 
-function CloneHistoryPanel({ history, batches, modelOptions, selectedCloneKey, onSelect, onOpenBatch, onOpenAsr, onOpenManual, onOpenFineTune, maxVisible }: { history: CloneHistoryEntry[]; batches: EvaluationBatch[]; modelOptions: BackendSelectOption[]; selectedCloneKey?: string; onSelect: (cloneKey: string) => void; onOpenBatch: (batch: EvaluationBatch) => void; onOpenAsr: (asrSubId?: string) => void; onOpenManual: (item: CloneHistoryEntry) => void; onOpenFineTune: (item: CloneHistoryEntry) => void; maxVisible: number }) {
+function CloneHistoryPanel({ history, batches, modelOptions, selectedCloneKey, onSelect, onOpenBatch, onOpenAsr, onOpenManual, maxVisible }: { history: CloneHistoryEntry[]; batches: EvaluationBatch[]; modelOptions: BackendSelectOption[]; selectedCloneKey?: string; onSelect: (cloneKey: string) => void; onOpenBatch: (batch: EvaluationBatch) => void; onOpenAsr: (asrSubId?: string) => void; onOpenManual: (item: CloneHistoryEntry) => void; maxVisible: number }) {
   if (!history.length && !batches.length) return null
   const rowCount = history.length + batches.length
   return (
@@ -1880,10 +2157,7 @@ function CloneHistoryPanel({ history, batches, modelOptions, selectedCloneKey, o
                 <tr key={item.key} role="button" tabIndex={0} title={failed ? cloneHistoryFailureReason(item) : item.taskStatus?.message ?? undefined} onClick={() => onSelect(item.key)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelect(item.key) } }} className={cn('cursor-pointer border-b border-cyan-300/8 last:border-0 hover:bg-cyan-300/[0.04] focus:outline-none focus:ring-1 focus:ring-inset focus:ring-cyan-300/35', selectedCloneKey === item.key && 'bg-cyan-300/[0.08]', failed && 'bg-rose-400/[0.035]')}>
                   <td className="px-2 py-2 text-center font-mono text-cyan-200" title={item.cloneSubId ?? item.cloneId ?? item.key}><span className="block truncate">#{index + 1} {item.cloneSubId ?? item.cloneId?.slice(0, 12) ?? '等待编号'}{failed ? <span className="ml-2 rounded-full bg-rose-400/12 px-1.5 py-0.5 font-sans text-[10px] font-black text-rose-300">失败</span> : null}</span><span className="mt-1 block text-[10px] text-slate-500">{formatTaskTime(item.taskStatus?.createdAt ?? item.createdAt)}</span></td>
                   <td className="px-2 py-3 text-center">
-                    <span className="inline-flex items-center justify-center gap-1">
-                      <span className="rounded-full border border-cyan-300/18 bg-cyan-400/8 px-2 py-1 font-black text-cyan-100">{request?.model ? cloneTypeLabel(request.model) : '—'}</span>
-                      {item.result?.fineTune ? <button type="button" onClick={(event) => { event.stopPropagation(); onOpenFineTune(item) }} className="grid h-7 w-7 place-items-center rounded-[6px] border border-amber-300/18 text-amber-200 hover:bg-amber-300/10" aria-label="查看微调报告" title="查看微调报告"><Search className="h-3.5 w-3.5" /></button> : null}
-                    </span>
+                    <span className="rounded-full border border-cyan-300/18 bg-cyan-400/8 px-2 py-1 font-black text-cyan-100">{request?.model ? cloneTypeLabel(request.model) : '—'}</span>
                   </td>
                   <td className={cn('truncate px-2 py-3 text-center font-bold', failed ? 'text-rose-200' : 'text-slate-100')} title={request?.model}>{shortCloneModelName(request?.model)}</td>
                   <td className="px-2 py-3 text-center">
@@ -1935,60 +2209,6 @@ function ManualAnnotationModal({ item, onClose }: { item: CloneHistoryEntry | nu
         <div className="mt-4 rounded-[8px] border border-emerald-300/16 bg-emerald-400/[0.06] p-4">
           <p className="text-xs font-black text-emerald-300">原始与保护参考音频共用这一条人工标注</p>
           <p className="mt-3 whitespace-pre-wrap text-sm leading-7 text-slate-200">{text || '未填写人工标注'}</p>
-        </div>
-      </div>
-    </div>,
-    document.body,
-  )
-}
-
-function FineTuneReportModal({ item, onClose }: { item: CloneHistoryEntry | null; onClose: () => void }) {
-  useEffect(() => {
-    if (!item?.result?.fineTune) return undefined
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose()
-    }
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [item, onClose])
-  const report = item?.result?.fineTune
-  if (!item || !report) return null
-  const rows = [
-    ['原始参考音频', report.original],
-    ['保护参考音频', report.protected],
-  ] as const
-  return createPortal(
-    <div className="fixed inset-0 z-[160] grid place-items-center bg-slate-950/80 px-4 py-8" role="dialog" aria-modal="true" aria-label="微调报告" onClick={onClose}>
-      <div className="ui-card max-h-full w-full max-w-[760px] overflow-y-auto !bg-[#061426] p-5 shadow-[0_28px_90px_rgba(0,0,0,0.62)]" onClick={(event) => event.stopPropagation()}>
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            <p className="text-xs font-bold tracking-[0.12em] text-amber-300">现场微调报告</p>
-            <h3 className="mt-2 text-xl font-black text-white">{shortCloneModelName(report.model ?? item.request?.model)}</h3>
-            <p className="mt-1 font-mono text-xs text-slate-500">{item.cloneSubId ?? item.cloneId ?? item.key}{report.mode ? ` · ${report.mode}` : ''}</p>
-          </div>
-          <button type="button" onClick={onClose} className="grid h-9 w-9 shrink-0 place-items-center rounded-full border border-cyan-300/14 text-slate-300 hover:text-white" aria-label="关闭微调报告"><X className="h-4 w-4" /></button>
-        </div>
-        <div className="mt-5 grid gap-3 sm:grid-cols-2">
-          {rows.map(([label, evidence]) => (
-            <section key={label} className="rounded-[8px] border border-cyan-300/12 bg-slate-950 p-4">
-              <p className="text-sm font-black text-cyan-100">{label}</p>
-              <dl className="mt-3 grid grid-cols-[1fr_auto] gap-x-4 gap-y-2 text-xs">
-                <dt className="text-slate-500">参考音频时长</dt><dd className="font-mono text-slate-200">{formatMetricValue(evidence?.sourceDurationSec, 'seconds')}</dd>
-                <dt className="text-slate-500">训练音频时长</dt><dd className="font-mono text-slate-200">{formatMetricValue(evidence?.trainingDurationSec, 'seconds')}</dd>
-                <dt className="text-slate-500">文本预处理</dt><dd className="font-mono text-slate-200">{formatMetricValue(evidence?.textSec, 'seconds')}</dd>
-                <dt className="text-slate-500">HuBERT 特征</dt><dd className="font-mono text-slate-200">{formatMetricValue(evidence?.hubertSec, 'seconds')}</dd>
-                <dt className="text-slate-500">语义特征</dt><dd className="font-mono text-slate-200">{formatMetricValue(evidence?.semanticSec, 'seconds')}</dd>
-                <dt className="text-slate-500">GPT 训练</dt><dd className="font-mono text-slate-200">{formatMetricValue(evidence?.s1TrainSec, 'seconds')}</dd>
-                <dt className="text-slate-500">SoVITS 训练</dt><dd className="font-mono text-slate-200">{formatMetricValue(evidence?.s2TrainSec, 'seconds')}</dd>
-                <dt className="text-slate-500">推理耗时</dt><dd className="font-mono text-slate-200">{formatMetricValue(evidence?.inferenceWallSec, 'seconds')}</dd>
-                <dt className="text-slate-500">单侧总耗时</dt><dd className="font-mono font-black text-amber-200">{formatMetricValue(evidence?.totalWallSec, 'seconds')}</dd>
-              </dl>
-            </section>
-          ))}
-        </div>
-        <div className="mt-4 flex items-center justify-between rounded-[8px] border border-amber-300/14 bg-slate-950 px-4 py-3 text-sm">
-          <span className="font-bold text-slate-400">原始与保护两侧合计耗时</span>
-          <span className="font-mono font-black text-amber-200">{formatMetricValue(report.pairWallSec, 'seconds')}</span>
         </div>
       </div>
     </div>,
@@ -2380,27 +2600,6 @@ function computeEditMetrics(originalText: string, protectedText: string, level: 
   }
 }
 
-function asrErrorShares(asrEval: AsrEval, editStats: EditMetrics | null) {
-  const direct = asrEval.errorShares
-  if (direct && [direct.substituteShare, direct.insertShare, direct.deleteShare].some((value) => optionalNumber(value) !== null)) {
-    return {
-      substituteShare: optionalNumber(direct.substituteShare) ?? 0,
-      insertShare: optionalNumber(direct.insertShare) ?? 0,
-      deleteShare: optionalNumber(direct.deleteShare) ?? 0,
-    }
-  }
-  const counts = asrEval.editCounts
-  if (counts && optionalNumber(counts.totalErrors) !== null) {
-    const total = Math.max(optionalNumber(counts.totalErrors) ?? 0, 1)
-    return {
-      substituteShare: counts.totalErrors ? counts.substitutions / total : 0,
-      insertShare: counts.totalErrors ? counts.insertions / total : 0,
-      deleteShare: counts.totalErrors ? counts.deletions / total : 0,
-    }
-  }
-  return editStats?.errorShares ?? null
-}
-
 function renderDiffOps(diffOps: DiffOp[]): ReactNode[] {
   const joiner = diffOps.some((op) => ('text' in op ? /\s/.test(op.text) : /\s/.test(`${op.from}${op.to}`))) ? ' ' : ''
   const nodes: ReactNode[] = []
@@ -2412,7 +2611,7 @@ function renderDiffOps(diffOps: DiffOp[]): ReactNode[] {
     }
     if (op.type === 'insert') {
       nodes.push(
-        <span key={`ins-${index}`} className="text-red-300">
+        <span key={`ins-${index}`} className="rounded-[3px] bg-red-400/[0.07] px-0.5 text-red-300 transition-colors duration-200 hover:bg-red-400/[0.16]" title="新增内容">
           {op.text}
           {spacer}
         </span>,
@@ -2421,7 +2620,7 @@ function renderDiffOps(diffOps: DiffOp[]): ReactNode[] {
     }
     if (op.type === 'delete') {
       nodes.push(
-        <span key={`del-${index}`} className="text-emerald-300 line-through decoration-emerald-300/70">
+        <span key={`del-${index}`} className="rounded-[3px] bg-emerald-400/[0.06] px-0.5 text-emerald-300 line-through decoration-emerald-300/70 transition-colors duration-200 hover:bg-emerald-400/[0.14]" title="缺失内容">
           {op.text}
           {spacer}
         </span>,
@@ -2430,10 +2629,10 @@ function renderDiffOps(diffOps: DiffOp[]): ReactNode[] {
     }
     if ('from' in op) {
       nodes.push(
-        <span key={`replace-del-${index}`} className="text-emerald-300 line-through decoration-emerald-300/70">
+        <span key={`replace-del-${index}`} className="rounded-[3px] bg-emerald-400/[0.06] px-0.5 text-emerald-300 line-through decoration-emerald-300/70 transition-colors duration-200 hover:bg-emerald-400/[0.14]" title="替换前内容">
           {op.from}
         </span>,
-        <span key={`replace-ins-${index}`} className="text-red-300">
+        <span key={`replace-ins-${index}`} className="rounded-[3px] bg-red-400/[0.07] px-0.5 text-red-300 transition-colors duration-200 hover:bg-red-400/[0.16]" title="替换后内容">
           {joiner}
           {op.to}
           {spacer}
@@ -2464,89 +2663,38 @@ function QualityPanel({ result, embedded }: { result: TaskResult; embedded?: boo
   const snr = optionalNumber(result.protectionQuality?.snr) ?? optionalNumber(result.quality.snr)
   const pesq = optionalNumber(result.protectionQuality?.pesq) ?? optionalNumber(result.quality.pesq)
   const stoi = optionalNumber(result.protectionQuality?.stoi)
-  const backendMos = optionalNumber(result.protectionQuality?.mos)
-  const manualMosKey = `manual-mos:${result.taskId || 'current'}`
-  const readManualMos = (key: string) => {
-    const saved = window.localStorage.getItem(key)
-    if (saved === null) return null
-    const value = Number(saved)
-    return Number.isFinite(value) ? clamp(value, 1, 5) : null
-  }
-  const [manualMosState, setManualMosState] = useState<{ key: string; value: number | null }>(() => ({ key: manualMosKey, value: readManualMos(manualMosKey) }))
-  const manualMos = manualMosState.key === manualMosKey ? manualMosState.value : readManualMos(manualMosKey)
-  const setManualMos = (value: number | null) => setManualMosState({ key: manualMosKey, value })
-  const [editingMos, setEditingMos] = useState(false)
-  const [mosDraft, setMosDraft] = useState('')
-  const mos = backendMos ?? manualMos
+  const dnsMos = optionalNumber(result.protectionQuality?.dnsMos)
   const missingReasons = [
     pesq === null ? ['PESQ', metricReason(result, ['protectionQuality.pesq'])] : null,
     stoi === null ? ['STOI', metricReason(result, ['protectionQuality.stoi'])] : null,
+    dnsMos === null ? ['DNSMOS', result.protectionQuality?.dnsMosReason ? friendlyCloneMetricReason(result.protectionQuality.dnsMosReason) : metricReason(result, ['protectionQuality.dnsMos'])] : null,
   ].filter((item): item is [string, string] => Boolean(item?.[1]))
-
-  const startMosEdit = () => {
-    if (backendMos !== null) return
-    setMosDraft(manualMos === null ? '' : String(manualMos))
-    setEditingMos(true)
-  }
-
-  const commitMosEdit = () => {
-    const trimmed = mosDraft.trim()
-    if (!trimmed) {
-      window.localStorage.removeItem(manualMosKey)
-      setManualMos(null)
-      setEditingMos(false)
-      return
-    }
-    const value = Number(trimmed)
-    if (!Number.isFinite(value)) {
-      setEditingMos(false)
-      return
-    }
-    const normalized = Math.round(clamp(value, 1, 5) * 10) / 10
-    window.localStorage.setItem(manualMosKey, String(normalized))
-    setManualMos(normalized)
-    setEditingMos(false)
-  }
 
   return (
     <section className={cn(embedded ? 'mt-5' : 'ui-card p-5')}>
       <SectionTitle>感知质量评估</SectionTitle>
       <div className="mt-5 grid grid-cols-[repeat(auto-fit,minmax(132px,1fr))] gap-3">
-        <QualityMetric label="SNR" value={formatMetricValue(snr, 'db')} tag={snr === null ? '未生成' : '信噪比'} tone="green" foot="原始语音与扰动噪声的强弱比；数值越高，音频越接近原音。" />
+        <QualityMetric
+          label="SNR"
+          value={formatMetricValue(snr, 'db')}
+          tag={snr === null ? '未生成' : '信噪比'}
+          tone="green"
+          foot={(
+            <MetricFormulaContent
+              description="比较原始语音功率与保护扰动功率。"
+              formulas={['\\mathrm{SNR}=10\\log_{10}\\!\\left(\\frac{P_x+10^{-12}}{P_{\\delta}+10^{-12}}\\right)\\,\\mathrm{dB}']}
+              note="数值越高，表示扰动相对越弱，保护音频越接近原音。"
+            />
+          )}
+        />
         <QualityMetric label="PESQ" value={formatMetricValue(pesq, 'number')} tag={pesq === null ? '未生成' : '听感质量'} tone="blue" foot="模拟人耳评价语音质量，分数越高表示听感越好。" />
         <QualityMetric label="STOI" value={formatMetricValue(stoi, 'number')} tag={stoi === null ? '未生成' : '可懂度'} tone="blue" foot="衡量语音是否容易听懂，越接近 1 表示可懂度越高。" />
         <QualityMetric
-          label="人工MOS"
-          value={
-            editingMos ? (
-              <input
-                autoFocus
-                className="h-7 w-20 rounded-[6px] border border-orange-300/28 bg-slate-950/80 px-2 text-center text-[18px] font-black leading-none text-orange-200 outline-none focus:border-orange-200"
-                inputMode="decimal"
-                max={5}
-                min={1}
-                onBlur={commitMosEdit}
-                onChange={(event) => setMosDraft(event.target.value)}
-                onClick={(event) => event.stopPropagation()}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter') commitMosEdit()
-                  if (event.key === 'Escape') setEditingMos(false)
-                }}
-                step={0.1}
-                type="number"
-                value={mosDraft}
-              />
-            ) : mos === null ? (
-              '自行评价'
-            ) : (
-              formatMetricValue(mos, 'number')
-            )
-          }
-          onClick={backendMos === null ? startMosEdit : undefined}
-          tag={backendMos === null ? (manualMos === null ? '点击输入' : '人工反馈') : 'perception'}
-          title={backendMos === null ? '点击输入 1-5 分人工 MOS' : undefined}
+          label={<span className="block min-w-0 whitespace-nowrap text-[11px] sm:text-[12px]"><span className="hidden sm:inline">DNSMOS</span><span className="sm:hidden">DNS</span></span>}
+          value={formatMetricValue(dnsMos, 'number')}
+          tag={dnsMos === null ? '未生成' : '语音质量评分'}
           tone="orange"
-          foot="人工试听给出的主观质量评分，范围为 1–5 分；分数越高表示听感越好。"
+          foot={'语音质量评分，范围为 \\([1,5]\\) 分；分数越高表示听感越好。'}
         />
       </div>
       {missingReasons.length ? (
@@ -2574,11 +2722,14 @@ function PsychoacousticPanel({ result }: { result: TaskResult }) {
   const originalDuration = optionalNumber(result.originalAudio.durationSec) ?? optionalNumber(result.originalAudio.duration)
   const audioDurationSec = protectedDuration ?? originalDuration ?? getAudioDuration(result.protectedAudio) ?? getAudioDuration(result.originalAudio)
   const chartPoints = psychoMode === 'frame' && sliceData ? psychoPointsFromSlice(sliceData) : psychoPointsFromResult(result)
-  const modeLabel = psychoMode === 'frame' ? `t = ${(actualTimeSec ?? selectedTimeSec ?? 0).toFixed(2)} s 对应帧` : 't 平均聚合'
+  const modeTime = (actualTimeSec ?? selectedTimeSec ?? 0).toFixed(2)
+  const modeLabel = psychoMode === 'frame'
+    ? <><MathText formula={`t=${modeTime}\\,\\mathrm{s}`} className="align-[-1px]" /> 对应帧</>
+    : <><MathText formula="t" className="align-[-1px]" /> 平均聚合</>
   const modeDescription =
     psychoMode === 'frame'
       ? frameIndex !== null && actualTimeSec !== null
-        ? `当前显示 t = ${actualTimeSec.toFixed(2)}s 附近第 ${frameIndex} 帧的心理声学阈值与扰动谱。`
+        ? `当前显示 \\(t=${actualTimeSec.toFixed(2)}\\,\\mathrm{s}\\) 附近第 ${frameIndex} 帧的心理声学阈值与扰动谱。`
         : '当前显示指定时间附近的单帧心理声学曲线。'
       : '该图为 STFT 时频结果沿时间帧取平均后的频率维曲线。'
 
@@ -2673,7 +2824,7 @@ function PsychoacousticPanel({ result }: { result: TaskResult }) {
               </button>
             </div>
             <label className="text-[12px] font-bold text-slate-300" htmlFor="psycho-time-sec">
-              时间 t（秒）
+              时间 <MathText formula="t" className="mx-0.5 align-[-1px]" />（秒）
             </label>
             <input
               id="psycho-time-sec"
@@ -2710,7 +2861,7 @@ function PsychoacousticPanel({ result }: { result: TaskResult }) {
   )
 }
 
-function PsychoacousticModeDropdown({ label, open, onToggle, onMean, onFrame }: { label: string; open: boolean; onToggle: () => void; onMean: () => void; onFrame: () => void }) {
+function PsychoacousticModeDropdown({ label, open, onToggle, onMean, onFrame }: { label: ReactNode; open: boolean; onToggle: () => void; onMean: () => void; onFrame: () => void }) {
   return (
     <div className="relative">
       <button
@@ -2726,10 +2877,10 @@ function PsychoacousticModeDropdown({ label, open, onToggle, onMean, onFrame }: 
       {open ? (
         <div className="absolute left-1/2 top-11 z-20 w-[180px] -translate-x-1/2 rounded-[8px] border border-cyan-300/18 bg-slate-950 p-1 shadow-[0_18px_45px_rgba(0,0,0,0.42)]" role="menu">
           <button type="button" onClick={onMean} className="block h-9 w-full rounded-[6px] px-3 text-left text-[12px] font-bold text-slate-200 hover:bg-cyan-300/[0.08] hover:text-cyan-100" role="menuitem">
-            t 平均聚合
+            <MathText formula="t" className="mr-1 align-[-1px]" />平均聚合
           </button>
           <button type="button" onClick={onFrame} className="block h-9 w-full rounded-[6px] px-3 text-left text-[12px] font-bold text-slate-200 hover:bg-cyan-300/[0.08] hover:text-cyan-100" role="menuitem">
-            指定 t 对应帧
+            指定 <MathText formula="t" className="mx-1 align-[-1px]" />对应帧
           </button>
         </div>
       ) : null}
@@ -2737,10 +2888,10 @@ function PsychoacousticModeDropdown({ label, open, onToggle, onMean, onFrame }: 
   )
 }
 
-function QualityMetric({ label, value, tag, tone, onClick, title, foot }: { label: string; value: ReactNode; tag: string; tone: 'green' | 'blue' | 'orange'; onClick?: () => void; title?: string; foot?: ReactNode }) {
+function QualityMetric({ label, value, tag, tone, onClick, title, foot }: { label: ReactNode; value: ReactNode; tag: string; tone: 'green' | 'blue' | 'orange'; onClick?: () => void; title?: string; foot?: ReactNode }) {
   return (
     <div
-      className={cn('relative rounded-[9px] border border-cyan-300/12 bg-slate-950/16 px-3 py-3.5 text-center', onClick && 'cursor-pointer transition hover:border-orange-300/28 hover:bg-orange-300/[0.04]')}
+      className={cn('relative min-w-0 rounded-[9px] border border-cyan-300/12 bg-slate-950/16 px-3 py-3.5 text-center', onClick && 'cursor-pointer transition hover:border-orange-300/28 hover:bg-orange-300/[0.04]')}
       onClick={onClick}
       onKeyDown={(event) => {
         if (!onClick) return
@@ -2754,7 +2905,7 @@ function QualityMetric({ label, value, tag, tone, onClick, title, foot }: { labe
       title={title}
     >
       <div className="relative min-h-7">
-        <p className="absolute inset-x-0 top-1/2 -translate-y-1/2 truncate px-8 text-center text-[12px] font-black text-slate-300">{label}</p>
+        <p className="absolute inset-x-0 top-1/2 min-w-0 -translate-y-1/2 truncate whitespace-nowrap px-8 text-center text-[12px] font-black text-slate-300">{label}</p>
         {foot ? <div className="absolute right-0 top-1/2 -translate-y-1/2"><MetricInfoButton title={label}>{foot}</MetricInfoButton></div> : null}
       </div>
       <div className={cn('mt-1 flex h-6 items-center justify-center text-[20px] font-black leading-none', tone === 'green' && 'text-emerald-300', tone === 'blue' && 'text-cyan-300', tone === 'orange' && 'text-orange-300')}>{value}</div>
@@ -2830,11 +2981,11 @@ function TrendPanel({ result, embedded }: { result: TaskResult; embedded?: boole
           <div className="rounded-[7px] border border-cyan-300/12 bg-slate-950/20 px-5 py-5">
             <div className="flex items-center justify-between gap-4">
               <p className="text-[11px] font-bold text-slate-400">平均每次迭代耗时</p>
-              <p className="text-[14px] font-black text-cyan-200">{avgIterationSec === null ? '未生成' : `${avgIterationSec.toFixed(2)} s / step`}</p>
+              <p className="text-[14px] font-black text-cyan-200">{avgIterationSec === null ? '未生成' : <MathText formula={`${avgIterationSec.toFixed(2)}\\,\\mathrm{s/step}`} />}</p>
             </div>
             <div className="mt-3 flex items-center justify-between gap-4 border-t border-cyan-300/10 pt-3">
               <p className="text-[11px] font-bold text-slate-400">总共迭代步数</p>
-              <p className="text-[14px] font-black text-white">{totalIterationSteps === null ? '未生成' : `${Math.round(totalIterationSteps)} steps`}</p>
+              <p className="text-[14px] font-black text-white">{totalIterationSteps === null ? '未生成' : <MathText formula={`${Math.round(totalIterationSteps)}\\,\\mathrm{steps}`} />}</p>
             </div>
           </div>
         </div>
@@ -3008,17 +3159,10 @@ function friendlyAsrFailure(reason?: string | null) {
   return value.split('\n')[0]
 }
 
-function formatRatioPercent(value: unknown, options?: { clampToUnit?: boolean }) {
+function formatRatioPercent(value: unknown) {
   const numberValue = optionalNumber(value)
   if (numberValue === null) return '未生成'
-  const normalized = options?.clampToUnit ? clamp(numberValue, 0, 1) : numberValue
-  return `${(normalized * 100).toFixed(2)}%`
-}
-
-function formatRadarScore(value: unknown) {
-  const numberValue = optionalNumber(value)
-  if (numberValue === null) return '未生成'
-  return `${clamp(numberValue, 0, 100).toFixed(2)} 分`
+  return `${(numberValue * 100).toFixed(2)}%`
 }
 
 function formatTaskTime(value?: string | null) {
@@ -3036,6 +3180,10 @@ function optionalNumber(value: unknown) {
   if (value === null || value === undefined || value === '') return null
   const numberValue = typeof value === 'number' ? value : Number(value)
   return Number.isFinite(numberValue) ? numberValue : null
+}
+
+function metricStatusAvailable(status?: string | null) {
+  return ['available', 'computed', 'complete', 'completed', 'success', 'partial'].includes(String(status ?? '').toLowerCase())
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -3069,6 +3217,20 @@ function shortMetricReason(reason: string) {
   return reason.split('\n')[0].trim()
 }
 
+function friendlyCloneMetricReason(reason?: string | null) {
+  const value = String(reason ?? '').trim()
+  if (!value) return '待完成对应测试'
+  if (/baseline|基线/i.test(value)) {
+    if (/identity|speaker|声纹|身份/i.test(value)) return '原始克隆语音的声音身份参考不足'
+    if (/semantic|text|transcript|语义|文本/i.test(value)) return '原始克隆语音的文本结果不足'
+    if (/quality|mos|质量/i.test(value)) return '原始克隆语音的质量结果不足'
+    return '原始克隆语音结果不足'
+  }
+  if (/dnsmos|DNSMOS|no[-_ ]?reference|无参考|quality model|quality_model/i.test(value)) return '语音质量评分暂不可用'
+  if (/clone.*asr|asr.*clone|transcri|自动转写/i.test(value)) return '克隆语音文本暂未生成'
+  return shortMetricReason(value)
+}
+
 function formatLossNumber(value: unknown) {
   const numberValue = optionalNumber(value)
   if (numberValue === null) return '未生成'
@@ -3100,22 +3262,6 @@ function lossFinalValue(lossFinal: LossFinal | null | undefined, loss: { key: Lo
 function lastStep(points: LossTrendPoint[]) {
   const step = optionalNumber(points.at(-1)?.step)
   return step && step > 0 ? step : null
-}
-
-function computeEpsilonUsageRate(perturbation: TaskResult['perturbation']) {
-  if (!perturbation) return null
-  const epsilon = optionalNumber(perturbation.epsilon)
-  if (epsilon === null || epsilon <= 0) return null
-  const epsilonNorm = perturbation.epsilonNorm
-  if (epsilonNorm === 'linf') {
-    const linfNorm = optionalNumber(perturbation.linfNorm)
-    return linfNorm === null ? null : linfNorm / epsilon
-  }
-  if (epsilonNorm === 'l2') {
-    const l2Norm = optionalNumber(perturbation.l2Norm)
-    return l2Norm === null ? null : l2Norm / epsilon
-  }
-  return null
 }
 
 function downsampleTrace(trace: LossTrendPoint[] | null | undefined, maxPoints = 80) {
@@ -3276,7 +3422,7 @@ function linkedCloneTuningAdvice({ linkedTaskStatus, cloneEval, cloneHistory }: 
   const sampleText = `基于 ${validEvaluations.length} 次可用克隆结果，保护后声纹相似度平均值为 ${similarityText}`
   const dropText = similarityDropRate === null ? '' : `，相对原始克隆的平均下降幅度为 ${formatRatioPercent(similarityDropRate)}`
   if (originalSimilarity !== null && originalSimilarity < speakerSameIdentityThreshold) {
-    return `调参建议（克隆平均联动）：基于 ${validEvaluations.length} 次可用克隆结果，原始克隆声纹相似度平均值为 ${originalSimilarity.toFixed(2)}，整体克隆基线偏弱；建议先更换克隆模型或样本复测，暂不据此调整 \\(\\lambda_{\\mathrm{id}}\\)。`
+    return `调参建议（克隆平均联动）：基于 ${validEvaluations.length} 次可用克隆结果，原始克隆声纹相似度平均值为 ${originalSimilarity.toFixed(2)}，原始克隆效果偏弱；建议先更换克隆模型或样本复测，暂不据此调整 \\(\\lambda_{\\mathrm{id}}\\)。`
   }
   if (protectedSimilarity >= speakerHighSimilarityThreshold) {
     return `调参建议（克隆平均联动）：${sampleText}${dropText}，整体声音身份残留较高；建议提高 \\(\\lambda_{\\mathrm{id}}\\) 后重新保护并复测。`
@@ -3294,7 +3440,8 @@ function generateProtectionInsights(result: TaskResult, evaluationContext: Prote
   const snr = optionalNumber(perturbation?.snr) ?? optionalNumber(quality?.snr)
   const pesq = optionalNumber(quality?.pesq)
   const stoi = optionalNumber('stoi' in (quality ?? {}) ? (quality as { stoi?: number | null }).stoi : null)
-  const epsilonUsageRate = optionalNumber(perturbation?.epsilonUsageRate) ?? computeEpsilonUsageRate(perturbation)
+  const dnsMos = optionalNumber('dnsMos' in (quality ?? {}) ? (quality as { dnsMos?: number | null }).dnsMos : null)
+  const epsilonUsageRate = resolveEpsilonUsageRate(perturbation)
   const trends = {
     Lid: analyzeLossTrend(trace, 'Lid'),
     Lsem: analyzeLossTrend(trace, 'Lsem'),
@@ -3308,7 +3455,7 @@ function generateProtectionInsights(result: TaskResult, evaluationContext: Prote
   if (epsilonUsageRate === null) {
     items.push('指标概览：扰动预算使用率尚未完成评估。')
   } else {
-    const usage = formatRatioPercent(epsilonUsageRate, { clampToUnit: true })
+    const usage = formatRatioPercent(epsilonUsageRate)
     const strength = epsilonUsageRate < 0.7 ? '保护强度较为保守' : epsilonUsageRate < 0.9 ? '保护强度处于中等水平' : '当前保护强度较高'
     items.push(`指标概览：本次保护的扰动预算使用率为 ${usage}，${strength}。`)
   }
@@ -3325,6 +3472,10 @@ function generateProtectionInsights(result: TaskResult, evaluationContext: Prote
   if (stoi !== null) {
     const level = stoi >= 0.9 ? '语音可懂度良好' : stoi >= 0.75 ? '语音可懂度中等' : '语音可懂度较弱'
     qualityNotes.push(`STOI 为 ${stoi.toFixed(2)}，${level}。`)
+  }
+  if (dnsMos !== null) {
+    const level = dnsMos >= 4 ? '语音质量较好' : dnsMos >= 3 ? '语音质量中等' : '语音质量偏低'
+    qualityNotes.push(`语音质量评分为 ${dnsMos.toFixed(2)}，${level}。`)
   }
   items.push(`听感质量：${qualityNotes.length ? qualityNotes.join('') : '该指标尚未完成评估。'}`)
   items.push(`心理声学保真：${lossTrendText('Lpsy', trends.Lpsy.direction)}`)

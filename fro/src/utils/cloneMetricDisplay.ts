@@ -3,6 +3,15 @@ export type CloneMetricInput = {
   protectedSimilarity?: number | null
   embeddingDistanceBefore?: number | null
   embeddingDistanceAfter?: number | null
+  embeddingDistanceDelta?: number | null
+  cloneIdentityScore?: number | null
+  cloneSemanticScore?: number | null
+  cloneQualityScore?: number | null
+  cloneQualityDropRate?: number | null
+  cloneSemanticStatus?: string | null
+  cloneSemanticReason?: string | null
+  cloneQualityStatus?: string | null
+  cloneQualityReason?: string | null
 }
 
 export function optionalMetricNumber(value: unknown) {
@@ -50,7 +59,8 @@ export function formatEmbeddingDistanceDelta(delta: number | null | undefined) {
 export function cloneMetricDisplay(input: CloneMetricInput) {
   const similarityDelta = computeAbsoluteDelta(input.originalSimilarity, input.protectedSimilarity)
   const similarityDropAbs = computeAbsoluteDrop(input.originalSimilarity, input.protectedSimilarity)
-  const embeddingDistanceDelta = computeAbsoluteDelta(input.embeddingDistanceBefore, input.embeddingDistanceAfter)
+  const embeddingDistanceDelta = optionalMetricNumber(input.embeddingDistanceDelta)
+    ?? computeAbsoluteDelta(input.embeddingDistanceBefore, input.embeddingDistanceAfter)
   return {
     similarityBefore: formatCloneMetricNumber(input.originalSimilarity),
     similarityAfter: formatCloneMetricNumber(input.protectedSimilarity),
@@ -64,27 +74,43 @@ export function cloneMetricDisplay(input: CloneMetricInput) {
 }
 
 export function generateCloneMetricInsights(input: CloneMetricInput) {
-  const similarityDropAbs = computeAbsoluteDrop(input.originalSimilarity, input.protectedSimilarity)
-  const embeddingDistanceDelta = computeAbsoluteDelta(input.embeddingDistanceBefore, input.embeddingDistanceAfter)
+  const embeddingDistanceDelta = optionalMetricNumber(input.embeddingDistanceDelta)
+    ?? computeAbsoluteDelta(input.embeddingDistanceBefore, input.embeddingDistanceAfter)
+  const identityScore = optionalMetricNumber(input.cloneIdentityScore)
+  const semanticScore = optionalMetricNumber(input.cloneSemanticScore)
+  const qualityScore = optionalMetricNumber(input.cloneQualityScore)
+  const qualityDropRate = optionalMetricNumber(input.cloneQualityDropRate)
   const items: string[] = []
-  if (similarityDropAbs !== null) {
-    const direction = similarityDropAbs > 0 ? '绝对下降' : similarityDropAbs < 0 ? '绝对上升' : '无明显变化'
-    const magnitude = similarityDropAbs === 0 ? '' : ` ${Math.abs(similarityDropAbs).toFixed(2)}`
-    items.push(
-      `保护后克隆相似度从 ${formatCloneMetricNumber(input.originalSimilarity)} 变为 ${formatCloneMetricNumber(input.protectedSimilarity)}，${direction}${magnitude}。`,
-    )
-  }
   if (embeddingDistanceDelta !== null) {
-    const direction = embeddingDistanceDelta > 0 ? '增加' : embeddingDistanceDelta < 0 ? '减少' : '无明显变化'
-    const magnitude = embeddingDistanceDelta === 0 ? '' : `，绝对${direction} ${Math.abs(embeddingDistanceDelta).toFixed(2)}`
-    items.push(
-      `embedding cosine distance 从 ${formatCloneMetricNumber(input.embeddingDistanceBefore)} ${direction === '增加' ? '增加到' : direction === '减少' ? '减少到' : '保持在'} ${formatCloneMetricNumber(input.embeddingDistanceAfter)}${magnitude}。`,
-    )
-    items.push('cosine distance = 1 - cosine similarity，因此当相似度为负时，距离可以大于 1。')
+    const level = embeddingDistanceDelta >= 0.2 ? '明显' : embeddingDistanceDelta >= 0.05 ? '中等' : '偏低'
+    items.push(`身份差异${level}：声纹嵌入距离由 ${formatCloneMetricNumber(input.embeddingDistanceBefore)} 变为 ${formatCloneMetricNumber(input.embeddingDistanceAfter)}，克隆后的声音身份${embeddingDistanceDelta > 0 ? '与原说话人进一步分离' : embeddingDistanceDelta < 0 ? '与原说话人更加接近' : '未出现明显变化'}。`)
   }
-  if ([input.originalSimilarity, input.protectedSimilarity, input.embeddingDistanceBefore, input.embeddingDistanceAfter].some((value) => optionalMetricNumber(value) === null)) {
-    items.push('部分克隆指标未生成，不做强结论。')
+  if (semanticScore !== null) {
+    const level = semanticScore >= 70 ? '较高' : semanticScore >= 40 ? '中等' : '偏低'
+    items.push(`语义干扰${level}：克隆后语义干扰评分为 ${semanticScore.toFixed(2)} 分，反映保护前后克隆表达内容的实际变化。`)
+  } else if (input.cloneSemanticReason) {
+    items.push('语义干扰暂不可用：克隆语音文本尚未完整生成。')
   }
-  if (items.length === 0) items.push('语音克隆评估已执行，但暂时没有足够指标用于生成结论。')
+  if (qualityScore !== null) {
+    const level = qualityScore >= 70 ? '明显' : qualityScore >= 40 ? '中等' : '较低'
+    const dropText = qualityDropRate === null ? '' : `，语音质量相对下降 ${(qualityDropRate * 100).toFixed(2)}%`
+    items.push(`克隆质量退化${level}：质量退化评分为 ${qualityScore.toFixed(2)} 分${dropText}。`)
+  } else if (input.cloneQualityReason) {
+    items.push('克隆质量退化暂不可用：语音质量评分尚未生成。')
+  }
+  if (identityScore !== null) {
+    const level = identityScore >= 85 ? '优秀' : identityScore >= 70 ? '中等' : '较差'
+    items.push(`身份保护效果${level}：克隆身份保护评分为 ${identityScore.toFixed(2)} 分。`)
+  }
+  if (identityScore !== null && semanticScore !== null && qualityScore !== null) {
+    const scores = [identityScore, semanticScore, qualityScore]
+    const conclusion = scores.every((score) => score >= 70)
+      ? '总体克隆防护效果良好。'
+      : scores.filter((score) => score >= 40).length >= 2
+        ? '总体克隆防护效果中等。'
+        : '总体克隆防护效果偏弱。'
+    items.push(conclusion)
+  }
+  if (items.length === 0) items.push('语音克隆评估已执行，但身份、语义或质量评分尚未生成。')
   return items
 }

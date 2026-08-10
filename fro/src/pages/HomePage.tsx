@@ -13,9 +13,12 @@ import {
   Waves,
   Zap,
 } from 'lucide-react'
+import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import heroShieldScene from '@/assets/reference-hero-shield-scene.png'
 import { cn } from '@/lib/utils'
+import { getTaskResult, getTaskStatus, listTasks } from '@/services/apiClient'
+import type { TaskResult, TaskStatusResponse } from '@/types/task'
 
 const heroChecks = ['端到端可验证', '多模型自适应', '听感友好', '高效易用']
 
@@ -23,15 +26,15 @@ const strategies = [
   {
     title: '语义防护',
     tag: '推荐',
-    desc: '干扰语义表示，降低 ASR/LLM 理解准确率',
-    points: ['语义表示扰动', '对抗迁移鲁棒', '多模型泛化'],
+    desc: '干扰语义表示，降低语言系统理解准确率',
+    points: ['语义表示扰动', '多模型泛化'],
     icon: BrainCircuit,
     tone: 'green',
   },
   {
     title: '声音身份防护',
     desc: '削弱声学特征，降低相似度与克隆质量',
-    points: ['声学特征干扰', '抑制特征建模', '克隆攻击抵御'],
+    points: ['声学特征干扰', '抑制特征建模'],
     icon: Fingerprint,
     tone: 'blue',
   },
@@ -44,43 +47,137 @@ const strategies = [
   },
 ] as const
 
-const metrics = [
-  { title: 'ASR 干扰（平均）', value: '↓ 62.3%', sub: '识别准确率下降', tone: 'red', data: [40, 72, 52, 69, 50, 80, 61, 34] },
-  { title: '声纹相似度下降', value: '↓ 0.736', sub: '克隆相似度降低', tone: 'red', data: [28, 46, 66, 50, 74, 42, 56, 38] },
-  { title: 'SNR 信噪比', value: '25.1', sub: '高保真听感', tone: 'green', data: [35, 45, 38, 62, 54, 77, 69, 82] },
-  { title: '对抗评估（攻击成功率）', value: '↓ 85.6%', sub: '多攻击平均下降', tone: 'red', data: [22, 38, 55, 31, 76, 42, 37, 25] },
-  { title: '任务通过率', value: '98.7%', sub: '通过率（内部基准）', tone: 'cyan', data: [16, 22, 28, 45, 39, 56, 73, 88] },
-  { title: '单步平均时长', value: '0.9s', sub: '平均耗时', tone: 'blue', data: [18, 47, 26, 62, 38, 70, 54, 76] },
-]
+const metricTemplates = [
+  { title: 'ASR 干扰（平均）', sub: '识别准确率下降', tone: 'red' },
+  { title: '声纹相似度下降', sub: '克隆相似度降低', tone: 'red' },
+  { title: 'SNR 信噪比', sub: '高保真听感', tone: 'green' },
+  { title: '对抗评估（攻击成功率）', sub: '多攻击平均下降', tone: 'red' },
+  { title: '任务通过率', sub: '通过率（内部基准）', tone: 'cyan' },
+  { title: '单步平均时长', sub: '平均耗时', tone: 'blue' },
+] as const
+
+type HomeMetricSnapshot = {
+  result: TaskResult
+  status: TaskStatusResponse
+}
+
+type HomeMetric = (typeof metricTemplates)[number] & {
+  value: string
+  data: number[]
+}
+
+function optionalNumber(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function series(values: unknown[]) {
+  const available = values.map(optionalNumber).filter((value): value is number => value !== null)
+  if (available.length >= 2) return available
+  if (available.length === 1) return [available[0], available[0]]
+  return [0, 0]
+}
+
+function sampled(values: unknown[], maxPoints = 8) {
+  const available = series(values)
+  if (available.length <= maxPoints) return available
+  return Array.from({ length: maxPoints }, (_, index) => available[Math.round((index / (maxPoints - 1)) * (available.length - 1))])
+}
+
+function average(values: Array<number | null>) {
+  const available = values.filter((value): value is number => value !== null)
+  return available.length ? available.reduce((sum, value) => sum + value, 0) / available.length : null
+}
+
+function percent(value: number | null, prefix = '') {
+  return value === null ? '—' : `${prefix}${(value * 100).toFixed(2)}%`
+}
+
+function decimal(value: number | null, prefix = '', suffix = '') {
+  return value === null ? '—' : `${prefix}${value.toFixed(2)}${suffix}`
+}
+
+function buildHomeMetrics(snapshot?: HomeMetricSnapshot): { metrics: HomeMetric[]; impactValues: string[] } {
+  const result = snapshot?.result
+  const status = snapshot?.status
+  const tokenErrorRate = optionalNumber(result?.semanticEval?.tokenErrorRate)
+  const tokenChangeRate = optionalNumber(result?.semanticEval?.tokenChangeRate)
+  const semanticDrift = optionalNumber(result?.semanticEval?.semanticDrift)
+  const snr = optionalNumber(result?.protectionQuality?.snr)
+  const averageStepSec = optionalNumber(result?.averageStepSec)
+  const cloneEvaluations = (result?.cloneResults ?? []).flatMap((item) => item.cloneEval ? [item.cloneEval] : [])
+  const similarityDrops = cloneEvaluations.map((item) => {
+    const before = optionalNumber(item.originalSimilarity)
+    const after = optionalNumber(item.protectedSimilarity)
+    return before === null || after === null ? null : Math.max(0, before - after)
+  })
+  const relativeSimilarityDrops = cloneEvaluations.map((item) => optionalNumber(item.similarityDropRate))
+  const averageSimilarityDrop = average(similarityDrops)
+  const averageRelativeSimilarityDrop = average(relativeSimilarityDrops)
+  const subtasks = [...(status?.asrTasks ?? []), ...(status?.cloneTasks ?? [])]
+  const completedSubtasks = subtasks.filter((item) => item.status === 'completed' || item.status === 'success').length
+  const taskPassRate = subtasks.length ? completedSubtasks / subtasks.length : null
+  const asrSeries = series((result?.asrResults ?? []).map((item) => optionalNumber(item.asr?.wer)).map((value) => value === null ? null : value * 100))
+  const similaritySeries = series(similarityDrops.map((value) => value === null ? null : value * 100))
+  const snrSeries = sampled((result?.optimizationTrace ?? []).map((item) => item.snr))
+  const attackSeries = series(relativeSimilarityDrops.map((value) => value === null ? null : value * 100))
+  const passSeries = series(subtasks.map((item) => item.status === 'completed' || item.status === 'success' ? 100 : item.status === 'failed' || item.status === 'error' || item.status === 'cancelled' ? 0 : null))
+  const timingSeries = sampled((result?.optimizationTrace ?? []).map((item) => optionalNumber(item.stepElapsedSec)).map((value) => value === null ? null : value * 1000))
+  const values = [
+    percent(tokenErrorRate, '↓ '),
+    decimal(averageSimilarityDrop, '↓ '),
+    decimal(snr),
+    percent(averageRelativeSimilarityDrop, '↓ '),
+    percent(taskPassRate),
+    decimal(averageStepSec, '', 's'),
+  ]
+  const data = [asrSeries, similaritySeries, snrSeries, attackSeries, passSeries, timingSeries]
+  return {
+    metrics: metricTemplates.map((template, index) => ({ ...template, value: values[index], data: data[index] })),
+    impactValues: [percent(tokenErrorRate, '↓ '), percent(tokenChangeRate, '↑ '), percent(semanticDrift, '↓ '), decimal(averageSimilarityDrop, '↓ ')],
+  }
+}
 
 const capabilities = [
   { title: '双重防护机制', icon: ShieldCheck, desc: '语义及声音身份双通路协同，全面降低被克隆与滥用风险。', tone: 'green' },
   { title: '多模型泛化', icon: Puzzle, desc: '覆盖主流 ASR / Tokenizer / LLM / TTS 模型，具备强迁移能力。', tone: 'blue' },
   { title: '听感无感知', icon: Ear, desc: '基于心理声学约束，保障人耳听感质量与发布可用性。', tone: 'purple' },
-  { title: '可解释可评估', icon: Gauge, desc: '全流程评估与可视化，风险可控、结果可追踪、报告可导出。', tone: 'amber' },
+  { title: '可解释可评估', icon: Gauge, desc: '全流程评估与可视化，风险可控，指标可追踪，效果可评估。', tone: 'amber' },
 ]
 
 export function HomePage() {
+  const { data: snapshot } = useQuery({
+    queryKey: ['home-real-metrics'],
+    queryFn: async (): Promise<HomeMetricSnapshot | undefined> => {
+      const tasks = await listTasks()
+      const latest = tasks.find((task) => (task.protectionStatus ?? task.status) === 'completed' || (task.protectionStatus ?? task.status) === 'success')
+      if (!latest) return undefined
+      const [result, status] = await Promise.all([getTaskResult(latest.taskId), getTaskStatus(latest.taskId)])
+      return { result, status }
+    },
+    refetchInterval: 30_000,
+  })
+  const homeData = buildHomeMetrics(snapshot)
   return (
-    <div className="space-y-6 pb-2">
-      <section className="grid min-h-[486px] grid-cols-[430px_1fr_372px] gap-5 max-2xl:grid-cols-[420px_1fr_350px] max-xl:grid-cols-1">
-        <div className="pt-[34px]">
+    <div className="home-page-shell">
+      <div className="home-page-scroll">
+      <section className="home-upper-section home-hero-grid grid grid-cols-[430px_1fr_372px] gap-5 max-2xl:grid-cols-[420px_1fr_350px] max-xl:grid-cols-1">
+        <div className="home-hero-copy pt-[34px]">
           <h1 className="text-[43px] font-black leading-[1.18] tracking-normal text-white drop-shadow-[0_4px_18px_rgba(0,0,0,0.3)] max-md:text-4xl">
             发布前保护你的声音，
             <span className="block bg-gradient-to-r from-emerald-300 via-cyan-300 to-sky-400 bg-clip-text text-transparent">降低语音克隆风险</span>
           </h1>
-          <div className="mt-2 w-full max-w-[390px] overflow-hidden" aria-label="VoiceShield">
+          <div className="home-hero-wordmark mt-2 w-full max-w-[390px] overflow-hidden" aria-label="VoiceShield">
             <span
               aria-hidden="true"
-              className="block whitespace-nowrap bg-gradient-to-r from-sky-200 via-cyan-300 to-blue-500 bg-clip-text text-[55px] font-black italic leading-none tracking-[0.055em] text-transparent drop-shadow-[0_5px_20px_rgba(34,211,238,0.28)] [-webkit-text-stroke:1px_rgba(125,211,252,0.28)] [font-family:'Arial_Black','Trebuchet_MS',sans-serif] max-md:text-[48px]"
+              className="home-hero-brand block whitespace-nowrap bg-gradient-to-r from-sky-200 via-cyan-300 to-blue-500 bg-clip-text text-[55px] font-black italic leading-none tracking-[0.055em] text-transparent drop-shadow-[0_5px_20px_rgba(34,211,238,0.28)] [-webkit-text-stroke:1px_rgba(125,211,252,0.28)] [font-family:'Arial_Black','Trebuchet_MS',sans-serif] max-md:text-[48px]"
             >
               VoiceShield
             </span>
           </div>
-          <p className="mt-5 max-w-[390px] text-[16px] leading-8 text-slate-300">
+          <p className="home-hero-description mt-5 max-w-[390px] text-[16px] leading-8 text-slate-300">
             融合语义防护与声音身份防护的双重机制，在保证听感质量的同时干扰语音理解与声音身份建模，有效抵御非授权的语音克隆与滥用。
           </p>
-          <div className="mt-7 flex gap-4">
+          <div className="home-hero-actions mt-7 flex gap-4">
             <Link to="/workspace" className="cyan-button inline-flex h-11 min-w-[168px] items-center justify-center gap-2 rounded-[7px] text-[16px] font-black">
               <ShieldCheck className="h-5 w-5" />
               开始防护
@@ -93,7 +190,7 @@ export function HomePage() {
               查看结果
             </Link>
           </div>
-          <div className="mt-5 flex flex-wrap gap-x-6 gap-y-3 text-[14px] text-slate-300">
+          <div className="home-hero-checks mt-5 grid grid-cols-2 gap-y-3 text-[14px] text-slate-300">
             {heroChecks.map((item) => (
               <span key={item} className="flex items-center gap-2">
                 <CheckCircle2 className="h-4 w-4 text-cyan-300" />
@@ -103,34 +200,35 @@ export function HomePage() {
           </div>
         </div>
 
-        <HeroScene />
+        <HeroScene impactValues={homeData.impactValues} />
 
-        <div className="grid content-start gap-3 pt-[10px]">
+        <div className="home-strategies grid gap-3">
           {strategies.map((item) => (
             <StrategyPanel key={item.title} item={item} />
           ))}
         </div>
       </section>
 
-      <section className="mb-1 grid grid-cols-6 gap-2.5 max-xl:grid-cols-3 max-md:grid-cols-1">
-        {metrics.map((metric) => (
+      <div className="home-lower-section">
+      <section className="home-metrics-grid grid grid-cols-6 gap-2.5 max-xl:grid-cols-3 max-md:grid-cols-1">
+        {homeData.metrics.map((metric) => (
           <MetricTile key={metric.title} {...metric} />
         ))}
       </section>
 
-      <section className="mt-6 grid grid-cols-[1fr_358px] gap-3 max-xl:grid-cols-1">
-        <div className="ui-card p-4">
+      <section className="home-capability-grid grid grid-cols-[1fr_358px] gap-3 max-xl:grid-cols-1">
+        <div className="home-capability-panel ui-card ui-card-interactive p-4">
           <div className="mb-3 flex h-7 items-center gap-2">
             <Zap className="h-5 w-5 shrink-0 translate-y-[1px] text-cyan-300" />
             <h2 className="text-[18px] font-black leading-none text-white">核心能力</h2>
             <Info className="h-4 w-4 shrink-0 translate-y-[1px] text-slate-500" />
           </div>
-          <div className="grid grid-cols-[repeat(4,minmax(0,1fr))] gap-4 max-lg:grid-cols-2 max-sm:grid-cols-1">
+          <div className="home-capability-list grid grid-cols-[repeat(4,minmax(0,1fr))] gap-4 max-lg:grid-cols-2 max-sm:grid-cols-1">
             {capabilities.map(({ title, icon: Icon, desc, tone }) => (
               <div
                 key={title}
                 className={cn(
-                  'min-h-[124px] rounded-[7px] border p-3',
+                  'home-capability-card rounded-[7px] border p-3',
                   tone === 'green' && 'border-emerald-400/28 bg-emerald-400/10',
                   tone === 'blue' && 'border-sky-400/28 bg-sky-400/10',
                   tone === 'purple' && 'border-violet-400/28 bg-violet-400/10',
@@ -142,18 +240,18 @@ export function HomePage() {
                   <h3 className="text-[16px] font-black leading-none text-white">{title}</h3>
                 </div>
                 <p className="mt-2 text-[12px] leading-5 text-slate-300">{desc}</p>
-                <button className="mt-2 rounded-[5px] bg-cyan-400/12 px-3 py-1.5 text-xs font-bold text-cyan-300">了解更多 →</button>
+                <button type="button" className="rounded-[5px] bg-cyan-400/12 px-3 py-1.5 text-xs font-bold text-cyan-300">了解更多 →</button>
               </div>
             ))}
           </div>
         </div>
 
-        <div className="ui-card p-4">
+        <div className="home-evaluation-card ui-card ui-card-interactive p-4">
           <div className="mb-3 flex h-7 items-center gap-2">
             <Sparkles className="h-5 w-5 shrink-0 translate-y-[1px] fill-amber-300 text-amber-300" />
             <h2 className="text-[18px] font-black leading-none text-white">作品亮点</h2>
           </div>
-          <div className="space-y-2 text-[13px] leading-5 text-slate-300">
+          <div className="home-evaluation-list space-y-2 text-[13px] leading-5 text-slate-300">
             {[
               '面向新兴语音克隆技术的主动防护',
               '提出语义与声音身份双重防护框架，兼顾安全与可用',
@@ -166,13 +264,13 @@ export function HomePage() {
               </p>
             ))}
           </div>
-          <div className="mt-3 rounded-[6px] border border-emerald-400/36 bg-emerald-400/10 px-4 py-2.5 text-center text-[15px] font-black text-emerald-200">
-            安全可信 · 听感友好 · 高效可用
+          <div className="home-evaluation-summary mt-3 rounded-[6px] border border-emerald-400/36 bg-emerald-400/10 px-4 py-2.5 text-center text-[15px] font-black">
+            安全可信 · 听感友好 · 高效易用
           </div>
         </div>
       </section>
 
-      <footer className="ui-card flex min-h-[54px] items-center justify-between px-5 text-sm text-slate-400 max-md:flex-col max-md:gap-3 max-md:py-4">
+      <footer className="home-footer ui-card flex items-center justify-between px-5 text-sm text-slate-400 max-md:flex-col max-md:gap-3 max-md:py-4">
         <div className="flex items-center gap-3 text-slate-200">
           <ShieldCheck className="h-7 w-7 text-cyan-300" />
           安全可信的语音发布基础设施
@@ -184,38 +282,45 @@ export function HomePage() {
         </div>
         <span>© 2026 VoiceShield</span>
       </footer>
+      </div>
+      </div>
     </div>
   )
 }
 
-function HeroScene() {
+function HeroScene({ impactValues }: { impactValues: string[] }) {
   return (
-    <div className="relative overflow-hidden rounded-[8px] border border-cyan-300/10 scan-panel max-xl:min-h-[460px]">
+    <div className="home-hero-scene relative overflow-hidden rounded-[8px] border border-cyan-300/10 scan-panel max-xl:min-h-[460px]">
       <div className="hero-grid-layer absolute inset-0 opacity-55 [background-image:linear-gradient(rgba(56,189,248,0.08)_1px,transparent_1px),linear-gradient(90deg,rgba(56,189,248,0.08)_1px,transparent_1px)] [background-size:38px_38px]" />
-      <div className="hero-shield-stage absolute inset-x-[22px] top-[8px] h-[304px] overflow-hidden max-2xl:inset-x-[8px]">
-        <img src={heroShieldScene} alt="" className="hero-scene-crop hero-scene-layer h-full w-full object-cover object-center" />
+      <div className="hero-shield-stage absolute inset-x-[22px] top-[8px] overflow-hidden max-2xl:inset-x-[8px]">
+        <div className="hero-shield-centering relative h-full w-full">
+          <img src={heroShieldScene} alt="" aria-hidden="true" className="hero-scene-blur pointer-events-none absolute inset-0 h-full w-full object-cover object-center" />
+          <img src={heroShieldScene} alt="" className="hero-scene-crop hero-scene-layer h-full w-full object-cover object-center" />
+        </div>
       </div>
       <div className="hero-impact-panel absolute inset-x-0 bottom-5 rounded-[8px] border border-cyan-300/22 bg-[#061426]/92 p-3">
         <div className="mb-2 text-center text-sm font-medium leading-5 text-slate-300">
           下游系统影响（攻击面）
         </div>
-        <div className="grid grid-cols-[120px_28px_130px_1fr] gap-2.5 max-md:grid-cols-1">
-          <WaveCard title="原始音频" subtitle="00:12" tone="cyan" />
-          <div className="grid place-items-center text-3xl font-light text-cyan-300 max-md:hidden">+</div>
-          <WaveCard title="保护性扰动" subtitle="不可感知的微小扰动" tone="green" />
+        <div className="hero-impact-content grid grid-cols-[minmax(260px,278px)_minmax(0,1fr)] gap-2.5 max-md:grid-cols-1">
+          <div className="hero-audio-pair grid min-w-0 grid-cols-[minmax(0,1fr)_28px_minmax(0,1fr)] gap-2.5">
+            <WaveCard title="原始音频" meta="00:12" tone="cyan" />
+            <div className="grid place-items-center text-3xl font-light text-cyan-300">+</div>
+            <WaveCard title="保护性扰动" tone="green" />
+          </div>
           <div className="p-0">
             <div className="grid grid-cols-4 gap-2">
               {[
-                ['ASR', '语音识别', '↓ 62.3%'],
-                ['Tokenizer', '分词器', '↑ 73.8%'],
-                ['LLM', '语言模型', '↓ 58.7%'],
-                ['TTS', '克隆系统', '↓ 0.736'],
+                ['ASR', '语音识别', impactValues[0]],
+                ['Tokenizer', '分词器', impactValues[1]],
+                ['LLM', '语言模型', impactValues[2]],
+                ['TTS', '克隆系统', impactValues[3]],
               ].map(([name, sub, value]) => (
-                <div key={name} className="hero-impact-tile h-[96px] rounded-[6px] border border-cyan-300/18 bg-[#07192d] px-1.5 py-2 text-center">
+                <div key={name} className="hero-impact-tile rounded-[6px] border border-cyan-300/18 bg-[#07192d] px-1.5 py-2 text-center">
                   <div className="whitespace-nowrap text-[12px] font-black leading-4 text-white">{name}</div>
                   <div className="mt-0.5 text-[9px] leading-3 text-slate-400">{sub}</div>
                   <TinyWave className="my-1 h-3.5" color="#8fdcff" />
-                  <div className={cn('text-[13px] font-black leading-4', value.includes('↑') ? 'text-lime-300' : 'text-red-300')}>{value}</div>
+                  <div className={cn('text-[12px] font-black leading-4', value.includes('↑') ? 'text-lime-300' : 'text-red-300')}>{value}</div>
                 </div>
               ))}
             </div>
@@ -231,7 +336,7 @@ function StrategyPanel({ item }: { item: (typeof strategies)[number] }) {
   return (
     <div
       className={cn(
-        'relative h-[156px] overflow-hidden rounded-[8px] border p-3',
+        'home-strategy-card relative overflow-hidden rounded-[8px] border p-3',
         item.tone === 'green' && 'strategy-card-green',
         item.tone === 'green' && 'border-emerald-400/42 bg-emerald-400/10 shadow-[inset_0_0_36px_rgba(16,185,129,0.12)]',
         item.tone === 'blue' && 'border-sky-400/40 bg-sky-400/10 shadow-[inset_0_0_36px_rgba(14,165,233,0.12)]',
@@ -252,28 +357,30 @@ function StrategyPanel({ item }: { item: (typeof strategies)[number] }) {
           </p>
         ))}
       </div>
-      {item.tone === 'green' ? <Network className="absolute bottom-5 right-8 h-[72px] w-[72px] text-emerald-300/30" /> : null}
-      {item.tone === 'blue' ? <Waves className="absolute bottom-4 right-8 h-[72px] w-[72px] text-sky-300/35" /> : null}
-      {item.tone === 'purple' ? <Ear className="absolute bottom-4 right-10 h-[72px] w-[72px] text-violet-300/35" /> : null}
+      {item.tone === 'green' ? <Network className="home-strategy-decoration absolute right-4 top-4 h-16 w-16 text-emerald-300/30" /> : null}
+      {item.tone === 'blue' ? <Waves className="home-strategy-decoration absolute right-4 top-4 h-16 w-16 text-sky-300/35" /> : null}
+      {item.tone === 'purple' ? <Ear className="home-strategy-decoration absolute right-4 top-4 h-16 w-16 text-violet-300/35" /> : null}
     </div>
   )
 }
 
-function WaveCard({ title, subtitle, tone }: { title: string; subtitle: string; tone: 'cyan' | 'green' }) {
+function WaveCard({ title, meta, tone }: { title: string; meta?: string; tone: 'cyan' | 'green' }) {
   return (
-    <div className="hero-wave-card h-[118px] rounded-[7px] border border-cyan-300/14 bg-[#07192d]/95 p-2">
+    <div className="hero-wave-card rounded-[7px] border border-cyan-300/14 bg-[#07192d]/95 p-2">
       <div className="h-[50px] rounded-[6px] bg-slate-950/44 px-2 py-1.5">
         <TinyWave color={tone === 'green' ? '#22c55e' : '#b7e7ff'} />
       </div>
-      <div className="mt-2 text-[13px] font-bold leading-4 text-white">{title}</div>
-      <div className="mt-0.5 text-[11px] leading-4 text-slate-400">{subtitle}</div>
+      <div className="mt-2 flex min-w-0 items-center justify-between gap-2">
+        <span className="truncate text-[13px] font-bold leading-4 text-white">{title}</span>
+        {meta ? <span className="shrink-0 font-mono text-[11px] leading-4 text-slate-400">{meta}</span> : null}
+      </div>
     </div>
   )
 }
 
-function MetricTile({ title, value, sub, tone, data }: (typeof metrics)[number]) {
+function MetricTile({ title, value, sub, tone, data }: HomeMetric) {
   return (
-    <div className="ui-card metric-glow relative h-[128px] overflow-hidden p-5">
+    <div className="ui-card ui-card-interactive metric-glow home-metric-tile relative overflow-hidden p-4">
       <div className="relative z-10 text-[14px] font-medium leading-5 text-slate-300">{title}</div>
       <div className={cn('relative z-10 mt-2 text-[28px] font-black leading-none', tone === 'red' && 'text-red-300', tone === 'green' && 'text-emerald-300', tone === 'cyan' && 'text-cyan-200', tone === 'blue' && 'text-sky-300')}>
         {value}
@@ -335,7 +442,7 @@ function TinyWave({ color, className }: { color: string; className?: string }) {
             rx="1"
             fill={color}
             opacity={0.5 + (index % 3) * 0.16}
-            style={{ animationDelay: `${index * -55}ms`, transformOrigin: 'center' }}
+            style={{ animationDelay: `${index * 12}ms`, transformOrigin: 'center' }}
           />
         )
       })}
