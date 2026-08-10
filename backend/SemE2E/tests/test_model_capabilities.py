@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
@@ -65,6 +66,43 @@ class ModelCapabilitiesTest(unittest.TestCase):
             "tts_models/multilingual/multi-dataset/xtts_v1.1",
         )
         self.assertEqual(result_adapter._tts_catalog_entry("XTTS-v1.1")["value"], "XTTS-v1.1")
+
+    def test_hidden_tts_environment_default_falls_back_to_visible_available_model(self) -> None:
+        def catalog_status(item: dict[str, object], *, coqui_available: bool) -> tuple[str, str | None, str | None]:
+            del coqui_available
+            if item["value"] == "YourTTS":
+                return "available", None, "your-tts-cache"
+            return "unavailable", "test unavailable", None
+
+        with patch.dict(os.environ, {"SEME2E_API_DEFAULT_TTS_MODEL": "XTTS-v1.1"}), patch.object(
+            result_adapter,
+            "_tts_catalog_status",
+            side_effect=catalog_status,
+        ):
+            config = runtime_config()
+
+        visible_options = config["models"]["tts"]
+        form_options = config["formSchema"]["modelOptions"]["ttsModels"]
+        visible_backend_values = {option["backendValue"] for option in visible_options}
+        default_backend = config["clone"]["defaults"]["backendValue"]
+
+        self.assertEqual(default_backend, "tts_models/multilingual/multi-dataset/your_tts")
+        self.assertEqual(config["clone"]["defaults"]["model"], default_backend)
+        self.assertIn(default_backend, visible_backend_values)
+        self.assertEqual(form_options, visible_options)
+        self.assertNotIn("tts_models/multilingual/multi-dataset/xtts_v1.1", visible_backend_values)
+
+    def test_hidden_tts_environment_default_falls_back_to_first_visible_when_none_are_available(self) -> None:
+        with patch.dict(os.environ, {"SEME2E_API_DEFAULT_TTS_MODEL": "XTTS-v1.1"}), patch.object(
+            result_adapter,
+            "_tts_catalog_status",
+            return_value=("unavailable", "test unavailable", None),
+        ):
+            config = runtime_config()
+
+        first_visible = config["models"]["tts"][0]
+        self.assertEqual(config["clone"]["defaults"]["backendValue"], first_visible["backendValue"])
+        self.assertEqual(config["clone"]["defaults"]["model"], first_visible["backendValue"])
 
     def test_gpt_sovits_status_accepts_live_fine_tune_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -464,14 +464,11 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
     () => backendOptionItems(runtimeConfig?.models.tts),
     [runtimeConfig?.models.tts],
   )
-  const ttsModelOptions = useMemo(
-    () => {
-      if (configuredTtsOptions.length) return configuredTtsOptions
-      const value = result.cloneResults?.at(-1)?.request?.model
-      return value ? [{ label: value, name: value, value, status: 'available' as const }] : []
-    },
-    [configuredTtsOptions, result.cloneResults],
-  )
+  // New clone requests must only use the backend-owned capability catalog.
+  // Historical clone models are rendered from their saved request/result data
+  // and must never be promoted back into an available creation option while
+  // capabilities are loading or unavailable.
+  const ttsModelOptions = configuredTtsOptions
   const ttsOptions = useMemo(() => ttsModelOptions.filter(isAvailableModel).map((option) => option.value), [ttsModelOptions])
   const selectedTtsOption = ttsModelOptions.find((option) => option.value === cloneForm.model) ?? ttsModelOptions[0]
   const evaluationModel = useMemo(() => backendOptionItems(runtimeConfig?.models.evaluation)[0] ?? null, [runtimeConfig?.models.evaluation])

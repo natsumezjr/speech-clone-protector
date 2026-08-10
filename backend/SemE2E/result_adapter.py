@@ -875,6 +875,26 @@ def runtime_config() -> dict[str, Any]:
                 fineTuneMode=item.get("fineTuneMode"),
             )
         )
+    configured_tts_backend = normalize_tts_model(os.getenv("SEME2E_API_DEFAULT_TTS_MODEL"))
+    configured_tts_option = next(
+        (
+            option
+            for option in tts_options
+            if str(option.get("backendValue") or "").lower() == configured_tts_backend.lower()
+        ),
+        None,
+    )
+    default_tts_option = (
+        configured_tts_option
+        if configured_tts_option is not None and configured_tts_option.get("status") == "available"
+        else next((option for option in tts_options if option.get("status") == "available"), None)
+        or (tts_options[0] if tts_options else None)
+    )
+    default_tts_backend = (
+        str(default_tts_option["backendValue"])
+        if default_tts_option is not None
+        else None
+    )
     evaluation_options = [
         _model_option(
             "ECAPA-TDNN",
@@ -981,8 +1001,8 @@ def runtime_config() -> dict[str, Any]:
         },
         "clone": {
             "defaults": {
-                "model": normalize_tts_model(os.getenv("SEME2E_API_DEFAULT_TTS_MODEL")),
-                "backendValue": normalize_tts_model(os.getenv("SEME2E_API_DEFAULT_TTS_MODEL")),
+                "model": default_tts_backend,
+                "backendValue": default_tts_backend,
                 "language": os.getenv("SEME2E_API_DEFAULT_TTS_LANGUAGE", "en"),
                 "uiPreferredLanguage": os.getenv("SEME2E_API_UI_TTS_LANGUAGE", "zh-cn"),
                 "speed": _env_float("SEME2E_API_DEFAULT_TTS_SPEED", 1.0),
