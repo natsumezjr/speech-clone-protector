@@ -51,7 +51,7 @@ const metricTemplates = [
   { title: 'ASR 干扰', sub: '识别准确率下降', tone: 'red' },
   { title: '声纹相似度下降', sub: '克隆相似度降低', tone: 'red' },
   { title: 'SNR 信噪比', sub: '高保真听感', tone: 'green' },
-  { title: '攻击成功率', sub: '多攻击平均下降', tone: 'red' },
+  { title: '综合防护评分', sub: '多维防护综合评估', tone: 'red' },
   { title: '最高训练推理线程并发数', sub: '高效率高并发', tone: 'cyan' },
   { title: '单步平均时长', sub: '平均耗时', tone: 'blue' },
 ] as const
@@ -94,6 +94,12 @@ function average(values: Array<number | null>) {
   return available.length ? available.reduce((sum, value) => sum + value, 0) / available.length : null
 }
 
+function completeAverage(values: Array<number | null>, expectedCount: number) {
+  const available = values.filter((value): value is number => value !== null)
+  if (values.length !== expectedCount || available.length !== expectedCount) return null
+  return available.reduce((sum, value) => sum + value, 0) / expectedCount
+}
+
 function percent(value: number | null, prefix = '') {
   return value === null ? '—' : `${prefix}${(value * 100).toFixed(2)}%`
 }
@@ -116,7 +122,7 @@ function cloneEvaluationsFrom(result?: TaskResult): CloneEval[] {
 }
 
 function latestTaskTime(task: HistoryTask) {
-  const value = task.updatedAt ?? task.protectionCompletedAt ?? task.createdAt
+  const value = task.protectionCompletedAt ?? task.createdAt ?? task.updatedAt
   const dotted = value.match(/^(\d{4})\.(\d{1,2})\.(\d{1,2})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/)
   const timestamp = dotted
     ? new Date(Number(dotted[1]), Number(dotted[2]) - 1, Number(dotted[3]), Number(dotted[4] ?? 0), Number(dotted[5] ?? 0), Number(dotted[6] ?? 0)).getTime()
@@ -143,6 +149,15 @@ function metricWithFallback(
   return latestValue ?? average(fallbackResults.map((result) => select(result)))
 }
 
+function overallScoreWithFallback(latestResult: TaskResult | undefined, fallbackResults: TaskResult[]) {
+  const latestValue = optionalNumber(latestResult?.protectionEvaluation?.overallScore)
+  if (latestValue !== null) return latestValue
+  return completeAverage(
+    fallbackResults.map((result) => optionalNumber(result.protectionEvaluation?.overallScore)),
+    defaultMetricTaskIds.length,
+  )
+}
+
 function cloneMetricWithFallback(
   latestResult: TaskResult | undefined,
   fallbackResults: TaskResult[],
@@ -162,19 +177,19 @@ function buildHomeMetrics(snapshot?: HomeMetricSnapshot): { metrics: HomeMetric[
   const tokenChangeRate = metricWithFallback(result, fallbackResults, (item) => optionalNumber(item?.semanticEval?.tokenChangeRate))
   const semanticDrift = metricWithFallback(result, fallbackResults, (item) => optionalNumber(item?.semanticEval?.semanticDrift))
   const snr = metricWithFallback(result, fallbackResults, (item) => optionalNumber(item?.protectionQuality?.snr))
+  const overallProtectionScore = overallScoreWithFallback(result, fallbackResults)
   const averageStepSec = metricWithFallback(result, fallbackResults, (item) => optionalNumber(item?.averageStepSec))
   const averageSimilarityDrop = cloneMetricWithFallback(result, fallbackResults, (item) => {
     const before = optionalNumber(item.originalSimilarity)
     const after = optionalNumber(item.protectedSimilarity)
     return before === null || after === null ? null : Math.max(0, before - after)
   })
-  const averageRelativeSimilarityDrop = cloneMetricWithFallback(result, fallbackResults, (item) => optionalNumber(item.similarityDropRate))
   const maxConcurrency = optionalNumber(snapshot?.maxConcurrency)
   const values = [
     integerPercent(tokenErrorRate, '↓ '),
     decimal(averageSimilarityDrop, '↓ '),
     decimal(snr),
-    integerPercent(averageRelativeSimilarityDrop, '↓ '),
+    decimal(overallProtectionScore, '', '分'),
     integerDecimal(maxConcurrency),
     decimal(averageStepSec, '', 's'),
   ]
