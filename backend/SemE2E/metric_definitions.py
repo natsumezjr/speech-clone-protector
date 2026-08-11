@@ -83,7 +83,7 @@ SCORE_CALIBRATION: dict[str, float | None] = {
     "directDistance90": _positive_env_float("SEME2E_DIRECT_DISTANCE_D90", 0.50),
     "cloneTokenChangeRate90": _positive_env_float("SEME2E_CLONE_TOKEN_CHANGE_R90", 1.00),
     "cloneSemanticDrift90": _positive_env_float("SEME2E_CLONE_SEMANTIC_DRIFT_D90", 0.78),
-    "cloneQualityDropRate90": _positive_env_float("SEME2E_CLONE_QUALITY_DROP_R90", 0.18),
+    "cloneQualityWeightedDrop90": _positive_env_float("SEME2E_CLONE_WEIGHTED_QUALITY_DROP_R90", 0.75),
 }
 
 SCORE_CALIBRATION_SOURCES: dict[str, str] = {
@@ -92,7 +92,17 @@ SCORE_CALIBRATION_SOURCES: dict[str, str] = {
     "directDistance90": "real protection tasks p90 rounded: [0.4956,0.2618,0.4622,0.2689]",
     "cloneTokenChangeRate90": "existing real clone pairs task_4810dbfae886, n=6, p90=0.9962 rounded",
     "cloneSemanticDrift90": "existing real clone pairs task_4810dbfae886, n=6, p90=0.7784 rounded",
-    "cloneQualityDropRate90": "existing real clone pairs task_4810dbfae886, DNSMOS P.835 OVRL, n=6, p90=0.1774 rounded",
+    "cloneQualityWeightedDrop90": "same-text clone pairs across five real protection tasks, n=20, weighted quality-drop p90=0.73953 rounded to 0.75",
+}
+
+# Pair-reference PESQ/STOI are the primary clone quality evidence. DNSMOS is a
+# no-reference absolute-quality cross-check and therefore carries a smaller
+# weight. The same available-component mask is used on the before/after sides;
+# a missing metric is never filled with zero.
+CLONE_QUALITY_COMPONENT_WEIGHTS: dict[str, float] = {
+    "pesq": 0.45,
+    "stoi": 0.45,
+    "dnsmos": 0.10,
 }
 
 
@@ -365,41 +375,108 @@ def compute_clone_quality_score(
     clean_mos: Any,
     protected_mos: Any,
     *,
+    pair_pesq: Any = None,
+    pair_stoi: Any = None,
     identity_baseline_weight: Any = None,
     clone_identity_score: Any = None,
     clone_semantic_score: Any = None,
 ) -> dict[str, Any]:
     clean_value = finite_float(clean_mos)
     protected_value = finite_float(protected_mos)
-    drop_rate = None
-    if clean_value is not None and protected_value is not None and clean_value > 1.0:
-        drop_rate = max(0.0, (clean_value - protected_value) / (clean_value - 1.0))
+    if clean_value is not None and not 1.0 <= clean_value <= 5.0:
+        clean_value = None
+    if protected_value is not None and not 1.0 <= protected_value <= 5.0:
+        protected_value = None
+    pesq_value = finite_float(pair_pesq)
+    stoi_value = finite_float(pair_stoi)
+
+    # PESQ and STOI are reference metrics. The clean/original-side clone is the
+    # same-text reference, so its self-reference baseline is defined as 100;
+    # the protected-side values are measured against that reference. DNSMOS is
+    # no-reference and is therefore measured independently on both sides.
+    component_before: dict[str, tuple[float | None, float]] = {}
+    component_after: dict[str, tuple[float | None, float]] = {}
+    normalized_components: dict[str, dict[str, float] | None] = {
+        "pesq": None,
+        "stoi": None,
+        "dnsmos": None,
+    }
+    if pesq_value is not None:
+        pesq_before = 100.0
+        pesq_after = 100.0 * clamp((pesq_value + 0.5) / 5.0)
+        component_before["pesq"] = (pesq_before, CLONE_QUALITY_COMPONENT_WEIGHTS["pesq"])
+        component_after["pesq"] = (pesq_after, CLONE_QUALITY_COMPONENT_WEIGHTS["pesq"])
+        normalized_components["pesq"] = {
+            "before": pesq_before,
+            "after": pesq_after,
+            "weight": CLONE_QUALITY_COMPONENT_WEIGHTS["pesq"],
+        }
+    if stoi_value is not None:
+        stoi_before = 100.0
+        stoi_after = 100.0 * clamp(stoi_value)
+        component_before["stoi"] = (stoi_before, CLONE_QUALITY_COMPONENT_WEIGHTS["stoi"])
+        component_after["stoi"] = (stoi_after, CLONE_QUALITY_COMPONENT_WEIGHTS["stoi"])
+        normalized_components["stoi"] = {
+            "before": stoi_before,
+            "after": stoi_after,
+            "weight": CLONE_QUALITY_COMPONENT_WEIGHTS["stoi"],
+        }
+    if clean_value is not None and protected_value is not None:
+        dns_before = 100.0 * clamp((clean_value - 1.0) / 4.0)
+        dns_after = 100.0 * clamp((protected_value - 1.0) / 4.0)
+        component_before["dnsmos"] = (dns_before, CLONE_QUALITY_COMPONENT_WEIGHTS["dnsmos"])
+        component_after["dnsmos"] = (dns_after, CLONE_QUALITY_COMPONENT_WEIGHTS["dnsmos"])
+        normalized_components["dnsmos"] = {
+            "before": dns_before,
+            "after": dns_after,
+            "weight": CLONE_QUALITY_COMPONENT_WEIGHTS["dnsmos"],
+        }
+
+    quality_before = weighted_available_mean(component_before)
+    quality_after = weighted_available_mean(component_after)
+    drop_rate = (
+        max(0.0, (quality_before - quality_after) / max(quality_before, EPS))
+        if quality_before is not None and quality_after is not None and quality_before > EPS
+        else None
+    )
+    raw_score = phi_score(drop_rate, SCORE_CALIBRATION["cloneQualityWeightedDrop90"])
     baseline_weight = _smoothstep_weight(clean_value, 2.5, 4.0)
-    raw_score = phi_score(drop_rate, SCORE_CALIBRATION["cloneQualityDropRate90"])
+    if baseline_weight is None and quality_before is not None:
+        baseline_weight = _smoothstep_weight(quality_before, 50.0, 90.0)
     score, relevance = adjust_clone_quality_score(
         raw_score,
         identity_baseline_weight=identity_baseline_weight,
         clone_identity_score=clone_identity_score,
         clone_semantic_score=clone_semantic_score,
     )
-    if clean_value is None or protected_value is None:
-        reason = "克隆语音质量结果尚未生成"
-    elif clean_value <= 1.0:
-        reason = "原始克隆的语音质量结果不足以进行有效比较"
-    elif SCORE_CALIBRATION["cloneQualityDropRate90"] is None:
-        reason = "克隆语音质量评分标定尚未完成"
-    else:
-        reason = None
+    degradation_components = {
+        name: (
+            max(0.0, values["before"] - values["after"])
+            if isinstance(values, dict)
+            else None
+        )
+        for name, values in normalized_components.items()
+    }
+    missing = [name for name, value in normalized_components.items() if value is None]
+    reason = None if raw_score is not None else "克隆语音质量结果尚未生成"
     return {
         "cleanCloneQualityMos": clean_value,
         "protectedCloneQualityMos": protected_value,
+        "clonePairPesq": pesq_value,
+        "clonePairStoi": stoi_value,
+        "cloneQualityBefore": quality_before,
+        "cloneQualityAfter": quality_after,
         "cloneQualityDropRate": drop_rate,
+        "clonePesqDegradationScore": degradation_components["pesq"],
+        "cloneStoiDegradationScore": degradation_components["stoi"],
+        "cloneDnsMosDegradationScore": degradation_components["dnsmos"],
+        "cloneQualityComponents": normalized_components,
         "cloneQualityRawScore": raw_score,
         "cloneQualityRelevance": relevance,
         "cloneQualityScore": score,
         "qualityBaselineWeight": baseline_weight,
-        "cloneQualityStatus": "available" if score is not None else "unavailable",
-        "cloneQualityReason": reason,
+        "cloneQualityStatus": "available" if score is not None and not missing else "partial" if score is not None else "unavailable",
+        "cloneQualityReason": reason if reason is not None else (f"克隆语音质量指标尚未完整生成：{', '.join(missing)}" if missing else None),
     }
 
 
@@ -562,6 +639,108 @@ def align_audio_pair(clean_path: Path, protected_path: Path) -> tuple[np.ndarray
     xp = xp[:n].astype(np.float32)
     delta = (xp - x).astype(np.float32)
     return x, xp, delta, int(sr)
+
+
+def compute_clone_pair_perceptual_metrics(
+    clean_clone_path: Path,
+    protected_clone_path: Path,
+) -> dict[str, Any]:
+    """Compute reference-based clone-pair PESQ/STOI without introducing SNR."""
+
+    sources: dict[str, dict[str, Any]] = {}
+    try:
+        clean, protected, _, sample_rate = align_audio_pair(clean_clone_path, protected_clone_path)
+    except Exception as exc:
+        reason = str(exc)
+        return {
+            "clonePairPesq": None,
+            "clonePairStoi": None,
+            "sampleRate": None,
+            "status": "error",
+            "reason": reason,
+            "_metricSources": {
+                "cloneEval.clonePairPesq": metric_source("error", "pesq", reason=reason, formula="PESQ(cleanClone,protectedClone)"),
+                "cloneEval.clonePairStoi": metric_source("error", "pystoi", reason=reason, formula="STOI(cleanClone,protectedClone)"),
+            },
+        }
+
+    pesq_value = None
+    if not _module_available("pesq"):
+        sources["cloneEval.clonePairPesq"] = metric_source(
+            "unavailable",
+            "pesq",
+            reason="Python package 'pesq' is not installed",
+            formula="PESQ(cleanClone,protectedClone)",
+        )
+    else:
+        try:
+            from pesq import pesq
+
+            pesq_sample_rate = sample_rate if sample_rate in {8000, 16000} else 16000
+            pesq_clean = clean if pesq_sample_rate == sample_rate else _resample(clean, sample_rate, pesq_sample_rate)
+            pesq_protected = protected if pesq_sample_rate == sample_rate else _resample(protected, sample_rate, pesq_sample_rate)
+            pesq_value = float(
+                pesq(
+                    pesq_sample_rate,
+                    pesq_clean,
+                    pesq_protected,
+                    "wb" if pesq_sample_rate == 16000 else "nb",
+                )
+            )
+            sources["cloneEval.clonePairPesq"] = metric_source(
+                "available",
+                "pesq",
+                reason=None if pesq_sample_rate == sample_rate else f"Audio was resampled from {sample_rate} Hz to 16000 Hz for PESQ compatibility",
+                formula="PESQ(cleanClone,protectedClone)",
+            )
+        except Exception as exc:
+            sources["cloneEval.clonePairPesq"] = metric_source(
+                "error",
+                "pesq",
+                reason=str(exc),
+                formula="PESQ(cleanClone,protectedClone)",
+            )
+
+    stoi_value = None
+    if not _module_available("pystoi"):
+        sources["cloneEval.clonePairStoi"] = metric_source(
+            "unavailable",
+            "pystoi",
+            reason="Python package 'pystoi' is not installed",
+            formula="STOI(cleanClone,protectedClone)",
+        )
+    else:
+        try:
+            from pystoi.stoi import stoi
+
+            stoi_value = float(stoi(clean, protected, sample_rate, extended=False))
+            sources["cloneEval.clonePairStoi"] = metric_source(
+                "available",
+                "pystoi",
+                formula="STOI(cleanClone,protectedClone)",
+            )
+        except Exception as exc:
+            sources["cloneEval.clonePairStoi"] = metric_source(
+                "error",
+                "pystoi",
+                reason=str(exc),
+                formula="STOI(cleanClone,protectedClone)",
+            )
+
+    available_count = sum(value is not None for value in (pesq_value, stoi_value))
+    reasons = [
+        str(source.get("reason"))
+        for source in sources.values()
+        if source.get("reason") and source.get("status") != "available"
+    ]
+    return {
+        "clonePairPesq": pesq_value,
+        "clonePairStoi": stoi_value,
+        "sampleRate": sample_rate,
+        "status": "available" if available_count == 2 else "partial" if available_count else "unavailable",
+        "reason": "; ".join(dict.fromkeys(reasons)) or None,
+        "_metricSources": sources,
+    }
 
 
 def compute_perturbation_metrics(
@@ -1803,12 +1982,20 @@ def compute_clone_eval(
         "cloneSemanticReason": semantic_metrics.get("reason") or clone_transcription.get("reason") or "克隆语义指标尚未生成",
         "cleanCloneQualityMos": finite_float(quality_metrics.get("cleanMos")),
         "protectedCloneQualityMos": finite_float(quality_metrics.get("protectedMos")),
+        "clonePairPesq": finite_float(quality_metrics.get("clonePairPesq")),
+        "clonePairStoi": finite_float(quality_metrics.get("clonePairStoi")),
+        "cloneQualityBefore": None,
+        "cloneQualityAfter": None,
         "cloneQualityDropRate": None,
+        "clonePesqDegradationScore": None,
+        "cloneStoiDegradationScore": None,
+        "cloneDnsMosDegradationScore": None,
+        "cloneQualityComponents": None,
         "cloneQualityRawScore": None,
         "cloneQualityRelevance": None,
         "cloneQualityScore": None,
         "qualityBaselineWeight": None,
-        "cloneQualityModel": quality_metrics.get("model") or "DNSMOS P.835 OVRL",
+        "cloneQualityModel": quality_metrics.get("model") or "PESQ + STOI + DNSMOS P.835 OVRL",
         "cloneQualityModelPath": quality_metrics.get("modelPath"),
         "cloneQualityStatus": quality_metrics.get("status") or "unavailable",
         "cloneQualityReason": quality_metrics.get("reason") or "克隆语音质量结果尚未生成",
@@ -1843,9 +2030,9 @@ def compute_clone_eval(
             ),
             "cloneEval.cloneQualityScore": metric_source(
                 quality_metrics.get("status") or "unavailable",
-                quality_metrics.get("model") or "DNSMOS P.835 OVRL",
+                quality_metrics.get("model") or "PESQ + STOI + DNSMOS P.835 OVRL",
                 reason=quality_metrics.get("reason"),
-                formula="raw=Phi(max(0,(q0-q1)/(q0-1));r_q90); rho=max(1-w_id,1-min(S_id,S_sem)/100); score=(1-rho)*100+rho*raw",
+                formula="Q0=weighted(100,100,N(DNS0)); Q1=weighted(N(PESQ(clean,protected)),N(STOI(clean,protected)),N(DNS1)); Sq_raw=Phi(max(0,(Q0-Q1)/Q0);0.75)",
             ),
             "cloneEval.cloneConfidenceBefore": metric_source("unavailable", "confidence_calibrator", reason="No confidence calibrator is configured", formula="sigmoid(A*similarity+B)"),
             "cloneEval.cloneConfidenceAfter": metric_source("unavailable", "confidence_calibrator", reason="No confidence calibrator is configured", formula="sigmoid(A*similarity+B)"),
@@ -1945,6 +2132,8 @@ def compute_clone_eval(
     quality = compute_clone_quality_score(
         quality_metrics.get("cleanMos"),
         quality_metrics.get("protectedMos"),
+        pair_pesq=quality_metrics.get("clonePairPesq"),
+        pair_stoi=quality_metrics.get("clonePairStoi"),
         identity_baseline_weight=eval_payload.get("identityBaselineWeight"),
         clone_identity_score=eval_payload.get("cloneIdentityScore"),
         clone_semantic_score=eval_payload.get("cloneSemanticScore"),
@@ -1955,12 +2144,24 @@ def compute_clone_eval(
         eval_payload["cloneQualityReason"] = quality_metrics.get("reason") or quality.get("cloneQualityReason")
     quality_source = metric_source(
         eval_payload["cloneQualityStatus"],
-        quality_metrics.get("model") or "DNSMOS P.835 OVRL",
+        quality_metrics.get("model") or "PESQ + STOI + DNSMOS P.835 OVRL",
         reason=eval_payload.get("cloneQualityReason"),
-        formula="w_q=smoothstep((q0-2.5)/(4.0-2.5)); raw=Phi(max(0,(q0-q1)/(q0-1));r_q90); rho=max(1-w_id,1-min(S_id,S_sem)/100); score=(1-rho)*100+rho*raw",
+        formula="Q0=weighted(100,100,N(DNS0)); Q1=weighted(N(PESQ(clean,protected)),N(STOI(clean,protected)),N(DNS1)); Sq_raw=Phi(max(0,(Q0-Q1)/Q0);0.75)",
     )
-    for metric_key in ("cloneQualityRawScore", "cloneQualityRelevance", "cloneQualityScore"):
+    for metric_key in (
+        "cloneQualityBefore",
+        "cloneQualityAfter",
+        "clonePesqDegradationScore",
+        "cloneStoiDegradationScore",
+        "cloneDnsMosDegradationScore",
+        "cloneQualityRawScore",
+        "cloneQualityRelevance",
+        "cloneQualityScore",
+    ):
         eval_payload["_metricSources"][f"cloneEval.{metric_key}"] = quality_source
+    pair_metric_sources = quality_metrics.get("pairMetricSources")
+    if isinstance(pair_metric_sources, dict):
+        eval_payload["_metricSources"].update(pair_metric_sources)
 
     available_dimensions = sum(
         eval_payload.get(key) == "available"
@@ -2053,30 +2254,61 @@ def compute_overall_score(result: dict[str, Any]) -> dict[str, Any]:
         "qualityBaselineWeight",
         "缺少有效的原始克隆语音质量结果",
     )
+    clone_quality_status = "available"
+    clone_quality_partial_reasons: list[str] = []
+    for clone_eval in clone_evals:
+        quality_score = finite_float(clone_eval.get("cloneQualityScore"))
+        quality_weight = finite_float(clone_eval.get("qualityBaselineWeight"))
+        quality_status = str(clone_eval.get("cloneQualityStatus") or "").strip().lower()
+        if quality_score is None or quality_weight is None or quality_weight <= EPS:
+            clone_quality_status = "partial" if clone_quality is not None else "unavailable"
+            reason = clone_eval.get("cloneQualityReason")
+            if isinstance(reason, str) and reason.strip():
+                clone_quality_partial_reasons.append(reason.strip())
+            continue
+        if quality_status and quality_status != "available":
+            clone_quality_status = "partial"
+            reason = clone_eval.get("cloneQualityReason")
+            if isinstance(reason, str) and reason.strip():
+                clone_quality_partial_reasons.append(reason.strip())
+    if clone_quality is None:
+        clone_quality_status = "unavailable"
+    elif clone_quality_status == "partial":
+        clone_quality_reason = "；".join(dict.fromkeys(clone_quality_partial_reasons)) or "部分克隆语音质量指标尚未生成"
     if not clone_evals:
         clone_identity_reason = clone_semantic_reason = clone_quality_reason = "待完成克隆测试"
+        clone_quality_status = "pending"
 
     dimension_specs = [
-        ("protectionQuality", "保护音频听感质量", protection_quality.get("qualityScore"), protection_quality.get("scoreReason"), 0.20),
-        ("cloneQuality", "克隆音频质量下降", clone_quality, clone_quality_reason, 0.10),
-        ("protectionSemantic", "保护后音频语义干扰", protection_semantic.get("protectionSemanticScore"), protection_semantic.get("scoreReason"), 0.20),
-        ("cloneSemantic", "克隆后音频语义干扰", clone_semantic, clone_semantic_reason, 0.15),
-        ("directIdentity", "保护后声音身份直接保护效果", direct_identity.get("directIdentityScore"), direct_identity.get("scoreReason"), 0.15),
-        ("cloneIdentity", "克隆声音身份保护效果", clone_identity, clone_identity_reason, 0.20),
+        ("protectionQuality", "保护音频听感质量", protection_quality.get("qualityScore"), protection_quality.get("scoreReason"), 0.20, None),
+        ("cloneQuality", "克隆音频质量下降", clone_quality, clone_quality_reason, 0.10, clone_quality_status),
+        ("protectionSemantic", "保护后音频语义干扰", protection_semantic.get("protectionSemanticScore"), protection_semantic.get("scoreReason"), 0.20, None),
+        ("cloneSemantic", "克隆后音频语义干扰", clone_semantic, clone_semantic_reason, 0.15, None),
+        ("directIdentity", "保护后声音身份直接保护效果", direct_identity.get("directIdentityScore"), direct_identity.get("scoreReason"), 0.15, None),
+        ("cloneIdentity", "克隆声音身份保护效果", clone_identity, clone_identity_reason, 0.20, None),
     ]
     dimensions: list[dict[str, Any]] = []
     missing_dimensions: list[str] = []
-    for key, label, value, reason, weight in dimension_specs:
+    for key, label, value, reason, weight, explicit_status in dimension_specs:
         score_value = finite_float(value)
-        if score_value is None:
+        status = (
+            explicit_status
+            if score_value is not None and explicit_status is not None
+            else "available"
+            if score_value is not None
+            else "pending"
+            if reason == "待完成克隆测试"
+            else "unavailable"
+        )
+        if score_value is None or status != "available":
             missing_dimensions.append(key)
         dimensions.append(
             {
                 "key": key,
                 "label": label,
                 "score": score_value,
-                "status": "available" if score_value is not None else "pending" if reason == "待完成克隆测试" else "unavailable",
-                "reason": None if score_value is not None else reason,
+                "status": status,
+                "reason": None if status == "available" else reason,
                 "weight": weight,
             }
         )

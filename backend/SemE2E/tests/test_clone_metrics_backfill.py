@@ -43,9 +43,22 @@ class CloneMetricsBackfillTest(unittest.TestCase):
             "cloneSemanticScore": 78.0,
             "semanticBaselineWeight": 1.0,
             "cloneQualityStatus": "available",
-            "cloneQualityModel": "DNSMOS P.835 OVRL",
+            "cloneQualityModel": "PESQ + STOI + DNSMOS P.835 OVRL",
             "cleanCloneQualityMos": 3.8,
             "protectedCloneQualityMos": 3.1,
+            "clonePairPesq": 2.5,
+            "clonePairStoi": 0.6,
+            "cloneQualityBefore": 95.0,
+            "cloneQualityAfter": 60.0,
+            "cloneQualityDropRate": 0.3684210526315789,
+            "clonePesqDegradationScore": 40.0,
+            "cloneStoiDegradationScore": 40.0,
+            "cloneDnsMosDegradationScore": 17.5,
+            "cloneQualityComponents": {
+                "pesq": {"before": 100.0, "after": 60.0, "weight": 0.45},
+                "stoi": {"before": 100.0, "after": 60.0, "weight": 0.45},
+                "dnsmos": {"before": 70.0, "after": 52.5, "weight": 0.10},
+            },
             "cloneQualityRawScore": 58.0,
             "cloneQualityRelevance": 0.82,
             "cloneQualityScore": 65.0,
@@ -66,7 +79,7 @@ class CloneMetricsBackfillTest(unittest.TestCase):
                 },
                 "cloneEval.cloneQualityScore": {
                     "status": "available",
-                    "source": "DNSMOS P.835 OVRL",
+                    "source": "PESQ + STOI + DNSMOS P.835 OVRL",
                 },
             },
         }
@@ -177,18 +190,20 @@ class CloneMetricsBackfillTest(unittest.TestCase):
                 "tokenChangeRate": 0.72,
                 "semanticDrift": 0.61,
             }
-            dnsmos = {
+            quality_metrics = {
                 "status": "available",
-                "model": "DNSMOS P.835 OVRL",
+                "model": "PESQ + STOI + DNSMOS P.835 OVRL",
                 "cleanMos": 3.8,
                 "protectedMos": 3.1,
+                "clonePairPesq": 2.5,
+                "clonePairStoi": 0.6,
             }
 
             with (
                 mock.patch.object(adapter, "TASK_DIR", task_root),
                 mock.patch.object(adapter, "_transcribe_clone_pair_isolated", return_value=transcription) as asr,
                 mock.patch.object(adapter, "_compute_clone_semantic_isolated", return_value=semantic) as semantic_eval,
-                mock.patch.object(adapter, "_evaluate_dnsmos_pair_isolated", return_value=dnsmos) as quality_eval,
+                mock.patch.object(adapter, "_evaluate_clone_quality_pair", return_value=quality_metrics) as quality_eval,
                 mock.patch.object(adapter, "compute_clone_eval", return_value=complete_eval) as scorer,
                 mock.patch.object(adapter, "create_clone_voice") as create_clone,
                 mock.patch.object(adapter, "_coqui_tts_clone_pair") as coqui,
@@ -245,7 +260,7 @@ class CloneMetricsBackfillTest(unittest.TestCase):
                 mock.patch.object(adapter, "TASK_DIR", task_root),
                 mock.patch.object(adapter, "_transcribe_clone_pair_isolated") as asr,
                 mock.patch.object(adapter, "_compute_clone_semantic_isolated") as semantic_eval,
-                mock.patch.object(adapter, "_evaluate_dnsmos_pair_isolated") as quality_eval,
+                mock.patch.object(adapter, "_evaluate_clone_quality_pair") as quality_eval,
                 mock.patch.object(adapter, "compute_clone_eval") as scorer,
                 mock.patch.object(adapter, "create_clone_voice") as create_clone,
                 redirect_stdout(output),

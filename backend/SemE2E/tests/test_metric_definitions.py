@@ -821,11 +821,13 @@ class MetricDefinitionsTest(unittest.TestCase):
                 ),
                 mock.patch.object(
                     adapter,
-                    "_evaluate_dnsmos_pair_isolated",
+                    "_evaluate_clone_quality_pair",
                     return_value={
                         "status": "unavailable",
                         "reason": "not run",
                         "provider": "dnsmos",
+                        "clonePairPesq": None,
+                        "clonePairStoi": None,
                         "diagnostics": {"stage": "clone_quality"},
                     },
                 ),

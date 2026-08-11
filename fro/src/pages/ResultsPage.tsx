@@ -1662,12 +1662,12 @@ function CloneTab({ result, cloneResult, cloneEval, cloneHistory, cloneBatches, 
     cloneDetail = <EmptyState title="未执行语音克隆测试" text="请在防护工作台选择已完成的保护任务并开始语音克隆测试。" />
   } else {
     const cloneReason = cloneEval.reason ? shortMetricReason(cloneEval.reason) : ''
-    const cloneRequest = cloneResult?.request ?? selectedCloneEntry?.request
+    const cloneRequest = selectedCloneEntry?.request ?? cloneResult?.request
     const cloneModelLabel = shortCloneModelName(cloneEval.cloneModel ?? cloneRequest?.model)
     const cloneModelValue = cloneEval.cloneModel ?? cloneRequest?.model
     const cloneModelOption = cloneModelOptions.find((item) => item.value === cloneModelValue || item.backendValue === cloneModelValue) ?? null
     const cloneAnnotation = cloneAnnotationTitle(cloneRequest, cloneModelOption, cloneResult?.fineTune)
-    const cloneTitle = cloneAnnotation ? `TTS 克隆 · ${cloneAnnotation} · ${cloneModelLabel}` : cloneModelLabel
+    const cloneTitle = cloneAnnotation ? `TTS 克隆 · ${cloneAnnotation} · ${cloneModelLabel}` : `TTS 克隆 · ${cloneModelLabel}`
     cloneDetail = (
       <>
         <div className="flex flex-wrap items-center justify-center gap-2 text-center text-sm font-black text-violet-100">
@@ -1856,14 +1856,17 @@ function CloneCoreMetricCards({ cloneEval }: { cloneEval: CloneEval }) {
         tone="amber"
         info={(
           <MetricFormulaContent
-            description="先比较两段克隆音频的 DNSMOS 语音质量评分，再结合原始克隆能力以及已有的身份、语义保护效果，判断质量下降在当前结果中的必要程度。"
+            description="该指标衡量保护导致的相对质量下降，不评价克隆音频的绝对好坏。PESQ 与 STOI 要求同文本参考，因此以原始侧克隆音频作为保护后克隆音频的参考；DNSMOS 则在两侧分别实测。"
             formulas={[
-              'r_q=\\max\\!\\left(0,\\frac{q^0-q^1}{q^0-1}\\right)',
-              'S_q^{\\mathrm{raw}}=\\Phi(r_q;r_{90}^{q})',
-              '\\rho_q=\\max\\!\\left(1-w^{\\mathrm{id}},1-\\frac{\\min(S_{\\mathrm{id}},S_{\\mathrm{sem}})}{100}\\right)',
-              'S_{\\mathrm{clone\\_quality}}=(1-\\rho_q)\\times100+\\rho_q S_q^{\\mathrm{raw}}',
+              'S_{\\mathrm{PESQ}}^{1}=100\\,\\operatorname{clip}\\!\\left(\\frac{\\mathrm{PESQ}(x^{0},x^{1})+0.5}{5},0,1\\right)',
+              'S_{\\mathrm{STOI}}^{1}=100\\,\\operatorname{clip}\\!\\left(\\mathrm{STOI}(x^{0},x^{1}),0,1\\right)',
+              'S_{\\mathrm{DNSMOS}}^{k}=100\\,\\operatorname{clip}\\!\\left(\\frac{\\mathrm{MOS}^{k}-1}{4},0,1\\right),\\quad k\\in\\{0,1\\}',
+              'Q^{0}=0.45\\times100+0.45\\times100+0.10S_{\\mathrm{DNSMOS}}^{0}',
+              'Q^{1}=0.45S_{\\mathrm{PESQ}}^{1}+0.45S_{\\mathrm{STOI}}^{1}+0.10S_{\\mathrm{DNSMOS}}^{1}',
+              'd_q=\\max\\!\\left(0,\\frac{Q^{0}-Q^{1}}{Q^{0}}\\right)',
+              'S_q^{\\mathrm{raw}}=\\Phi(d_q;0.75)',
             ]}
-            note="身份和语义已得到充分保护时，不再要求额外破坏听感；原始克隆能力较弱或其他保护不足时，实际质量下降仍保持较高参考价值。"
+            note="Q⁰ 中 PESQ、STOI 的 100 是同文本自参考经过归一化后的相对基线，不是原始克隆音频的绝对质量分。当前没有与克隆目标文本相同的自然参考录音，不能合法计算两侧各自的绝对 PESQ/STOI。缺失指标会从前后两侧同时剔除并按剩余权重重新归一化，不会补零。"
           />
         )}
       />
@@ -2003,7 +2006,7 @@ function AsrEvalModal({
   onQuickSubmit: () => void
 }) {
   const [informationModel, setInformationModel] = useState<BackendSelectOption | null>(null)
-  return (
+  return createPortal(
     <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/68 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="ASR 测试表单">
       <div className="ui-card max-h-[92vh] w-full max-w-[620px] overflow-y-auto !bg-[#061426] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.46)]">
         <div className="mb-4 flex items-center justify-between">
@@ -2055,7 +2058,8 @@ function AsrEvalModal({
         </div>
       </div>
       <ModelInformationModal model={informationModel} modelTypes={modelTypes} onClose={() => setInformationModel(null)} />
-    </div>
+    </div>,
+    document.body,
   )
 }
 
@@ -2071,14 +2075,18 @@ function cloneAnnotationTitle(
   fineTune: CloneVoiceResult['fineTune'],
 ) {
   const explicitSource = request?.annotationSource
+  const modelLabel = shortCloneModelName(request?.model ?? modelOption?.value ?? modelOption?.backendValue)
+  if (modelLabel === 'XTTS-v2' || modelLabel === 'YourTTS') return null
+  if (explicitSource === 'manual') return '人工标注'
+  if (explicitSource === 'asr') return 'ASR 标注'
   const asrEvidence = Boolean(
     request?.annotationAsrSubId
       || request?.annotationAsrModel
       || (request?.originalSpeakerPrompt?.trim() && request?.protectedSpeakerPrompt?.trim()),
   )
-  const needsAnnotation = cloneModelRequiresReferenceText(modelOption) || Boolean(explicitSource) || asrEvidence || Boolean(fineTune)
+  const needsAnnotation = cloneModelRequiresReferenceText(modelOption) || asrEvidence || Boolean(fineTune)
   if (!needsAnnotation) return null
-  if (explicitSource === 'asr' || asrEvidence) return 'ASR 标注'
+  if (asrEvidence) return 'ASR 标注'
   return '人工标注'
 }
 
@@ -2088,9 +2096,9 @@ function cloneModelOption(modelOptions: BackendSelectOption[], model?: string) {
 
 function shortCloneModelName(value?: string) {
   const model = String(value ?? '')
-  if (/xtts[_:/-]?v?2/i.test(model)) return 'XTTS v2'
+  if (/xtts[_:/-]?v?2/i.test(model)) return 'XTTS-v2'
   if (/xtts[_:/-]?v?1[._-]?1/i.test(model)) return 'XTTS v1.1'
-  if (/yourtts/i.test(model)) return 'YourTTS'
+  if (/your[\s_-]?tts/i.test(model)) return 'YourTTS'
   if (/cosyvoice/i.test(model)) return 'CosyVoice2-0.5B'
   if (/gpt.?sovits/i.test(model)) return 'GPT-SoVITS'
   return model.split('/').at(-1)?.replaceAll('_', ' ') || '—'
@@ -2385,7 +2393,7 @@ function CloneVoiceModal({
     }, selected))
   }
 
-  return (
+  return createPortal(
     <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/68 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="语音克隆测试表单">
       <div className="ui-card max-h-[92vh] w-full max-w-[620px] overflow-y-auto !bg-[#061426] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.46)]">
         <div className="mb-4 flex items-center justify-between">
@@ -2500,7 +2508,8 @@ function CloneVoiceModal({
         </div>
       </div>
       <ModelInformationModal model={informationModel} modelTypes={modelTypes} onClose={() => setInformationModel(null)} />
-    </div>
+    </div>,
+    document.body,
   )
 }
 
@@ -2962,7 +2971,7 @@ function PsychoacousticPanel({ result }: { result: TaskResult }) {
         {sliceError && !timeDialogOpen ? <p className="mt-2 text-[11px] text-rose-300">{sliceError}</p> : null}
       </section>
 
-      {timeDialogOpen ? (
+      {timeDialogOpen ? createPortal(
         <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/68 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="选择心理声学分析时间点">
           <form
             className="ui-card w-full max-w-[440px] !bg-[#061426] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.46)]"
@@ -3009,7 +3018,8 @@ function PsychoacousticPanel({ result }: { result: TaskResult }) {
               </button>
             </div>
           </form>
-        </div>
+        </div>,
+        document.body,
       ) : null}
     </>
   )
@@ -3203,7 +3213,7 @@ function DownloadModal({ result, onClose }: { result: TaskResult; onClose: () =>
     }
   }
 
-  return (
+  return createPortal(
     <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/68 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="下载与导出">
       <div className="ui-card w-full max-w-[520px] !bg-[#061426] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.46)]">
         <div className="mb-5 flex items-center justify-between gap-4">
@@ -3227,7 +3237,8 @@ function DownloadModal({ result, onClose }: { result: TaskResult; onClose: () =>
           重新执行任务
         </button>
       </div>
-    </div>
+    </div>,
+    document.body,
   )
 }
 

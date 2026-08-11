@@ -28,6 +28,7 @@ from metric_definitions import (
     compute_asr_metrics,
     compute_clone_eval,
     compute_clone_identity_score,
+    compute_clone_pair_perceptual_metrics,
     compute_clone_quality_score,
     compute_direct_identity_score,
     compute_direct_speaker_metrics,
@@ -83,7 +84,15 @@ CLONE_EVAL_MIRROR_FIELDS = (
     "cloneSemanticReason",
     "cleanCloneQualityMos",
     "protectedCloneQualityMos",
+    "clonePairPesq",
+    "clonePairStoi",
+    "cloneQualityBefore",
+    "cloneQualityAfter",
     "cloneQualityDropRate",
+    "clonePesqDegradationScore",
+    "cloneStoiDegradationScore",
+    "cloneDnsMosDegradationScore",
+    "cloneQualityComponents",
     "cloneQualityRawScore",
     "cloneQualityRelevance",
     "cloneQualityScore",
@@ -570,6 +579,39 @@ def _evaluate_dnsmos_pair_isolated(
                 "stackTrace": traceback.format_exc(),
             },
         }
+
+
+def _evaluate_clone_quality_pair(
+    clean_clone_path: Path,
+    protected_clone_path: Path,
+    *,
+    cancel_event: Any | None = None,
+) -> dict[str, Any]:
+    dns_mos = _evaluate_dnsmos_pair_isolated(
+        clean_clone_path,
+        protected_clone_path,
+        cancel_event=cancel_event,
+    )
+    pair_metrics = compute_clone_pair_perceptual_metrics(clean_clone_path, protected_clone_path)
+    clean_mos = to_float(dns_mos.get("cleanMos"))
+    protected_mos = to_float(dns_mos.get("protectedMos"))
+    pair_pesq = to_float(pair_metrics.get("clonePairPesq"))
+    pair_stoi = to_float(pair_metrics.get("clonePairStoi"))
+    available_count = sum(value is not None for value in (pair_pesq, pair_stoi, clean_mos if protected_mos is not None else None))
+    reasons = [
+        str(reason)
+        for reason in (pair_metrics.get("reason"), dns_mos.get("reason"))
+        if reason
+    ]
+    return {
+        **dns_mos,
+        "status": "available" if available_count == 3 else "partial" if available_count else "unavailable",
+        "model": "PESQ + STOI + DNSMOS P.835 OVRL",
+        "clonePairPesq": pair_pesq,
+        "clonePairStoi": pair_stoi,
+        "reason": "; ".join(dict.fromkeys(reasons)) or None,
+        "pairMetricSources": pair_metrics.get("_metricSources") or {},
+    }
 
 
 def _dnsmos_fields_from_evaluation(evaluation: dict[str, Any]) -> dict[str, Any]:
@@ -3389,11 +3431,18 @@ def refresh_result_scores(result: dict[str, Any]) -> dict[str, Any]:
                 clone_eval["identityBaselineWeight"] = identity["identityBaselineWeight"]
         clean_clone_mos = clone_eval.get("cleanCloneQualityMos", clone_result.get("cleanCloneQualityMos"))
         protected_clone_mos = clone_eval.get("protectedCloneQualityMos", clone_result.get("protectedCloneQualityMos"))
-        if to_float(clean_clone_mos) is not None and to_float(protected_clone_mos) is not None:
+        pair_pesq = clone_eval.get("clonePairPesq", clone_result.get("clonePairPesq"))
+        pair_stoi = clone_eval.get("clonePairStoi", clone_result.get("clonePairStoi"))
+        if any(
+            to_float(value) is not None
+            for value in (clean_clone_mos, protected_clone_mos, pair_pesq, pair_stoi)
+        ):
             clone_eval.update(
                 compute_clone_quality_score(
                     clean_clone_mos,
                     protected_clone_mos,
+                    pair_pesq=pair_pesq,
+                    pair_stoi=pair_stoi,
                     identity_baseline_weight=clone_eval.get("identityBaselineWeight"),
                     clone_identity_score=clone_eval.get("cloneIdentityScore"),
                     clone_semantic_score=clone_eval.get("cloneSemanticScore"),
@@ -5152,7 +5201,7 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
         cancel_event=cancel_event,
         preferred_gpu=clone_gpu_key,
     )
-    clone_quality_metrics = _evaluate_dnsmos_pair_isolated(
+    clone_quality_metrics = _evaluate_clone_quality_pair(
         original_clone_path,
         protected_clone_path,
         cancel_event=cancel_event,
@@ -5169,7 +5218,7 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
     }
     clone_runtime_diagnostics["cloneQuality"] = {
         key: clone_quality_metrics.get(key)
-        for key in ("status", "reason", "provider", "diagnostics")
+        for key in ("status", "reason", "provider", "clonePairPesq", "clonePairStoi", "diagnostics")
         if clone_quality_metrics.get(key) is not None
     }
     if cancel_event is not None and cancel_event.is_set():
@@ -5202,6 +5251,15 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
             "identityBaselineWeight": clone_eval.get("identityBaselineWeight"),
             "cloneSemanticScore": clone_eval.get("cloneSemanticScore"),
             "semanticBaselineWeight": clone_eval.get("semanticBaselineWeight"),
+            "clonePairPesq": clone_eval.get("clonePairPesq"),
+            "clonePairStoi": clone_eval.get("clonePairStoi"),
+            "cloneQualityBefore": clone_eval.get("cloneQualityBefore"),
+            "cloneQualityAfter": clone_eval.get("cloneQualityAfter"),
+            "cloneQualityDropRate": clone_eval.get("cloneQualityDropRate"),
+            "clonePesqDegradationScore": clone_eval.get("clonePesqDegradationScore"),
+            "cloneStoiDegradationScore": clone_eval.get("cloneStoiDegradationScore"),
+            "cloneDnsMosDegradationScore": clone_eval.get("cloneDnsMosDegradationScore"),
+            "cloneQualityComponents": clone_eval.get("cloneQualityComponents"),
             "cloneQualityRawScore": clone_eval.get("cloneQualityRawScore"),
             "cloneQualityRelevance": clone_eval.get("cloneQualityRelevance"),
             "cloneQualityScore": clone_eval.get("cloneQualityScore"),

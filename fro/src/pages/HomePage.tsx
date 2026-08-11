@@ -65,11 +65,19 @@ const metricSparklineData = [
   [76, 24, 20, 18, 17, 16, 15],
 ] as const
 
+const defaultMetricTaskIds = [
+  'task_315001019e8c',
+  'task_4209545a2d39',
+  'task_4af5a69a5ce1',
+  'task_6ed27d226465',
+  'task_e0ecb699cfad',
+] as const
+const defaultMetricTaskIdSet = new Set<string>(defaultMetricTaskIds)
+
 type HomeMetricSnapshot = {
   result?: TaskResult
-  cloneResult?: TaskResult
+  fallbackResults: TaskResult[]
   maxConcurrency: number | null
-  averageStepSec: number | null
 }
 
 type HomeMetric = (typeof metricTemplates)[number] & {
@@ -107,43 +115,60 @@ function cloneEvaluationsFrom(result?: TaskResult): CloneEval[] {
   return evaluations.length ? evaluations : result?.cloneEval ? [result.cloneEval] : []
 }
 
-function hasUsableCloneMetrics(result?: TaskResult) {
-  return cloneEvaluationsFrom(result).some((evaluation) => [
-    evaluation.originalSimilarity,
-    evaluation.protectedSimilarity,
-    evaluation.similarityDropRate,
-  ].some((value) => optionalNumber(value) !== null))
+function latestTaskTime(task: HistoryTask) {
+  const value = task.updatedAt ?? task.protectionCompletedAt ?? task.createdAt
+  const dotted = value.match(/^(\d{4})\.(\d{1,2})\.(\d{1,2})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/)
+  const timestamp = dotted
+    ? new Date(Number(dotted[1]), Number(dotted[2]) - 1, Number(dotted[3]), Number(dotted[4] ?? 0), Number(dotted[5] ?? 0), Number(dotted[6] ?? 0)).getTime()
+    : Date.parse(value)
+  return Number.isFinite(timestamp) ? timestamp : 0
 }
 
-async function getLatestCloneMetricResult(tasks: HistoryTask[], cachedResult?: TaskResult) {
-  for (const task of tasks) {
-    if (!task.hasCloneResult) continue
-    try {
-      const result = cachedResult?.taskId === task.taskId ? cachedResult : await getTaskResult(task.taskId)
-      if (hasUsableCloneMetrics(result)) return result
-    } catch {
-      // A stale history row must not hide an older result that still has real clone metrics.
-    }
-  }
-  return undefined
+function latestCompletedTask(tasks: HistoryTask[]) {
+  return tasks
+    .filter((task) => {
+      const status = task.protectionStatus ?? task.status
+      return status === 'completed' || status === 'success'
+    })
+    .slice()
+    .sort((left, right) => latestTaskTime(right) - latestTaskTime(left))[0]
+}
+
+function metricWithFallback(
+  latestResult: TaskResult | undefined,
+  fallbackResults: TaskResult[],
+  select: (result?: TaskResult) => number | null,
+) {
+  const latestValue = select(latestResult)
+  return latestValue ?? average(fallbackResults.map((result) => select(result)))
+}
+
+function cloneMetricWithFallback(
+  latestResult: TaskResult | undefined,
+  fallbackResults: TaskResult[],
+  select: (evaluation: CloneEval) => number | null,
+) {
+  const latestValue = average(cloneEvaluationsFrom(latestResult).map(select))
+  if (latestValue !== null) return latestValue
+  return average(
+    fallbackResults.map((result) => average(cloneEvaluationsFrom(result).map(select))),
+  )
 }
 
 function buildHomeMetrics(snapshot?: HomeMetricSnapshot): { metrics: HomeMetric[]; impactValues: string[] } {
   const result = snapshot?.result
-  const tokenErrorRate = optionalNumber(result?.semanticEval?.tokenErrorRate)
-  const tokenChangeRate = optionalNumber(result?.semanticEval?.tokenChangeRate)
-  const semanticDrift = optionalNumber(result?.semanticEval?.semanticDrift)
-  const snr = optionalNumber(result?.protectionQuality?.snr)
-  const averageStepSec = optionalNumber(result?.averageStepSec) ?? optionalNumber(snapshot?.averageStepSec)
-  const cloneEvaluations = cloneEvaluationsFrom(snapshot?.cloneResult ?? result)
-  const similarityDrops = cloneEvaluations.map((item) => {
+  const fallbackResults = snapshot?.fallbackResults ?? []
+  const tokenErrorRate = metricWithFallback(result, fallbackResults, (item) => optionalNumber(item?.semanticEval?.tokenErrorRate))
+  const tokenChangeRate = metricWithFallback(result, fallbackResults, (item) => optionalNumber(item?.semanticEval?.tokenChangeRate))
+  const semanticDrift = metricWithFallback(result, fallbackResults, (item) => optionalNumber(item?.semanticEval?.semanticDrift))
+  const snr = metricWithFallback(result, fallbackResults, (item) => optionalNumber(item?.protectionQuality?.snr))
+  const averageStepSec = metricWithFallback(result, fallbackResults, (item) => optionalNumber(item?.averageStepSec))
+  const averageSimilarityDrop = cloneMetricWithFallback(result, fallbackResults, (item) => {
     const before = optionalNumber(item.originalSimilarity)
     const after = optionalNumber(item.protectedSimilarity)
     return before === null || after === null ? null : Math.max(0, before - after)
   })
-  const relativeSimilarityDrops = cloneEvaluations.map((item) => optionalNumber(item.similarityDropRate))
-  const averageSimilarityDrop = average(similarityDrops)
-  const averageRelativeSimilarityDrop = average(relativeSimilarityDrops)
+  const averageRelativeSimilarityDrop = cloneMetricWithFallback(result, fallbackResults, (item) => optionalNumber(item.similarityDropRate))
   const maxConcurrency = optionalNumber(snapshot?.maxConcurrency)
   const values = [
     integerPercent(tokenErrorRate, '↓ '),
@@ -170,15 +195,24 @@ export function HomePage() {
   const { data: snapshot } = useQuery({
     queryKey: ['home-real-metrics'],
     queryFn: async (): Promise<HomeMetricSnapshot | undefined> => {
-      const [tasks, capabilities] = await Promise.all([listTasks(), getCapabilities().catch(() => undefined)])
-      const latest = tasks.find((task) => (task.protectionStatus ?? task.status) === 'completed' || (task.protectionStatus ?? task.status) === 'success')
-      const result = latest ? await getTaskResult(latest.taskId).catch(() => undefined) : undefined
-      const cloneResult = await getLatestCloneMetricResult(tasks, result)
+      const [tasks, capabilities] = await Promise.all([listTasks().catch(() => []), getCapabilities().catch(() => undefined)])
+      const latest = latestCompletedTask(tasks.filter((task) => !defaultMetricTaskIdSet.has(task.taskId)))
+      const requestedTaskIds = [...new Set([latest?.taskId, ...defaultMetricTaskIds].filter((taskId): taskId is string => Boolean(taskId)))]
+      const taskResults = await Promise.all(requestedTaskIds.map(async (taskId) => {
+        try {
+          return await getTaskResult(taskId)
+        } catch {
+          return undefined
+        }
+      }))
+      const resultsByTaskId = new Map(taskResults.flatMap((result) => result ? [[result.taskId, result] as const] : []))
       return {
-        result,
-        cloneResult,
+        result: latest ? resultsByTaskId.get(latest.taskId) : undefined,
+        fallbackResults: defaultMetricTaskIds.flatMap((taskId) => {
+          const fallbackResult = resultsByTaskId.get(taskId)
+          return fallbackResult ? [fallbackResult] : []
+        }),
         maxConcurrency: optionalNumber(capabilities?.runtimeConcurrency?.total),
-        averageStepSec: optionalNumber(capabilities?.runtimePerformance?.averageStepSec),
       }
     },
     refetchInterval: 30_000,

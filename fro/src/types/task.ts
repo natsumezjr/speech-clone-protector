@@ -412,7 +412,19 @@ export interface CloneEval {
   cloneSemanticReason?: string | null
   cleanCloneQualityMos?: number | null
   protectedCloneQualityMos?: number | null
+  clonePairPesq?: number | null
+  clonePairStoi?: number | null
+  cloneQualityBefore?: number | null
+  cloneQualityAfter?: number | null
   cloneQualityDropRate?: number | null
+  clonePesqDegradationScore?: number | null
+  cloneStoiDegradationScore?: number | null
+  cloneDnsMosDegradationScore?: number | null
+  cloneQualityComponents?: {
+    pesq?: { before?: number | null; after?: number | null; weight?: number | null } | null
+    stoi?: { before?: number | null; after?: number | null; weight?: number | null } | null
+    dnsmos?: { before?: number | null; after?: number | null; weight?: number | null } | null
+  } | null
   cloneQualityRawScore?: number | null
   cloneQualityRelevance?: number | null
   cloneQualityScore?: number | null
@@ -465,6 +477,7 @@ export interface ProtectionEvaluationCalibration {
   cloneTokenChangeRate90?: number | null
   cloneSemanticDrift90?: number | null
   cloneQualityDropRate90?: number | null
+  cloneQualityWeightedDrop90?: number | null
 }
 
 export interface ProtectionEvaluation {

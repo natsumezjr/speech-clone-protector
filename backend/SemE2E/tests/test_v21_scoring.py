@@ -32,6 +32,37 @@ def write_wav(path: Path, samples: np.ndarray, sample_rate: int = 16000) -> None
         wav.writeframes(pcm.tobytes())
 
 
+def expected_clone_quality(
+    clean_mos: float | None,
+    protected_mos: float | None,
+    pair_pesq: float | None,
+    pair_stoi: float | None,
+) -> tuple[float | None, float | None, float | None, float | None]:
+    """Independent reference for the same-text clone quality degradation score."""
+
+    components: list[tuple[float, float, float]] = []
+    if pair_pesq is not None:
+        components.append((100.0, max(0.0, min(100.0, (pair_pesq + 0.5) / 5.0 * 100.0)), 0.45))
+    if pair_stoi is not None:
+        components.append((100.0, max(0.0, min(100.0, pair_stoi * 100.0)), 0.45))
+    if clean_mos is not None and protected_mos is not None:
+        components.append(
+            (
+                max(0.0, min(100.0, (clean_mos - 1.0) / 4.0 * 100.0)),
+                max(0.0, min(100.0, (protected_mos - 1.0) / 4.0 * 100.0)),
+                0.10,
+            )
+        )
+    if not components:
+        return None, None, None, None
+    weight_sum = sum(weight for _, _, weight in components)
+    before = sum(value * weight for value, _, weight in components) / weight_sum
+    after = sum(value * weight for _, value, weight in components) / weight_sum
+    drop = max(0.0, (before - after) / before) if before > 0.0 else 0.0
+    raw = 100.0 * (1.0 - 10.0 ** (-drop / 0.75))
+    return before, after, drop, raw
+
+
 class VoiceShieldV21ScoringTest(unittest.TestCase):
     def test_piecewise_quality_uses_exact_anchors_and_optional_dnsmos(self) -> None:
         without_dnsmos = metrics.compute_protection_quality_score(25.0, 0.9, 3.0)
@@ -98,6 +129,148 @@ class VoiceShieldV21ScoringTest(unittest.TestCase):
         self.assertEqual(relevance, 1.0)
         self.assertEqual(score, 48.86)
 
+    def test_clone_quality_combines_all_three_metrics_with_exact_same_text_formula(self) -> None:
+        quality = metrics.compute_clone_quality_score(
+            4.2,
+            3.4,
+            pair_pesq=2.5,
+            pair_stoi=0.6,
+        )
+        expected_before, expected_after, expected_drop, expected_raw = expected_clone_quality(
+            4.2,
+            3.4,
+            2.5,
+            0.6,
+        )
+
+        self.assertTrue(math.isclose(quality["cloneQualityBefore"], expected_before, rel_tol=1e-9))
+        self.assertTrue(math.isclose(quality["cloneQualityAfter"], expected_after, rel_tol=1e-9))
+        self.assertTrue(math.isclose(quality["cloneQualityDropRate"], expected_drop, rel_tol=1e-9))
+        self.assertTrue(math.isclose(quality["cloneQualityRawScore"], expected_raw, rel_tol=1e-9))
+        self.assertTrue(math.isclose(quality["cloneQualityScore"], expected_raw, rel_tol=1e-9))
+        self.assertEqual(
+            quality["cloneQualityComponents"],
+            {
+                "pesq": {"before": 100.0, "after": 60.0, "weight": 0.45},
+                "stoi": {"before": 100.0, "after": 60.0, "weight": 0.45},
+                "dnsmos": {"before": 80.0, "after": 60.0, "weight": 0.10},
+            },
+        )
+        self.assertEqual(quality["clonePesqDegradationScore"], 40.0)
+        self.assertEqual(quality["cloneStoiDegradationScore"], 40.0)
+        self.assertEqual(quality["cloneDnsMosDegradationScore"], 20.0)
+        self.assertEqual(quality["cloneQualityStatus"], "available")
+
+    def test_clone_quality_normalizes_the_full_pesq_and_stoi_ranges(self) -> None:
+        cases = [
+            (-0.5, 0.0, 0.0, 0.0),
+            (2.0, 0.5, 50.0, 50.0),
+            (4.5, 1.0, 100.0, 100.0),
+            (-1.0, -0.1, 0.0, 0.0),
+            (5.0, 1.1, 100.0, 100.0),
+        ]
+        for pair_pesq, pair_stoi, expected_pesq, expected_stoi in cases:
+            with self.subTest(pair_pesq=pair_pesq, pair_stoi=pair_stoi):
+                quality = metrics.compute_clone_quality_score(
+                    None,
+                    None,
+                    pair_pesq=pair_pesq,
+                    pair_stoi=pair_stoi,
+                )
+
+                self.assertEqual(quality["cloneQualityComponents"]["pesq"]["before"], 100.0)
+                self.assertEqual(quality["cloneQualityComponents"]["pesq"]["after"], expected_pesq)
+                self.assertEqual(quality["cloneQualityComponents"]["stoi"]["before"], 100.0)
+                self.assertEqual(quality["cloneQualityComponents"]["stoi"]["after"], expected_stoi)
+
+    def test_clone_quality_missing_metric_is_removed_from_both_sides_without_zero_fill(self) -> None:
+        quality = metrics.compute_clone_quality_score(
+            4.2,
+            3.4,
+            pair_pesq=None,
+            pair_stoi=0.6,
+        )
+        expected_before, expected_after, expected_drop, expected_raw = expected_clone_quality(
+            4.2,
+            3.4,
+            None,
+            0.6,
+        )
+
+        self.assertTrue(math.isclose(quality["cloneQualityBefore"], expected_before, rel_tol=1e-9))
+        self.assertTrue(math.isclose(quality["cloneQualityAfter"], expected_after, rel_tol=1e-9))
+        self.assertTrue(math.isclose(quality["cloneQualityDropRate"], expected_drop, rel_tol=1e-9))
+        self.assertTrue(math.isclose(quality["cloneQualityRawScore"], expected_raw, rel_tol=1e-9))
+        self.assertEqual(quality["cloneQualityComponents"]["pesq"], None)
+        self.assertEqual(
+            quality["cloneQualityComponents"]["stoi"],
+            {"before": 100.0, "after": 60.0, "weight": 0.45},
+        )
+        self.assertEqual(
+            quality["cloneQualityComponents"]["dnsmos"],
+            {"before": 80.0, "after": 60.0, "weight": 0.10},
+        )
+        self.assertEqual(quality["clonePesqDegradationScore"], None)
+        self.assertTrue(math.isclose(quality["cloneQualityAfter"], 60.0, rel_tol=1e-9))
+        self.assertEqual(quality["cloneQualityStatus"], "partial")
+
+    def test_clone_quality_returns_none_when_all_three_metrics_are_missing(self) -> None:
+        quality = metrics.compute_clone_quality_score(None, None, pair_pesq=None, pair_stoi=None)
+
+        for key in (
+            "cloneQualityBefore",
+            "cloneQualityAfter",
+            "cloneQualityDropRate",
+            "cloneQualityRawScore",
+            "cloneQualityScore",
+        ):
+            self.assertIsNone(quality[key])
+        self.assertEqual(
+            quality["cloneQualityComponents"],
+            {"pesq": None, "stoi": None, "dnsmos": None},
+        )
+        self.assertEqual(quality["cloneQualityStatus"], "unavailable")
+
+    def test_clone_quality_score_increases_monotonically_with_quality_drop(self) -> None:
+        unchanged = metrics.compute_clone_quality_score(4.2, 4.2, pair_pesq=4.5, pair_stoi=1.0)
+        moderate = metrics.compute_clone_quality_score(4.2, 3.4, pair_pesq=2.5, pair_stoi=0.6)
+        severe = metrics.compute_clone_quality_score(4.2, 2.0, pair_pesq=1.0, pair_stoi=0.2)
+
+        self.assertLess(unchanged["cloneQualityRawScore"], moderate["cloneQualityRawScore"])
+        self.assertLess(moderate["cloneQualityRawScore"], severe["cloneQualityRawScore"])
+        self.assertLess(unchanged["cloneQualityScore"], moderate["cloneQualityScore"])
+        self.assertLess(moderate["cloneQualityScore"], severe["cloneQualityScore"])
+
+    def test_clone_quality_ignores_snr_evidence(self) -> None:
+        class FakeSpeaker:
+            def score(self, reference: Path, candidate: Path) -> float:
+                del reference
+                return 0.8 if candidate.name == "clean.wav" else 0.2
+
+        base_quality = {
+            "status": "available",
+            "cleanMos": 4.2,
+            "protectedMos": 3.4,
+            "clonePairPesq": 2.5,
+            "clonePairStoi": 0.6,
+        }
+        results = []
+        for snr in (-100.0, 100.0):
+            results.append(
+                metrics.compute_clone_eval(
+                    Path("original.wav"),
+                    Path("clean.wav"),
+                    Path("protected.wav"),
+                    {"request": {"model": "fake", "text": "same text"}},
+                    speaker_model=FakeSpeaker(),
+                    quality_metrics={**base_quality, "snr": snr},
+                )
+            )
+
+        self.assertEqual(results[0]["cloneQualityRawScore"], results[1]["cloneQualityRawScore"])
+        self.assertEqual(results[0]["cloneQualityScore"], results[1]["cloneQualityScore"])
+        self.assertNotIn("snr", results[0]["cloneQualityComponents"])
+
     def test_real_clone_calibration_places_multiple_quality_scores_above_eighty_five(self) -> None:
         samples = [
             (0.455, 96.54, 88.62, 61.53),
@@ -135,9 +308,12 @@ class VoiceShieldV21ScoringTest(unittest.TestCase):
                         "identityBaselineWeight": 1.0,
                         "cloneSemanticScore": 90.32,
                         "semanticBaselineWeight": 1.0,
-                        "cleanCloneQualityMos": 3.5,
-                        "protectedCloneQualityMos": 3.5,
-                        "cloneQualityScore": 0.0,
+                        "cleanCloneQualityMos": 4.2,
+                        "protectedCloneQualityMos": 3.4,
+                        "clonePairPesq": 2.5,
+                        "clonePairStoi": 0.6,
+                        "cloneQualityRawScore": -1.0,
+                        "cloneQualityScore": -1.0,
                         "qualityBaselineWeight": 1.0,
                     },
                 }
@@ -146,9 +322,15 @@ class VoiceShieldV21ScoringTest(unittest.TestCase):
 
         adapter.refresh_result_scores(result)
         clone_eval = result["cloneResults"][0]["cloneEval"]
-        self.assertEqual(clone_eval["cloneQualityRawScore"], 0.0)
-        self.assertTrue(math.isclose(clone_eval["cloneQualityScore"], 90.32, rel_tol=1e-9))
-        self.assertTrue(math.isclose(result["cloneResults"][0]["cloneQualityScore"], 90.32, rel_tol=1e-9))
+        expected_before, expected_after, expected_drop, expected_raw = expected_clone_quality(4.2, 3.4, 2.5, 0.6)
+        expected_relevance = 1.0 - 90.32 / 100.0
+        expected_score = (1.0 - expected_relevance) * 100.0 + expected_relevance * expected_raw
+        self.assertTrue(math.isclose(clone_eval["cloneQualityBefore"], expected_before, rel_tol=1e-9))
+        self.assertTrue(math.isclose(clone_eval["cloneQualityAfter"], expected_after, rel_tol=1e-9))
+        self.assertTrue(math.isclose(clone_eval["cloneQualityDropRate"], expected_drop, rel_tol=1e-9))
+        self.assertTrue(math.isclose(clone_eval["cloneQualityRawScore"], expected_raw, rel_tol=1e-9))
+        self.assertTrue(math.isclose(clone_eval["cloneQualityScore"], expected_score, rel_tol=1e-9))
+        self.assertTrue(math.isclose(result["cloneResults"][0]["cloneQualityScore"], expected_score, rel_tol=1e-9))
 
     def test_bounded_text_error_handles_english_words_and_unspaced_chinese(self) -> None:
         english = metrics.compute_bounded_text_metrics("hello brave world", "hello world")
@@ -189,9 +371,11 @@ class VoiceShieldV21ScoringTest(unittest.TestCase):
                 semantic_metrics={"tokenChangeRate": 1.0, "semanticDrift": 0.78, "status": "available"},
                 quality_metrics={
                     "status": "available",
-                    "model": "DNSMOS P.835 OVRL",
+                    "model": "PESQ + STOI + DNSMOS P.835 OVRL",
                     "cleanMos": 3.5,
                     "protectedMos": 3.0,
+                    "clonePairPesq": 2.5,
+                    "clonePairStoi": 0.6,
                 },
             )
 
@@ -247,6 +431,48 @@ class VoiceShieldV21ScoringTest(unittest.TestCase):
         self.assertIsNone(incomplete["score"])
         self.assertEqual(incomplete["verdict"], "待完整评估")
         self.assertIn("cloneQuality", incomplete["protectionEvaluation"]["missingDimensions"])
+
+    def test_overall_stays_incomplete_when_clone_quality_score_is_partial(self) -> None:
+        result = {
+            "summary": {"primaryMetrics": {}, "metricSources": {}},
+            "details": {
+                "perception": {"snr": 25.0, "stoi": 0.9, "pesq": 3.0, "dnsMos": 4.0},
+                "semantic": {"tokenChangeRate": 0.9, "semanticDrift": 0.6},
+                "speaker": {"simOriginalProtected": 0.5},
+                "generation": {},
+            },
+            "cloneResults": [
+                {
+                    "request": {"model": "model-a"},
+                    "cloneEval": {
+                        "cloneModel": "model-a",
+                        "cloneIdentityScore": 80.0,
+                        "identityBaselineWeight": 0.8,
+                        "cloneIdentityStatus": "available",
+                        "cloneSemanticScore": 70.0,
+                        "semanticBaselineWeight": 0.7,
+                        "cloneSemanticStatus": "available",
+                        "cloneQualityScore": 60.0,
+                        "qualityBaselineWeight": 0.6,
+                        "cloneQualityStatus": "partial",
+                        "cloneQualityReason": "PESQ 尚未生成",
+                    },
+                }
+            ],
+        }
+
+        scored = metrics.compute_overall_score(result)
+        evaluation = scored["protectionEvaluation"]
+        clone_quality = next(item for item in evaluation["dimensions"] if item["key"] == "cloneQuality")
+
+        self.assertEqual(clone_quality["score"], 60.0)
+        self.assertEqual(clone_quality["status"], "partial")
+        self.assertEqual(clone_quality["reason"], "PESQ 尚未生成")
+        self.assertIn("cloneQuality", evaluation["missingDimensions"])
+        self.assertIsNone(evaluation["overallScore"])
+        self.assertEqual(evaluation["status"], "incomplete")
+        self.assertIsNone(scored["score"])
+        self.assertEqual(scored["verdict"], "待完整评估")
 
     def test_historical_direct_distance_is_accepted_without_similarity(self) -> None:
         result = {

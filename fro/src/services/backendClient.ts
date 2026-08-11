@@ -329,6 +329,7 @@ function normalizeProtectionEvaluation(value: unknown): ProtectionEvaluation | n
         cloneTokenChangeRate90: firstNumber(calibrationRecord, ['cloneTokenChangeRate90', 'clone_token_change_rate_90']),
         cloneSemanticDrift90: firstNumber(calibrationRecord, ['cloneSemanticDrift90', 'clone_semantic_drift_90']),
         cloneQualityDropRate90: firstNumber(calibrationRecord, ['cloneQualityDropRate90', 'clone_quality_drop_rate_90']),
+        cloneQualityWeightedDrop90: firstNumber(calibrationRecord, ['cloneQualityWeightedDrop90', 'clone_quality_weighted_drop_90']),
       }
     : null
   const overallScore = firstNumber(record, ['overallScore', 'overall_score'])
@@ -524,7 +525,32 @@ function normalizeCloneEval(value: unknown): TaskResult['cloneEval'] {
     cloneSemanticReason: metricString(['cloneSemanticReason', 'clone_semantic_reason']) ?? metricSourceReason('cloneEval.cloneSemanticScore'),
     cleanCloneQualityMos: metricNumber(['cleanCloneQualityMos', 'clean_clone_quality_mos']),
     protectedCloneQualityMos: metricNumber(['protectedCloneQualityMos', 'protected_clone_quality_mos']),
+    clonePairPesq: metricNumber(['clonePairPesq', 'clone_pair_pesq']),
+    clonePairStoi: metricNumber(['clonePairStoi', 'clone_pair_stoi']),
+    cloneQualityBefore: metricNumber(['cloneQualityBefore', 'clone_quality_before']),
+    cloneQualityAfter: metricNumber(['cloneQualityAfter', 'clone_quality_after']),
     cloneQualityDropRate: metricNumber(['cloneQualityDropRate', 'clone_quality_drop_rate']),
+    clonePesqDegradationScore: metricNumber(['clonePesqDegradationScore', 'clone_pesq_degradation_score']),
+    cloneStoiDegradationScore: metricNumber(['cloneStoiDegradationScore', 'clone_stoi_degradation_score']),
+    cloneDnsMosDegradationScore: metricNumber(['cloneDnsMosDegradationScore', 'clone_dnsmos_degradation_score']),
+    cloneQualityComponents: (() => {
+      const components = asRecord(metricValue(['cloneQualityComponents', 'clone_quality_components']))
+      if (!Object.keys(components).length) return null
+      const component = (key: 'pesq' | 'stoi' | 'dnsmos') => {
+        const value = asRecord(components[key])
+        if (!Object.keys(value).length) return null
+        return {
+          before: firstNumber(value, ['before']),
+          after: firstNumber(value, ['after']),
+          weight: firstNumber(value, ['weight']),
+        }
+      }
+      return {
+        pesq: component('pesq'),
+        stoi: component('stoi'),
+        dnsmos: component('dnsmos'),
+      }
+    })(),
     cloneQualityRawScore: metricNumber(['cloneQualityRawScore', 'clone_quality_raw_score']),
     cloneQualityRelevance: metricNumber(['cloneQualityRelevance', 'clone_quality_relevance']),
     cloneQualityScore: metricNumber(['cloneQualityScore', 'clone_quality_score']),

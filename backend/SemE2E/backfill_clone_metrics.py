@@ -24,10 +24,22 @@ def _finite(value: Any) -> bool:
         return False
 
 
+def _complete_quality_components(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    for key in ("pesq", "stoi", "dnsmos"):
+        component = value.get(key)
+        if not isinstance(component, dict):
+            return False
+        if not all(_finite(component.get(field)) for field in ("before", "after", "weight")):
+            return False
+    return True
+
+
 def missing_clone_metric_groups(clone_result: dict[str, Any]) -> list[str]:
     clone_eval = clone_result.get("cloneEval")
     if not isinstance(clone_eval, dict):
-        return ["asr", "semantic", "dnsmos", "v2.1"]
+        return ["asr", "semantic", "quality", "v2.1"]
 
     missing: list[str] = []
     if not (
@@ -50,12 +62,21 @@ def missing_clone_metric_groups(clone_result: dict[str, Any]) -> list[str]:
         clone_eval.get("cloneQualityStatus") == "available"
         and _finite(clone_eval.get("cleanCloneQualityMos"))
         and _finite(clone_eval.get("protectedCloneQualityMos"))
+        and _finite(clone_eval.get("clonePairPesq"))
+        and _finite(clone_eval.get("clonePairStoi"))
+        and _finite(clone_eval.get("cloneQualityBefore"))
+        and _finite(clone_eval.get("cloneQualityAfter"))
+        and _finite(clone_eval.get("cloneQualityDropRate"))
+        and _finite(clone_eval.get("clonePesqDegradationScore"))
+        and _finite(clone_eval.get("cloneStoiDegradationScore"))
+        and _finite(clone_eval.get("cloneDnsMosDegradationScore"))
+        and _complete_quality_components(clone_eval.get("cloneQualityComponents"))
         and _finite(clone_eval.get("cloneQualityRawScore"))
         and _finite(clone_eval.get("cloneQualityRelevance"))
         and _finite(clone_eval.get("cloneQualityScore"))
         and _finite(clone_eval.get("qualityBaselineWeight"))
     ):
-        missing.append("dnsmos")
+        missing.append("quality")
 
     sources = clone_eval.get("_metricSources")
     identity_source = None
@@ -347,7 +368,7 @@ def _compute_clone_metrics(
         protected_clone_path,
         semantic_config,
     )
-    quality_metrics = adapter._evaluate_dnsmos_pair_isolated(
+    quality_metrics = adapter._evaluate_clone_quality_pair(
         original_clone_path,
         protected_clone_path,
     )
@@ -371,7 +392,7 @@ def _metric_status(clone_eval: dict[str, Any]) -> dict[str, Any]:
     return {
         "asr": clone_eval.get("cloneAsrStatus"),
         "semantic": clone_eval.get("cloneSemanticStatus"),
-        "dnsmos": clone_eval.get("cloneQualityStatus"),
+        "quality": clone_eval.get("cloneQualityStatus"),
         "v2.1": clone_eval.get("status"),
     }
 
