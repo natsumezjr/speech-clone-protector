@@ -123,7 +123,7 @@ function ProtectionTaskSelector({ tasks, value, onChange, view }: { tasks: Histo
   const [open, setOpen] = useState(false)
   return (
     <div className="workspace-task-selector-wrap relative shrink-0">
-      <button type="button" onClick={() => setOpen((current) => !current)} className="workspace-task-selector flex h-10 w-full items-center gap-2 rounded-[7px] border border-cyan-300/14 bg-slate-950/55 pl-3 pr-2 text-left text-xs text-slate-200 hover:border-cyan-300/28">
+      <button type="button" onClick={() => setOpen((current) => !current)} className="workspace-task-selector workspace-hover-control flex h-10 w-full items-center gap-2 rounded-[7px] border border-cyan-300/14 bg-slate-950/55 pl-3 pr-2 text-left text-xs text-slate-200 hover:border-cyan-300/28">
         <span className={cn('min-w-0 flex-1 truncate font-mono', !value && 'font-sans text-slate-500')}>{value || '选择已完成的保护任务'}</span>
         <ChevronDown className={cn('h-4 w-4 shrink-0 text-slate-500 transition', open && 'rotate-180')} />
       </button>
@@ -131,7 +131,7 @@ function ProtectionTaskSelector({ tasks, value, onChange, view }: { tasks: Histo
         type="button"
         disabled={!value}
         onClick={() => navigate(`/history?view=${view}&search=${encodeURIComponent(value)}`)}
-        className="absolute right-9 top-1.5 grid h-7 w-7 place-items-center rounded-[5px] text-cyan-200 hover:bg-cyan-300/10 disabled:opacity-30"
+        className="workspace-hover-control absolute right-9 top-1.5 grid h-7 w-7 place-items-center rounded-[5px] text-cyan-200 hover:bg-cyan-300/10 disabled:opacity-30"
         aria-label="在历史记录中查看"
       >
         <Search className="h-3.5 w-3.5" />
@@ -139,7 +139,7 @@ function ProtectionTaskSelector({ tasks, value, onChange, view }: { tasks: Histo
       {open ? (
         <div className="ui-popover-surface absolute inset-x-0 top-11 z-40 max-h-48 overflow-y-auto rounded-[8px] border border-cyan-300/18 p-1.5 shadow-[0_18px_45px_rgba(0,0,0,0.48)]" role="listbox">
           {tasks.length ? tasks.map((task) => (
-            <button key={task.taskId} type="button" onClick={() => { onChange(task.taskId); setOpen(false) }} className="block w-full rounded-[6px] px-3 py-2 text-left hover:bg-cyan-300/[0.08]">
+            <button key={task.taskId} type="button" onClick={() => { onChange(task.taskId); setOpen(false) }} className="workspace-hover-row block w-full rounded-[6px] px-3 py-2 text-left hover:bg-cyan-300/[0.08]">
               <span className="flex items-center justify-between gap-3">
                 <span className="min-w-0 truncate font-mono text-[11px] font-black text-cyan-100">{task.taskId}</span>
                 <span className="shrink-0 font-mono text-[10px] text-slate-500">{formatTaskTime(task.protectionCompletedAt ?? task.createdAt)}</span>
@@ -159,7 +159,7 @@ function ModelGrid({ values, selected, onSelect }: { values: ModelOption[]; sele
       {values.map((item) => {
         const unavailable = !isAvailable(item)
         return (
-          <div key={item.value} className={cn('flex min-h-0 items-center rounded-[7px] border', selected === item.value ? 'border-cyan-300 bg-cyan-400/12' : 'border-cyan-300/12 bg-slate-950/38', unavailable && 'opacity-50')}>
+          <div key={item.value} className={cn('flex min-h-0 items-center rounded-[7px] border', !unavailable && 'workspace-hover-row', selected === item.value ? 'border-cyan-300 bg-cyan-400/12' : 'border-cyan-300/12 bg-slate-950/38', unavailable && 'opacity-50')}>
             <button type="button" disabled={unavailable} onClick={() => onSelect(item)} className={cn('h-full min-w-0 flex-1 truncate px-3 text-center text-[11px] font-black', selected === item.value ? 'text-cyan-100' : 'text-slate-300')} title={item.reason ?? item.value}>
               {shortModelName(item.value)}
             </button>
@@ -174,7 +174,7 @@ function ModelSummary({ model, modelTypes }: { model?: ModelOption; modelTypes?:
   const definitions = Object.values(modelTypes ?? {}).flat()
   const types = (model?.type ?? []).map((value) => definitions.find((item) => item.value === value)?.name ?? value)
   return (
-    <div className="workspace-model-info h-full min-h-0 overflow-y-auto rounded-[7px] border border-cyan-300/10 bg-slate-950/28 px-4 py-3">
+    <div className="workspace-model-info workspace-hover-card h-full min-h-0 overflow-y-auto rounded-[7px] border border-cyan-300/10 bg-slate-950/28 px-4 py-3">
       {model ? (
         <>
           <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
@@ -369,11 +369,11 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
   }
 
   return (
-    <section className="workspace-evaluation-panel ui-card grid h-full min-h-0 grid-rows-2 gap-3 p-3">
-      <div className="workspace-evaluation-section flex min-h-0 flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/18 p-4">
+    <section className="workspace-evaluation-panel workspace-hover-surface ui-card grid h-full min-h-0 grid-rows-2 gap-3 p-3">
+      <div className="workspace-evaluation-section workspace-hover-card flex min-h-0 flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/18 p-4">
         <div className="workspace-evaluation-header mb-3 flex items-center justify-between gap-3">
           <h2 className="flex-1 text-center text-[17px] font-black text-white">ASR 自动标注</h2>
-          <select value={asrLanguage} onChange={(event) => { setAsrLanguage(event.target.value); setSelectedAsr('') }} className="h-8 rounded-[6px] border border-cyan-300/14 bg-slate-950/70 px-2 text-xs font-bold text-slate-200">
+          <select value={asrLanguage} onChange={(event) => { setAsrLanguage(event.target.value); setSelectedAsr('') }} className="workspace-hover-control h-8 rounded-[6px] border border-cyan-300/14 bg-slate-950/70 px-2 text-xs font-bold text-slate-200">
             <option value="en">英文</option>
             <option value="zh-cn">中文</option>
           </select>
@@ -381,16 +381,16 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
         <ProtectionTaskSelector tasks={completedTasks} value={asrTaskId} onChange={setAsrTaskId} view="asr" />
         <div className="workspace-evaluation-model-grid mt-3"><ModelGrid values={availableAsr} selected={effectiveAsr?.value} onSelect={(item) => setSelectedAsr(item.value)} /></div>
         <div className="workspace-evaluation-model-summary mt-2 min-h-0 flex-1"><ModelSummary model={effectiveAsr} modelTypes={modelTypes} /></div>
-        <div className="workspace-evaluation-actions mt-auto flex justify-end gap-2 pt-3">
-          <button type="button" disabled={asrRunning || !effectiveAsr} onClick={() => void queueAsr(effectiveAsr ? [effectiveAsr] : [], false)} className="h-9 rounded-[7px] border border-cyan-300/16 px-3 text-xs font-black text-slate-200 disabled:opacity-45">测试所选模型</button>
-          <button type="button" disabled={asrRunning || !availableAsr.length} onClick={() => void queueAsr(availableAsr, true)} className="cyan-button inline-flex h-9 items-center gap-2 rounded-[7px] px-3 text-xs font-black disabled:opacity-45">{asrRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}一键测试</button>
+        <div className="workspace-evaluation-actions workspace-hover-group mt-auto flex justify-end gap-2 pt-3">
+          <button type="button" disabled={asrRunning || !effectiveAsr} onClick={() => void queueAsr(effectiveAsr ? [effectiveAsr] : [], false)} className="workspace-hover-control h-9 rounded-[7px] border border-cyan-300/16 px-3 text-xs font-black text-slate-200 disabled:opacity-45">测试所选模型</button>
+          <button type="button" disabled={asrRunning || !availableAsr.length} onClick={() => void queueAsr(availableAsr, true)} className="workspace-hover-control cyan-button inline-flex h-9 items-center gap-2 rounded-[7px] px-3 text-xs font-black disabled:opacity-45">{asrRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}一键测试</button>
         </div>
       </div>
 
-      <div className="workspace-evaluation-section flex min-h-0 flex-col rounded-[9px] border border-violet-300/14 bg-slate-950/18 p-4">
+      <div className="workspace-evaluation-section workspace-hover-card flex min-h-0 flex-col rounded-[9px] border border-violet-300/14 bg-slate-950/18 p-4">
         <div className="workspace-evaluation-header mb-3 flex items-center justify-between gap-3">
           <h2 className="flex-1 text-center text-[17px] font-black text-white">语音克隆测试</h2>
-          <select value={cloneLanguage} onChange={(event) => { setCloneLanguage(event.target.value); setSelectedClone('') }} className="h-8 rounded-[6px] border border-violet-300/14 bg-slate-950/70 px-2 text-xs font-bold text-slate-200">
+          <select value={cloneLanguage} onChange={(event) => { setCloneLanguage(event.target.value); setSelectedClone('') }} className="workspace-hover-control h-8 rounded-[6px] border border-violet-300/14 bg-slate-950/70 px-2 text-xs font-bold text-slate-200">
             <option value="en">英文</option>
             <option value="zh-cn">中文</option>
           </select>
@@ -398,9 +398,9 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
         <ProtectionTaskSelector tasks={completedTasks} value={cloneTaskId} onChange={setCloneTaskId} view="clone" />
         <div className="workspace-evaluation-model-grid mt-3"><ModelGrid values={availableClone} selected={effectiveClone?.value} onSelect={(item) => setSelectedClone(item.value)} /></div>
         <div className="workspace-evaluation-model-summary mt-2 min-h-0 flex-1"><ModelSummary model={effectiveClone} modelTypes={modelTypes} /></div>
-        <div className="workspace-evaluation-actions mt-auto flex justify-end gap-2 pt-3">
-          <button type="button" disabled={cloneRunning || !effectiveClone} onClick={() => openCloneDialog('single')} className="h-9 rounded-[7px] border border-violet-300/18 px-3 text-xs font-black text-slate-200 disabled:opacity-45">测试所选模型</button>
-          <button type="button" disabled={cloneRunning || !availableClone.length} onClick={() => openCloneDialog('all')} className="inline-flex h-9 items-center gap-2 rounded-[7px] bg-violet-400 px-3 text-xs font-black text-slate-950 shadow-[0_0_20px_rgba(167,139,250,0.2)] disabled:opacity-45">{cloneRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}一键克隆</button>
+        <div className="workspace-evaluation-actions workspace-hover-group mt-auto flex justify-end gap-2 pt-3">
+          <button type="button" disabled={cloneRunning || !effectiveClone} onClick={() => openCloneDialog('single')} className="workspace-hover-control h-9 rounded-[7px] border border-violet-300/18 px-3 text-xs font-black text-slate-200 disabled:opacity-45">测试所选模型</button>
+          <button type="button" disabled={cloneRunning || !availableClone.length} onClick={() => openCloneDialog('all')} className="workspace-hover-control inline-flex h-9 items-center gap-2 rounded-[7px] bg-violet-400 px-3 text-xs font-black text-slate-950 shadow-[0_0_20px_rgba(167,139,250,0.2)] disabled:opacity-45">{cloneRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}一键克隆</button>
         </div>
       </div>
 

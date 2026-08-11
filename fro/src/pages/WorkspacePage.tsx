@@ -357,7 +357,7 @@ function AudioAccessCard({ maxAudioSizeBytes }: { maxAudioSizeBytes?: number }) 
   const uploadMoment = splitUploadedAt(uploadedFile?.uploadedAt)
 
   return (
-    <section className="workspace-audio-card ui-card h-full min-h-0 p-4">
+    <section className="workspace-audio-card workspace-hover-surface ui-card h-full min-h-0 p-4">
       <h2 className="flex items-center gap-2 text-[21px] font-black text-white">
         音频接入
         <Info className="h-4 w-4 text-slate-500" />
@@ -381,7 +381,7 @@ function AudioAccessCard({ maxAudioSizeBytes }: { maxAudioSizeBytes?: number }) 
 
       {inputMode === 'upload' ? (
         <div
-          className="workspace-audio-dropzone mt-5 grid place-items-center rounded-[12px] border border-dashed border-cyan-300/55 bg-sky-400/5 text-center transition hover:border-cyan-200 hover:bg-cyan-400/10"
+          className="workspace-audio-dropzone workspace-hover-card mt-5 grid place-items-center rounded-[12px] border border-dashed border-cyan-300/55 bg-sky-400/5 text-center transition hover:border-cyan-200 hover:bg-cyan-400/10"
           onDragOver={(event) => event.preventDefault()}
           onDrop={(event) => {
             event.preventDefault()
@@ -397,20 +397,20 @@ function AudioAccessCard({ maxAudioSizeBytes }: { maxAudioSizeBytes?: number }) 
               单文件 ≤ {maxAudioSizeLabel}
             </p>
             <input ref={inputRef} type="file" accept=".wav,.mp3,.flac,.m4a,.webm,audio/*" className="hidden" onChange={(event) => void handleFile(event.target.files?.[0])} />
-            <span onClick={() => inputRef.current?.click()} className="mt-3 inline-flex h-11 min-w-[180px] items-center justify-center gap-2 rounded-full bg-cyan-300 px-5 text-[17px] font-medium text-slate-950 shadow-[0_0_28px_rgba(34,211,238,0.25)] cursor-pointer">
+            <span onClick={() => inputRef.current?.click()} className="workspace-hover-control mt-3 inline-flex h-11 min-w-[180px] items-center justify-center gap-2 rounded-full bg-cyan-300 px-5 text-[17px] font-medium text-slate-950 shadow-[0_0_28px_rgba(34,211,238,0.25)] cursor-pointer">
               <UploadCloud className="h-5 w-5" />
               选择文件
             </span>
           </div>
         </div>
       ) : (
-        <div className="workspace-audio-dropzone mt-5 grid place-items-center rounded-[12px] border border-dashed border-cyan-300/55 bg-sky-400/5 text-center transition hover:border-cyan-200 hover:bg-cyan-400/10">
+        <div className="workspace-audio-dropzone workspace-hover-card mt-5 grid place-items-center rounded-[12px] border border-dashed border-cyan-300/55 bg-sky-400/5 text-center transition hover:border-cyan-200 hover:bg-cyan-400/10">
           <div className="workspace-audio-dropzone-content workspace-recorder-content flex w-full flex-col items-center px-6 pt-6 pb-6 text-center">
             <button
               type="button"
               onClick={toggleRecording}
               className={cn(
-                'workspace-recorder-control',
+                'workspace-recorder-control workspace-hover-control',
                 'grid h-[4.5rem] w-[4.5rem] place-items-center rounded-full border-2 transition',
                 recording ? 'border-red-300 bg-red-400/18 text-red-200 shadow-[0_0_24px_rgba(248,113,113,0.35)]' : 'border-cyan-300/40 bg-cyan-400/12 text-cyan-200',
               )}
@@ -428,7 +428,7 @@ function AudioAccessCard({ maxAudioSizeBytes }: { maxAudioSizeBytes?: number }) 
       <div className="mt-9 border-t border-cyan-300/10 pt-3">
         <h3 className="text-[15px] font-bold text-slate-300">已上传文件</h3>
       </div>
-      <div className="uploaded-audio-panel mt-2 rounded-[8px] border border-cyan-300/12 bg-[#07192d]/85 p-3">
+      <div className="uploaded-audio-panel workspace-hover-card mt-2 rounded-[8px] border border-cyan-300/12 bg-[#07192d]/85 p-3">
         <div className="uploaded-audio-header mb-2 flex min-w-0 items-center gap-3">
           <FilenameWithExtension filename={displayFile.filename} className="min-w-0 flex-1 font-bold text-white" />
           <span className={cn('shrink-0 rounded-full px-3 py-1 text-xs font-bold', uploadedFile ? 'bg-emerald-400/12 text-emerald-300' : 'bg-slate-500/12 text-slate-400')}>
@@ -549,7 +549,7 @@ function StrategyConfigCard({
 
   if (!runtimeConfig) {
     return (
-      <section className="workspace-strategy-card ui-card flex h-full min-h-0 flex-col p-5">
+      <section className="workspace-strategy-card workspace-hover-surface ui-card flex h-full min-h-0 flex-col p-5">
         <div className="mb-6 flex items-center justify-between">
           <h2 className="flex items-center gap-2 text-[21px] font-black text-white">
             防护策略配置
@@ -559,7 +559,7 @@ function StrategyConfigCard({
             capabilities
           </span>
         </div>
-        <div className="workspace-config-loading grid min-h-0 flex-1 place-items-center rounded-[7px] border border-cyan-300/14 bg-slate-950/20 p-6 text-center">
+        <div className="workspace-config-loading workspace-hover-card grid min-h-0 flex-1 place-items-center rounded-[7px] border border-cyan-300/14 bg-slate-950/20 p-6 text-center">
           <div>
             {configError ? <Info className="mx-auto h-10 w-10 text-amber-300" /> : <Loader2 className="mx-auto h-10 w-10 animate-spin text-cyan-300" />}
             <p className="mt-4 text-base font-black text-white">{configError ? '系统参数读取失败' : '正在读取系统参数'}</p>
@@ -676,7 +676,7 @@ function StrategyConfigCard({
   }
 
   return (
-    <section className="workspace-strategy-card ui-card flex h-full min-h-0 flex-col overflow-hidden p-5">
+    <section className="workspace-strategy-card workspace-hover-surface ui-card flex h-full min-h-0 flex-col overflow-hidden p-5">
       <div className="workspace-strategy-header mb-6 flex items-center justify-between">
         <h2 className="flex items-center gap-2 text-[21px] font-black text-white">
           防护策略配置
@@ -685,7 +685,7 @@ function StrategyConfigCard({
         <button
           type="button"
           onClick={() => pushToast({ kind: 'info', title: '策略模板', description: '当前页面已内置标准、强保护、高保真与高级自定义模板。' })}
-          className="rounded-[6px] border border-cyan-300/14 bg-white/[0.03] px-3 py-2 text-sm text-slate-300"
+          className="workspace-hover-control rounded-[6px] border border-cyan-300/14 bg-white/[0.03] px-3 py-2 text-sm text-slate-300"
         >
           <Settings className="mr-1 inline h-4 w-4" />
           策略模板
@@ -701,7 +701,7 @@ function StrategyConfigCard({
               type="button"
               onClick={() => handleModeChange(mode.value)}
               className={cn(
-                'workspace-mode-option h-[70px] rounded-[6px] border bg-slate-950/18 px-3 text-left',
+                'workspace-mode-option workspace-hover-control h-[70px] rounded-[6px] border bg-slate-950/18 px-3 text-left',
                 mode.value === selectedMode ? 'border-cyan-400 bg-cyan-400/8 text-cyan-200' : 'border-cyan-300/12 text-slate-300',
               )}
             >
@@ -726,7 +726,7 @@ function StrategyConfigCard({
               disabled={disabled}
               onClick={() => handleTargetChange(targetValue)}
               className={cn(
-                'workspace-target-option h-[74px] rounded-[6px] border px-3 py-2 text-left',
+                'workspace-target-option workspace-hover-control h-[74px] rounded-[6px] border px-3 py-2 text-left',
                 selected ? 'border-cyan-400 bg-cyan-400/10' : 'border-cyan-300/12 bg-slate-950/18',
                 disabled && 'cursor-not-allowed opacity-45',
               )}
@@ -751,7 +751,7 @@ function StrategyConfigCard({
           <ModelSelectSummary label="语义编码器" values={selectedSemanticEncoders} options={semanticOptionItems} onOpen={openModelModal} />
           <ModelSelectSummary label="身份编码器" values={selectedFeatureModels} options={featureOptionItems} onOpen={openModelModal} />
         </div>
-        <div className="workspace-advanced-row mt-6 flex items-center gap-2 border-t border-cyan-300/10 pt-3">
+        <div className="workspace-advanced-row workspace-hover-group mt-6 flex items-center gap-2 border-t border-cyan-300/10 pt-3">
           <button type="button" onClick={() => setLambdaModalOpen(true)} className="flex min-w-0 flex-1 items-center justify-between text-left text-sm font-bold text-slate-300">
             <span className="inline-flex items-center gap-1">高级选项（<MathText formula="\lambda" className="text-cyan-100" />）</span>
             <ChevronDown className="h-4 w-4 text-cyan-300" />
@@ -760,7 +760,7 @@ function StrategyConfigCard({
             <Search className="h-4 w-4" />
           </button>
         </div>
-        <div className="workspace-parameter-help mt-5 rounded-[7px] border border-cyan-300/16 bg-sky-400/10 p-3 text-[12px] leading-5 text-slate-300">
+        <div className="workspace-parameter-help workspace-hover-card mt-5 rounded-[7px] border border-cyan-300/16 bg-sky-400/10 p-3 text-[12px] leading-5 text-slate-300">
           <p className="font-bold text-cyan-200">参数说明</p>
           <p>
             <MathTerm>ε</MathTerm> 控制保护扰动的最大幅度，Steps 控制优化迭代次数；<MathText formula="\lambda" className="mx-0.5 text-cyan-100" /> 权重在高级选项弹窗中调节。建议先保持默认权重，再根据语义扰动、身份相似度与听感质量进行微调。
@@ -832,7 +832,7 @@ function StrategyConfigCard({
               setConfigurationChangedSinceSubmission(false)
               onStart(buildPayload())
             }}
-            className="cyan-button inline-flex h-[50px] items-center justify-center gap-2 rounded-[7px] text-[16px] font-black disabled:opacity-60"
+            className="workspace-hover-control cyan-button inline-flex h-[50px] items-center justify-center gap-2 rounded-[7px] text-[16px] font-black disabled:opacity-60"
           >
             {running && !configurationChangedSinceSubmission ? <Loader2 className="h-5 w-5 animate-spin" /> : <ShieldCheck className="h-5 w-5" />}
             开始生成保护音频
@@ -933,7 +933,7 @@ function SliderRow({
   compact?: boolean
 }) {
   return (
-    <div className={cn('parameter-slider-row grid items-center text-sm', compact ? 'grid-cols-[minmax(96px,112px)_minmax(52px,1fr)_88px] gap-2' : 'grid-cols-[minmax(124px,164px)_minmax(68px,1fr)_112px] gap-3')}>
+    <div className={cn('parameter-slider-row workspace-hover-row grid items-center text-sm', compact ? 'grid-cols-[minmax(96px,112px)_minmax(52px,1fr)_88px] gap-2' : 'grid-cols-[minmax(124px,164px)_minmax(68px,1fr)_112px] gap-3')}>
       <span className="whitespace-nowrap text-slate-300">{label}</span>
       <div className="relative h-5">
         <input
@@ -1014,7 +1014,7 @@ function selectionSummary(values: string[], options: UiModelOption[]) {
 
 function ModelSelectSummary({ label, values, options, onOpen }: { label: string; values: string[]; options: UiModelOption[]; onOpen: () => void }) {
   return (
-    <div className="workspace-model-select-summary min-h-[64px] rounded-[7px] border border-cyan-300/14 bg-slate-950/24 px-3 py-2.5">
+    <div className="workspace-model-select-summary workspace-hover-card min-h-[64px] rounded-[7px] border border-cyan-300/14 bg-slate-950/24 px-3 py-2.5">
       <div className="flex h-full items-center justify-between gap-3">
         <div className="min-w-0">
           <p className="truncate whitespace-nowrap text-sm font-black leading-5 text-slate-200">{label}</p>
@@ -1023,7 +1023,7 @@ function ModelSelectSummary({ label, values, options, onOpen }: { label: string;
         <button
           type="button"
           onClick={onOpen}
-          className="grid h-9 w-9 shrink-0 place-items-center rounded-[6px] border border-cyan-300/18 bg-cyan-400/10 text-cyan-100 hover:bg-cyan-400/16 disabled:cursor-not-allowed disabled:opacity-45"
+          className="workspace-hover-control grid h-9 w-9 shrink-0 place-items-center rounded-[6px] border border-cyan-300/18 bg-cyan-400/10 text-cyan-100 hover:bg-cyan-400/16 disabled:cursor-not-allowed disabled:opacity-45"
           disabled={!options.length}
           aria-label={`配置${label}`}
           title={`配置${label}`}
