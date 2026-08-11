@@ -616,12 +616,36 @@ def _transcribe_clone_pair_isolated(
         target_text = str(payload.get("text") or "")
         language = "zh" if any("\u4e00" <= char <= "\u9fff" for char in target_text) else "en"
     requested_device = os.getenv("SEME2E_CLONE_ASR_DEVICE") or os.getenv("SEME2E_API_DEVICE", "cpu")
+    worker_timeout = _env_int("SEME2E_CLONE_ASR_WORKER_TIMEOUT_SECONDS", 600)
     try:
-        with _isolated_worker_gpu_lease(
-            ASR_WORKER_SLOTS,
-            requested_device,
-            "SEME2E_CLONE_ASR_CUDA_VISIBLE_DEVICES",
-            cancel_event,
+        def run_worker(
+            worker_device: str,
+            worker_env: Mapping[str, str] | None,
+            _selected_gpu: str | None,
+            attempt_timeout_seconds: float,
+        ) -> dict[str, Any]:
+            return _run_isolated_json_worker(
+                ROOT / "asr_worker.py",
+                {
+                    "model": model,
+                    "device": worker_device,
+                    "language": language,
+                    "originalPath": str(clean_clone_path.resolve()),
+                    "protectedPath": str(protected_clone_path.resolve()),
+                },
+                timeout_seconds=attempt_timeout_seconds,
+                cancel_event=cancel_event,
+                **({"env_overrides": worker_env} if worker_env else {}),
+            )
+
+        response, selected_gpu, gpu_attempts = _run_gpu_worker_with_retry(
+            operation_name=f"clone_asr:{model}",
+            worker_slot=ASR_WORKER_SLOTS,
+            requested_device=requested_device,
+            visible_devices_env="SEME2E_CLONE_ASR_CUDA_VISIBLE_DEVICES",
+            cancel_event=cancel_event,
+            operation=run_worker,
+            timeout_seconds=worker_timeout,
             explicit_device=bool(os.getenv("SEME2E_CLONE_ASR_DEVICE", "").strip()),
             preferred_gpu=preferred_gpu,
             minimum_free_mib=max(
@@ -631,20 +655,7 @@ def _transcribe_clone_pair_isolated(
                     _env_int("SEME2E_GPU_MIN_FREE_MIB", 0),
                 ),
             ),
-        ) as (worker_device, worker_env, _):
-            response = _run_isolated_json_worker(
-                ROOT / "asr_worker.py",
-                {
-                    "model": model,
-                    "device": worker_device,
-                    "language": language,
-                    "originalPath": str(clean_clone_path.resolve()),
-                    "protectedPath": str(protected_clone_path.resolve()),
-                },
-                timeout_seconds=_env_int("SEME2E_CLONE_ASR_WORKER_TIMEOUT_SECONDS", 600),
-                cancel_event=cancel_event,
-                **({"env_overrides": worker_env} if worker_env else {}),
-            )
+        )
     except RuntimeError as exc:
         if str(exc) == "TASK_CANCELLED":
             raise
@@ -654,6 +665,7 @@ def _transcribe_clone_pair_isolated(
             "originalText": None,
             "protectedText": None,
             "reason": f"克隆语音文本尚未生成：{exc}",
+            **({"diagnostics": exc.diagnostics} if isinstance(exc, IsolatedWorkerError) else {}),
         }
     except Exception as exc:
         return {
@@ -662,6 +674,7 @@ def _transcribe_clone_pair_isolated(
             "originalText": None,
             "protectedText": None,
             "reason": f"克隆语音文本尚未生成：{exc}",
+            **({"diagnostics": exc.diagnostics} if isinstance(exc, IsolatedWorkerError) else {}),
         }
     return {
         "status": "available",
@@ -671,6 +684,8 @@ def _transcribe_clone_pair_isolated(
         "protectedText": str(response.get("protectedText") or ""),
         "reason": None,
         "elapsedSec": response.get("elapsedSec"),
+        "gpu": selected_gpu,
+        **({"gpuAttempts": gpu_attempts} if gpu_attempts else {}),
     }
 
 
@@ -695,22 +710,14 @@ def _compute_clone_semantic_isolated(
     preferred_gpu: str | None = None,
 ) -> dict[str, Any]:
     requested_device = os.getenv("SEME2E_SEMANTIC_DEVICE") or os.getenv("SEME2E_API_DEVICE", "cpu")
+    worker_timeout = _env_int("SEME2E_SEMANTIC_WORKER_TIMEOUT_SECONDS", 900)
     try:
-        with _isolated_worker_gpu_lease(
-            SEMANTIC_WORKER_SLOTS,
-            requested_device,
-            "SEME2E_SEMANTIC_CUDA_VISIBLE_DEVICES",
-            cancel_event,
-            explicit_device=bool(os.getenv("SEME2E_SEMANTIC_DEVICE", "").strip()),
-            preferred_gpu=preferred_gpu,
-            minimum_free_mib=max(
-                0,
-                _env_int(
-                    "SEME2E_SEMANTIC_GPU_MIN_FREE_MIB",
-                    _env_int("SEME2E_GPU_MIN_FREE_MIB", 0),
-                ),
-            ),
-        ) as (worker_device, worker_env, _):
+        def run_worker(
+            worker_device: str,
+            worker_env: Mapping[str, str] | None,
+            _selected_gpu: str | None,
+            attempt_timeout_seconds: float,
+        ) -> dict[str, Any]:
             semantic_env = dict(worker_env or {})
             semantic_env["SEME2E_API_DEVICE"] = worker_device
             semantic_env["SEME2E_SEMANTIC_DEVICE"] = _semantic_child_device(
@@ -725,20 +732,42 @@ def _compute_clone_semantic_isolated(
                 os.getenv("SEME2E_SEMANTIC_ENCODER_DEVICE"),
                 worker_device,
             )
-            response = _run_isolated_json_worker(
+            return _run_isolated_json_worker(
                 ROOT / "semantic_metrics_worker.py",
                 {
                     "originalPath": str(clean_clone_path.resolve()),
                     "protectedPath": str(protected_clone_path.resolve()),
                     "config": config,
                 },
-                timeout_seconds=_env_int("SEME2E_SEMANTIC_WORKER_TIMEOUT_SECONDS", 900),
+                timeout_seconds=attempt_timeout_seconds,
                 cancel_event=cancel_event,
                 **({"env_overrides": semantic_env} if semantic_env else {}),
             )
+
+        response, selected_gpu, gpu_attempts = _run_gpu_worker_with_retry(
+            operation_name="clone_semantic_metrics",
+            worker_slot=SEMANTIC_WORKER_SLOTS,
+            requested_device=requested_device,
+            visible_devices_env="SEME2E_SEMANTIC_CUDA_VISIBLE_DEVICES",
+            cancel_event=cancel_event,
+            operation=run_worker,
+            timeout_seconds=worker_timeout,
+            explicit_device=bool(os.getenv("SEME2E_SEMANTIC_DEVICE", "").strip()),
+            preferred_gpu=preferred_gpu,
+            minimum_free_mib=max(
+                0,
+                _env_int(
+                    "SEME2E_SEMANTIC_GPU_MIN_FREE_MIB",
+                    _env_int("SEME2E_GPU_MIN_FREE_MIB", 0),
+                ),
+            ),
+        )
         metrics = response.get("metrics")
         if not isinstance(metrics, dict):
             raise ValueError("semantic worker did not return metrics")
+        metrics["gpu"] = selected_gpu
+        if gpu_attempts:
+            metrics["gpuAttempts"] = gpu_attempts
         if not metrics.get("reason") and metrics.get("status") not in {"available", "partial"}:
             metrics["reason"] = metrics.get("error") or "克隆语义指标尚未生成"
         return metrics
@@ -750,6 +779,7 @@ def _compute_clone_semantic_isolated(
             "tokenChangeRate": None,
             "semanticDrift": None,
             "reason": f"克隆语义指标尚未生成：{exc}",
+            **({"diagnostics": exc.diagnostics} if isinstance(exc, IsolatedWorkerError) else {}),
         }
     except Exception as exc:
         return {
@@ -786,19 +816,71 @@ DNSMOS_WORKER_SLOTS = threading.BoundedSemaphore(DNSMOS_WORKER_MAX_CONCURRENCY)
 GPT_SOVITS_WORKER_SLOTS = threading.BoundedSemaphore(GPT_SOVITS_WORKER_MAX_CONCURRENCY)
 CLONE_GPU_SLOTS_GUARD = threading.Lock()
 CLONE_GPU_SLOTS: dict[str, threading.BoundedSemaphore] = {}
+GPU_SLOT_CONDITION = threading.Condition()
 GPT_SOVITS_GPU_LEASE_CONDITION = threading.Condition()
 GPT_SOVITS_GPU_LEASES: set[str] = set()
+GPT_SOVITS_GPU_LEASE_KEYS: dict[str, str] = {}
 GPU_INVENTORY_CACHE_GUARD = threading.Lock()
 GPU_INVENTORY_CACHE_AT = 0.0
 GPU_INVENTORY_CACHE: tuple[tuple[str, ...], dict[str, int], dict[str, str]] = ((), {}, {})
 GPU_ACQUIRE_TIMEOUT_MESSAGE = "等待可用 GPU 超时，请稍后重试，或释放显存后重新运行。"
 
 
-def _acquire_worker_slot(semaphore: threading.BoundedSemaphore, cancel_event: Any | None) -> None:
+def _wait_for_gpu_slot_change(
+    cancel_event: Any | None,
+    deadline: float,
+    *,
+    maximum_wait_seconds: float | None = None,
+) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("TASK_CANCELLED")
+    now = time.monotonic()
+    remaining = deadline - now
+    if remaining <= 0:
+        raise RuntimeError(GPU_ACQUIRE_TIMEOUT_MESSAGE)
+    poll_seconds = max(0.05, _env_float("SEME2E_GPU_WAIT_POLL_SECONDS", 1.0))
+    if maximum_wait_seconds is None:
+        with GPU_SLOT_CONDITION:
+            GPU_SLOT_CONDITION.wait(timeout=min(poll_seconds, remaining))
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("TASK_CANCELLED")
+        return
+    wait_deadline = min(deadline, now + max(0.05, maximum_wait_seconds))
     while True:
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("TASK_CANCELLED")
-        if not semaphore.acquire(timeout=0.25):
+        now = time.monotonic()
+        remaining = min(deadline, wait_deadline) - now
+        if remaining <= 0:
+            return
+        with GPU_SLOT_CONDITION:
+            notified = GPU_SLOT_CONDITION.wait(timeout=min(poll_seconds, remaining))
+        if notified:
+            return
+
+
+def _notify_gpu_slot_waiters() -> None:
+    with GPU_SLOT_CONDITION:
+        GPU_SLOT_CONDITION.notify_all()
+
+
+def _acquire_worker_slot(
+    semaphore: threading.BoundedSemaphore,
+    cancel_event: Any | None,
+    *,
+    deadline: float | None = None,
+) -> None:
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("TASK_CANCELLED")
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(GPU_ACQUIRE_TIMEOUT_MESSAGE)
+            wait_seconds = min(0.25, remaining)
+        else:
+            wait_seconds = 0.25
+        if not semaphore.acquire(timeout=wait_seconds):
             continue
         if cancel_event is not None and cancel_event.is_set():
             semaphore.release()
@@ -886,9 +968,10 @@ def _nvidia_gpu_inventory(
     ttl_seconds = max(0.1, _env_float("SEME2E_GPU_INVENTORY_CACHE_SECONDS", 1.0))
     now = time.monotonic()
     with GPU_INVENTORY_CACHE_GUARD:
-        # TTL is enforced even for refresh requests so concurrent/polling callers
-        # collapse into one nvidia-smi process instead of launching one per loop.
-        if GPU_INVENTORY_CACHE_AT > 0 and now - GPU_INVENTORY_CACHE_AT < ttl_seconds:
+        # Normal polling is collapsed by the TTL. A retryable worker failure may
+        # request one fresh sample so its post-failure free-memory baseline is not
+        # confused with the pre-launch cache entry used to select the card.
+        if not force and GPU_INVENTORY_CACHE_AT > 0 and now - GPU_INVENTORY_CACHE_AT < ttl_seconds:
             indices, free_memory, canonical_keys = GPU_INVENTORY_CACHE
             return indices, dict(free_memory), dict(canonical_keys)
         GPU_INVENTORY_CACHE = _query_nvidia_gpu_inventory()
@@ -1033,19 +1116,26 @@ def _rank_gpu_candidates_by_free_memory(
     }
 
 
-def _acquire_best_gpu_slot(
+def acquire_gpu_slot(
     candidates: tuple[str, ...],
-    cancel_event: Any | None,
-    *,
+    cancel_event: Any | None = None,
     minimum_free_mib: int = 0,
+    *,
     allow_low_memory: bool = False,
+    deadline: float | None = None,
+    excluded_gpu_keys: set[str] | None = None,
 ) -> tuple[str, threading.BoundedSemaphore]:
     _, _, canonical_keys = _unpack_gpu_inventory(_nvidia_gpu_inventory())
     unique_candidates = _unique_gpu_tokens(candidates, canonical_keys)
     if not unique_candidates:
         raise RuntimeError("GPU worker requires at least one CUDA GPU candidate")
-    timeout_seconds = max(0.01, _env_float("SEME2E_GPU_ACQUIRE_TIMEOUT_SECONDS", 900.0))
-    deadline = time.monotonic() + timeout_seconds
+    if deadline is None:
+        timeout_seconds = max(0.01, _env_float("SEME2E_GPU_ACQUIRE_TIMEOUT_SECONDS", 900.0))
+        deadline = time.monotonic() + timeout_seconds
+    excluded = {
+        _canonical_gpu_slot_key(candidate, canonical_keys)
+        for candidate in (excluded_gpu_keys or set())
+    }
     while True:
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("TASK_CANCELLED")
@@ -1053,6 +1143,8 @@ def _acquire_best_gpu_slot(
             raise RuntimeError(GPU_ACQUIRE_TIMEOUT_MESSAGE)
         ranked, free_memory = _rank_gpu_candidates_by_free_memory(unique_candidates)
         for candidate in ranked:
+            if _canonical_gpu_slot_key(candidate, canonical_keys) in excluded:
+                continue
             known_free_mib = free_memory.get(candidate)
             if (
                 not allow_low_memory
@@ -1065,14 +1157,34 @@ def _acquire_best_gpu_slot(
             if not gpu_slot.acquire(blocking=False):
                 continue
             if cancel_event is not None and cancel_event.is_set():
-                gpu_slot.release()
+                release_gpu_slot(gpu_slot)
                 raise RuntimeError("TASK_CANCELLED")
             return candidate, gpu_slot
-        wait_seconds = min(0.25, max(0.0, deadline - time.monotonic()))
-        if cancel_event is not None and hasattr(cancel_event, "wait"):
-            cancel_event.wait(timeout=wait_seconds)
-        else:
-            time.sleep(wait_seconds)
+        _wait_for_gpu_slot_change(cancel_event, deadline)
+
+
+def release_gpu_slot(slot: threading.BoundedSemaphore) -> None:
+    slot.release()
+    _notify_gpu_slot_waiters()
+
+
+def _acquire_best_gpu_slot(
+    candidates: tuple[str, ...],
+    cancel_event: Any | None,
+    *,
+    minimum_free_mib: int = 0,
+    allow_low_memory: bool = False,
+    deadline: float | None = None,
+    excluded_gpu_keys: set[str] | None = None,
+) -> tuple[str, threading.BoundedSemaphore]:
+    return acquire_gpu_slot(
+        candidates,
+        cancel_event,
+        minimum_free_mib,
+        allow_low_memory=allow_low_memory,
+        deadline=deadline,
+        excluded_gpu_keys=excluded_gpu_keys,
+    )
 
 
 @contextmanager
@@ -1085,17 +1197,22 @@ def _isolated_worker_gpu_lease(
     explicit_device: bool = False,
     preferred_gpu: str | None = None,
     minimum_free_mib: int = 0,
+    candidate_overrides: tuple[str, ...] | None = None,
+    deadline: float | None = None,
+    excluded_gpu_keys: set[str] | None = None,
 ):
     acquired_slots: list[threading.BoundedSemaphore] = []
     try:
-        _acquire_worker_slot(worker_slot, cancel_event)
+        _acquire_worker_slot(worker_slot, cancel_event, deadline=deadline)
         acquired_slots.append(worker_slot)
         explicit_visible_devices = _visible_gpu_tokens(os.getenv(visible_devices_env, ""))
-        candidates = _worker_gpu_candidates(
-            requested_device,
-            visible_devices_env,
-            explicit_device=explicit_device,
-        )
+        candidates = candidate_overrides
+        if candidates is None:
+            candidates = _worker_gpu_candidates(
+                requested_device,
+                visible_devices_env,
+                explicit_device=explicit_device,
+            )
         if (
             preferred_gpu
             and not explicit_visible_devices
@@ -1109,6 +1226,8 @@ def _isolated_worker_gpu_lease(
                 cancel_event,
                 minimum_free_mib=minimum_free_mib,
                 allow_low_memory=(bool(explicit_visible_devices) and len(candidates) == 1) or explicit_device,
+                deadline=deadline,
+                excluded_gpu_keys=excluded_gpu_keys,
             )
             acquired_slots.append(gpu_slot)
             yield "cuda:0", {
@@ -1171,29 +1290,45 @@ def _gpt_sovits_gpu_candidates(requested_device: str) -> tuple[str, ...]:
 
 
 def _release_gpt_sovits_gpu_lease(candidate: str) -> None:
-    canonical_candidate = _canonical_gpu_slot_key(candidate)
     with GPT_SOVITS_GPU_LEASE_CONDITION:
+        canonical_candidate = GPT_SOVITS_GPU_LEASE_KEYS.pop(candidate, candidate)
         GPT_SOVITS_GPU_LEASES.discard(canonical_candidate)
         GPT_SOVITS_GPU_LEASE_CONDITION.notify_all()
+    _notify_gpu_slot_waiters()
+
+
+def _gpt_sovits_minimum_free_mib() -> int:
+    return max(
+        0,
+        _env_int(
+            "SEME2E_GPT_SOVITS_GPU_MIN_FREE_MIB",
+            max(
+                24576,
+                _env_int(
+                    "SEME2E_CLONE_GPU_MIN_FREE_MIB",
+                    _env_int("SEME2E_GPU_MIN_FREE_MIB", 0),
+                ),
+            ),
+        ),
+    )
 
 
 def _acquire_gpt_sovits_gpu_resources(
     candidates: tuple[str, ...],
     cancel_event: Any | None,
+    *,
+    deadline: float | None = None,
+    excluded_gpu_keys: set[str] | None = None,
 ) -> tuple[str, threading.BoundedSemaphore]:
-    explicit_pool = bool(
-        os.getenv("SEME2E_GPT_SOVITS_GPU_POOL", "").strip()
-        or os.getenv("SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES", "").strip()
-    )
-    minimum_free_mib = max(
-        0,
-        _env_int(
-            "SEME2E_CLONE_GPU_MIN_FREE_MIB",
-            _env_int("SEME2E_GPU_MIN_FREE_MIB", 0),
-        ),
-    )
-    timeout_seconds = max(0.01, _env_float("SEME2E_GPU_ACQUIRE_TIMEOUT_SECONDS", 900.0))
-    deadline = time.monotonic() + timeout_seconds
+    minimum_free_mib = _gpt_sovits_minimum_free_mib()
+    if deadline is None:
+        timeout_seconds = max(0.01, _env_float("SEME2E_GPU_ACQUIRE_TIMEOUT_SECONDS", 900.0))
+        deadline = time.monotonic() + timeout_seconds
+    _, _, initial_canonical_keys = _unpack_gpu_inventory(_nvidia_gpu_inventory())
+    excluded = {
+        _canonical_gpu_slot_key(candidate, initial_canonical_keys)
+        for candidate in (excluded_gpu_keys or set())
+    }
     while True:
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("TASK_CANCELLED")
@@ -1201,10 +1336,12 @@ def _acquire_gpt_sovits_gpu_resources(
             raise RuntimeError(GPU_ACQUIRE_TIMEOUT_MESSAGE)
         ranked, free_memory = _rank_gpu_candidates_by_free_memory(candidates)
         for candidate in ranked:
+            canonical_candidate = _canonical_gpu_slot_key(candidate, initial_canonical_keys)
+            if canonical_candidate in excluded:
+                continue
             known_free_mib = free_memory.get(candidate)
             if (
-                not (explicit_pool and len(ranked) == 1)
-                and minimum_free_mib > 0
+                minimum_free_mib > 0
                 and known_free_mib is not None
                 and known_free_mib < minimum_free_mib
             ):
@@ -1212,43 +1349,456 @@ def _acquire_gpt_sovits_gpu_resources(
             shared_gpu_slot = _clone_gpu_slot(candidate)
             if not shared_gpu_slot.acquire(blocking=False):
                 continue
-            canonical_candidate = _canonical_gpu_slot_key(candidate)
             with GPT_SOVITS_GPU_LEASE_CONDITION:
                 if canonical_candidate in GPT_SOVITS_GPU_LEASES:
-                    shared_gpu_slot.release()
+                    release_gpu_slot(shared_gpu_slot)
                     continue
                 GPT_SOVITS_GPU_LEASES.add(canonical_candidate)
+                GPT_SOVITS_GPU_LEASE_KEYS[candidate] = canonical_candidate
             if cancel_event is not None and cancel_event.is_set():
-                shared_gpu_slot.release()
+                release_gpu_slot(shared_gpu_slot)
                 _release_gpt_sovits_gpu_lease(candidate)
                 raise RuntimeError("TASK_CANCELLED")
             return candidate, shared_gpu_slot
-        wait_seconds = min(0.25, max(0.0, deadline - time.monotonic()))
-        if cancel_event is not None and hasattr(cancel_event, "wait"):
-            cancel_event.wait(timeout=wait_seconds)
-        else:
-            time.sleep(wait_seconds)
+        _wait_for_gpu_slot_change(cancel_event, deadline)
 
 
 @contextmanager
 def _gpt_sovits_gpu_resource_lease(
     requested_device: str,
     cancel_event: Any | None,
+    *,
+    candidate_overrides: tuple[str, ...] | None = None,
+    deadline: float | None = None,
+    excluded_gpu_keys: set[str] | None = None,
 ):
     candidate, shared_gpu_slot = _acquire_gpt_sovits_gpu_resources(
-        _gpt_sovits_gpu_candidates(requested_device),
+        candidate_overrides or _gpt_sovits_gpu_candidates(requested_device),
         cancel_event,
+        deadline=deadline,
+        excluded_gpu_keys=excluded_gpu_keys,
     )
     try:
         yield candidate
     finally:
-        shared_gpu_slot.release()
-        _release_gpt_sovits_gpu_lease(candidate)
+        try:
+            release_gpu_slot(shared_gpu_slot)
+        finally:
+            _release_gpt_sovits_gpu_lease(candidate)
 
 
 def _release_worker_slots(slots: list[threading.BoundedSemaphore]) -> None:
     for slot in reversed(slots):
         slot.release()
+    if slots:
+        _notify_gpu_slot_waiters()
+
+
+def _gpu_retry_deadline(_worker_timeout_seconds: float) -> tuple[float, float]:
+    acquire_timeout = max(
+        0.01,
+        _env_float("SEME2E_GPU_ACQUIRE_TIMEOUT_SECONDS", 900.0),
+    )
+    retry_timeout = max(
+        0.01,
+        _env_float("SEME2E_GPU_RETRY_TIMEOUT_SECONDS", acquire_timeout),
+    )
+    return time.monotonic() + retry_timeout, retry_timeout
+
+
+def _exception_diagnostics(exc: BaseException) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {
+        "exceptionType": type(exc).__name__,
+        "exceptionMessage": str(exc),
+    }
+    if isinstance(exc, IsolatedWorkerError):
+        diagnostics["workerDiagnostics"] = exc.diagnostics
+    elif isinstance(exc, subprocess.TimeoutExpired):
+        diagnostics.update(
+            {
+                "command": list(exc.cmd) if isinstance(exc.cmd, (list, tuple)) else str(exc.cmd),
+                "timeoutSec": exc.timeout,
+                "stdoutTail": str(exc.output or "")[-4000:].strip(),
+                "stderrTail": str(exc.stderr or "")[-8000:].strip(),
+            }
+        )
+    return diagnostics
+
+
+def _gpu_resource_error_kind(exc: BaseException) -> str | None:
+    diagnostics = _exception_diagnostics(exc)
+    try:
+        text = json.dumps(diagnostics, ensure_ascii=False, default=str).lower()
+    except Exception:
+        text = f"{type(exc).__name__}: {exc}".lower()
+    memory_markers = (
+        "cuda out of memory",
+        "cuda error: out of memory",
+        "hip out of memory",
+        "cudnn_status_alloc_failed",
+        "cublas_status_alloc_failed",
+        "failed to allocate cuda",
+    )
+    if any(marker in text for marker in memory_markers):
+        return "gpu_memory_exhausted"
+    gpu_context_markers = (
+        "cuda",
+        "gpu",
+        "cudnn",
+        "cublas",
+        "hip",
+        "nccl",
+    )
+    generic_memory_markers = (
+        "failed to allocate memory",
+        "cannot allocate memory",
+        "out of memory",
+        "memoryerror",
+    )
+    if any(marker in text for marker in gpu_context_markers) and any(
+        marker in text for marker in generic_memory_markers
+    ):
+        return "gpu_memory_exhausted"
+    busy_markers = (
+        "cuda-capable device is busy or unavailable",
+        "all cuda-capable devices are busy or unavailable",
+        "cuda device is busy or unavailable",
+        "cuda_error_devices_unavailable",
+        "cuda_error_device_already_in_use",
+    )
+    if any(marker in text for marker in busy_markers):
+        return "gpu_temporarily_unavailable"
+    if "resource temporarily unavailable" in text and any(
+        marker in text for marker in ("cuda", "gpu", "cudnn", "cublas")
+    ):
+        return "gpu_temporarily_unavailable"
+    cudnn_initialization_markers = (
+        "cudnn_status_internal_error",
+        "cudnncreate",
+    )
+    if any(marker in text for marker in cudnn_initialization_markers) and any(
+        marker in text for marker in ("cuda", "gpu", "cudnn", "onnxruntime")
+    ):
+        return "gpu_temporarily_unavailable"
+    return None
+
+
+def _gpu_retry_attempt(
+    operation_name: str,
+    selected_gpu: str,
+    exc: BaseException,
+    attempt_number: int,
+) -> dict[str, Any]:
+    return {
+        "attempt": attempt_number,
+        "operation": operation_name,
+        "gpu": selected_gpu,
+        "reason": _gpu_resource_error_kind(exc),
+        **_exception_diagnostics(exc),
+    }
+
+
+def _append_gpu_retry_attempt(
+    attempts: list[dict[str, Any]],
+    attempt: dict[str, Any],
+) -> None:
+    history_limit = max(3, _env_int("SEME2E_GPU_RETRY_DIAGNOSTIC_LIMIT", 12))
+    if len(attempts) >= history_limit:
+        # Keep the first failure and the most recent failures. The actual attempt
+        # number remains on every row and is also exposed as gpuAttemptCount.
+        del attempts[1]
+    attempts.append(attempt)
+
+
+def _gpu_failure_state(
+    candidate: str,
+    kind: str | None,
+) -> tuple[str, dict[str, Any]]:
+    _, free_memory, canonical_keys = _unpack_gpu_inventory(
+        _nvidia_gpu_inventory(force=True)
+    )
+    canonical_key = _canonical_gpu_slot_key(candidate, canonical_keys)
+    return canonical_key, {
+        "kind": kind,
+        "freeMemoryMiB": _gpu_free_memory_mib(candidate, free_memory, canonical_keys),
+    }
+
+
+def _recovered_gpu_keys(
+    candidates: tuple[str, ...],
+    failure_states: Mapping[str, Mapping[str, Any]],
+    *,
+    minimum_free_mib: int,
+    cooldown_deadlines: Mapping[str, float] | None = None,
+) -> set[str]:
+    _, free_memory, canonical_keys = _unpack_gpu_inventory(
+        _nvidia_gpu_inventory(force=True)
+    )
+    recovery_mib = max(1, _env_int("SEME2E_GPU_RETRY_MEMORY_RECOVERY_MIB", 512))
+    now = time.monotonic()
+    recovered: set[str] = set()
+    for candidate in candidates:
+        canonical_key = _canonical_gpu_slot_key(candidate, canonical_keys)
+        cooldown_until = max(
+            float((cooldown_deadlines or {}).get(candidate, 0.0)),
+            float((cooldown_deadlines or {}).get(canonical_key, 0.0)),
+        )
+        if cooldown_until > now:
+            continue
+        state = failure_states.get(canonical_key) or failure_states.get(candidate)
+        if state is None:
+            recovered.update((candidate, canonical_key))
+            continue
+        if state.get("kind") != "gpu_memory_exhausted":
+            recovered.update((candidate, canonical_key))
+            continue
+        previous_free = to_float(state.get("freeMemoryMiB"))
+        current_free = _gpu_free_memory_mib(candidate, free_memory, canonical_keys)
+        if previous_free is None or current_free is None:
+            # When nvidia-smi cannot provide a stable sample, use the bounded
+            # retry backoff rather than permanently excluding the device.
+            recovered.update((candidate, canonical_key))
+            continue
+        required_free = max(
+            int(previous_free) + recovery_mib,
+            max(0, int(minimum_free_mib)),
+        )
+        if current_free >= required_free:
+            recovered.update((candidate, canonical_key))
+    return recovered
+
+
+def _gpu_retry_backoff_seconds(exhausted_rounds: int) -> float:
+    base = max(0.05, _env_float("SEME2E_GPU_RETRY_BACKOFF_SECONDS", 1.0))
+    maximum = max(base, _env_float("SEME2E_GPU_RETRY_MAX_BACKOFF_SECONDS", 30.0))
+    return min(maximum, base * (2 ** min(max(0, exhausted_rounds), 8)))
+
+
+def _next_gpu_retry_wait_seconds(
+    candidates: tuple[str, ...],
+    excluded_gpu_keys: set[str],
+    cooldown_deadlines: Mapping[str, float],
+    exhausted_rounds: int,
+) -> float:
+    now = time.monotonic()
+    _, _, canonical_keys = _unpack_gpu_inventory(_nvidia_gpu_inventory())
+    pending_cooldowns: list[float] = []
+    for candidate in candidates:
+        canonical_key = _canonical_gpu_slot_key(candidate, canonical_keys)
+        if candidate not in excluded_gpu_keys and canonical_key not in excluded_gpu_keys:
+            continue
+        cooldown_until = max(
+            float(cooldown_deadlines.get(candidate, 0.0)),
+            float(cooldown_deadlines.get(canonical_key, 0.0)),
+        )
+        if cooldown_until > now:
+            pending_cooldowns.append(cooldown_until - now)
+    if pending_cooldowns:
+        return max(0.05, min(pending_cooldowns))
+    return _gpu_retry_backoff_seconds(exhausted_rounds)
+
+
+def _gpu_retry_error(
+    operation_name: str,
+    retry_timeout_seconds: float,
+    attempts: list[dict[str, Any]],
+    final_error: BaseException,
+) -> IsolatedWorkerError:
+    return IsolatedWorkerError(
+        f"{operation_name} 在等待或切换 GPU 后仍未完成：{final_error}",
+        diagnostics={
+            "operation": operation_name,
+            "retryTimeoutSec": retry_timeout_seconds,
+            "retryableResourceError": True,
+            "gpuAttemptCount": int(attempts[-1].get("attempt") or len(attempts)) if attempts else 0,
+            "gpuAttemptsTruncated": bool(
+                attempts and int(attempts[-1].get("attempt") or len(attempts)) > len(attempts)
+            ),
+            "gpuAttempts": attempts,
+            "finalError": _exception_diagnostics(final_error),
+        },
+    )
+
+
+def _remaining_gpu_candidates(
+    candidates: tuple[str, ...],
+    excluded_gpu_keys: set[str],
+) -> tuple[str, ...]:
+    if not excluded_gpu_keys:
+        return candidates
+    _, _, canonical_keys = _unpack_gpu_inventory(_nvidia_gpu_inventory())
+    return tuple(
+        candidate
+        for candidate in candidates
+        if candidate not in excluded_gpu_keys
+        and _canonical_gpu_slot_key(candidate, canonical_keys) not in excluded_gpu_keys
+    )
+
+
+def _run_gpu_worker_with_retry(
+    *,
+    operation_name: str,
+    worker_slot: threading.BoundedSemaphore,
+    requested_device: str,
+    visible_devices_env: str,
+    cancel_event: Any | None,
+    operation: Callable[[str, Mapping[str, str] | None, str | None, float], Any],
+    timeout_seconds: float,
+    explicit_device: bool = False,
+    preferred_gpu: str | None = None,
+    minimum_free_mib: int = 0,
+    before_retry: Callable[[dict[str, Any]], None] | None = None,
+) -> tuple[Any, str | None, list[dict[str, Any]]]:
+    candidates = _worker_gpu_candidates(
+        requested_device,
+        visible_devices_env,
+        explicit_device=explicit_device,
+    )
+    deadline, retry_timeout = _gpu_retry_deadline(timeout_seconds)
+    attempts: list[dict[str, Any]] = []
+    excluded_gpu_keys: set[str] = set()
+    failure_states: dict[str, dict[str, Any]] = {}
+    failure_counts: dict[str, int] = {}
+    cooldown_deadlines: dict[str, float] = {}
+    attempt_count = 0
+    exhausted_rounds = 0
+    last_resource_error: BaseException | None = None
+
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("TASK_CANCELLED")
+        if time.monotonic() >= deadline:
+            if last_resource_error is not None:
+                raise _gpu_retry_error(
+                    operation_name,
+                    retry_timeout,
+                    attempts,
+                    last_resource_error,
+                ) from last_resource_error
+            raise RuntimeError(GPU_ACQUIRE_TIMEOUT_MESSAGE)
+
+        remaining_candidates = _remaining_gpu_candidates(candidates, excluded_gpu_keys)
+        if candidates and not remaining_candidates:
+            try:
+                _wait_for_gpu_slot_change(
+                    cancel_event,
+                    deadline,
+                    maximum_wait_seconds=_next_gpu_retry_wait_seconds(
+                        candidates,
+                        excluded_gpu_keys,
+                        cooldown_deadlines,
+                        exhausted_rounds,
+                    ),
+                )
+            except RuntimeError as wait_error:
+                if (
+                    str(wait_error) == GPU_ACQUIRE_TIMEOUT_MESSAGE
+                    and last_resource_error is not None
+                ):
+                    raise _gpu_retry_error(
+                        operation_name,
+                        retry_timeout,
+                        attempts,
+                        last_resource_error,
+                    ) from last_resource_error
+                raise
+            recovered_keys = _recovered_gpu_keys(
+                candidates,
+                failure_states,
+                minimum_free_mib=minimum_free_mib,
+                cooldown_deadlines=cooldown_deadlines,
+            )
+            if recovered_keys:
+                excluded_gpu_keys.difference_update(recovered_keys)
+                for recovered_key in recovered_keys:
+                    cooldown_deadlines.pop(recovered_key, None)
+                exhausted_rounds = 0
+            else:
+                exhausted_rounds += 1
+            continue
+
+        selected_gpu: str | None = None
+        retry_error: BaseException | None = None
+        try:
+            with _isolated_worker_gpu_lease(
+                worker_slot,
+                requested_device,
+                visible_devices_env,
+                cancel_event,
+                explicit_device=explicit_device,
+                preferred_gpu=preferred_gpu,
+                minimum_free_mib=minimum_free_mib,
+                candidate_overrides=remaining_candidates if candidates else (),
+                deadline=deadline,
+            ) as (worker_device, worker_env, selected_gpu):
+                try:
+                    remaining_attempt_seconds = deadline - time.monotonic()
+                    if remaining_attempt_seconds <= 0:
+                        raise RuntimeError(GPU_ACQUIRE_TIMEOUT_MESSAGE)
+                    attempt_timeout_seconds = min(
+                        max(0.01, float(timeout_seconds)),
+                        remaining_attempt_seconds,
+                    )
+                    result = operation(
+                        worker_device,
+                        worker_env,
+                        selected_gpu,
+                        attempt_timeout_seconds,
+                    )
+                except Exception as exc:
+                    if selected_gpu is None or _gpu_resource_error_kind(exc) is None:
+                        raise
+                    retry_error = exc
+        except RuntimeError as exc:
+            if str(exc) == "TASK_CANCELLED":
+                raise
+            if attempts and str(exc) == GPU_ACQUIRE_TIMEOUT_MESSAGE and last_resource_error is not None:
+                raise _gpu_retry_error(
+                    operation_name,
+                    retry_timeout,
+                    attempts,
+                    last_resource_error,
+                ) from last_resource_error
+            raise
+
+        if retry_error is None:
+            return result, selected_gpu, attempts
+
+        last_resource_error = retry_error
+        attempt_count += 1
+        attempt = _gpu_retry_attempt(
+            operation_name,
+            str(selected_gpu),
+            retry_error,
+            attempt_count,
+        )
+        canonical_key, failure_state = _gpu_failure_state(
+            str(selected_gpu),
+            str(attempt.get("reason") or "") or None,
+        )
+        attempt["freeMemoryMiBAfterFailure"] = failure_state.get("freeMemoryMiB")
+        failure_count = failure_counts.get(canonical_key, 0) + 1
+        failure_counts[canonical_key] = failure_count
+        retry_cooldown_seconds = _gpu_retry_backoff_seconds(failure_count - 1)
+        cooldown_until = time.monotonic() + retry_cooldown_seconds
+        cooldown_deadlines[canonical_key] = cooldown_until
+        cooldown_deadlines[str(selected_gpu)] = cooldown_until
+        attempt["retryCooldownSec"] = retry_cooldown_seconds
+        _append_gpu_retry_attempt(attempts, attempt)
+        failure_states[canonical_key] = failure_state
+        failure_states[str(selected_gpu)] = failure_state
+        excluded_gpu_keys.update((str(selected_gpu), canonical_key))
+        if before_retry is not None:
+            try:
+                before_retry(attempt)
+            except Exception as cleanup_error:
+                attempt["retryCleanupError"] = _exception_diagnostics(cleanup_error)
+                raise _gpu_retry_error(
+                    operation_name,
+                    retry_timeout,
+                    attempts,
+                    cleanup_error,
+                ) from cleanup_error
 
 
 def _acquire_clone_worker_slots(
@@ -2904,14 +3454,40 @@ def maybe_asr_eval(
         return asr
 
     requested_device = os.getenv("SEME2E_ASR_DEVICE") or os.getenv("SEME2E_API_DEVICE", "cpu")
+    worker_timeout = _env_int("SEME2E_ASR_WORKER_TIMEOUT_SECONDS", 600)
     try:
         evaluations = []
         for model in actual_models:
-            with _isolated_worker_gpu_lease(
-                ASR_WORKER_SLOTS,
-                requested_device,
-                "SEME2E_ASR_CUDA_VISIBLE_DEVICES",
-                cancel_event,
+            def run_worker(
+                worker_device: str,
+                worker_env: Mapping[str, str] | None,
+                _selected_gpu: str | None,
+                attempt_timeout_seconds: float,
+                *,
+                current_model: str = model,
+            ) -> dict[str, Any]:
+                return _run_isolated_json_worker(
+                    ROOT / "asr_worker.py",
+                    {
+                        "model": current_model,
+                        "device": worker_device,
+                        "language": str(payload.get("language") or "en"),
+                        "originalPath": str(clean_path.resolve()),
+                        "protectedPath": str(protected_path.resolve()),
+                    },
+                    timeout_seconds=attempt_timeout_seconds,
+                    cancel_event=cancel_event,
+                    **({"env_overrides": worker_env} if worker_env else {}),
+                )
+
+            worker_result, selected_gpu, gpu_attempts = _run_gpu_worker_with_retry(
+                operation_name=f"asr:{model}",
+                worker_slot=ASR_WORKER_SLOTS,
+                requested_device=requested_device,
+                visible_devices_env="SEME2E_ASR_CUDA_VISIBLE_DEVICES",
+                cancel_event=cancel_event,
+                operation=run_worker,
+                timeout_seconds=worker_timeout,
                 explicit_device=bool(os.getenv("SEME2E_ASR_DEVICE", "").strip()),
                 minimum_free_mib=max(
                     0,
@@ -2920,20 +3496,7 @@ def maybe_asr_eval(
                         _env_int("SEME2E_GPU_MIN_FREE_MIB", 0),
                     ),
                 ),
-            ) as (worker_device, worker_env, _):
-                worker_result = _run_isolated_json_worker(
-                    ROOT / "asr_worker.py",
-                    {
-                        "model": model,
-                        "device": worker_device,
-                        "language": str(payload.get("language") or "en"),
-                        "originalPath": str(clean_path.resolve()),
-                        "protectedPath": str(protected_path.resolve()),
-                    },
-                    timeout_seconds=_env_int("SEME2E_ASR_WORKER_TIMEOUT_SECONDS", 600),
-                    cancel_event=cancel_event,
-                    **({"env_overrides": worker_env} if worker_env else {}),
-                )
+            )
             if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("TASK_CANCELLED")
             clean_text = str(worker_result.get("originalText") or "")
@@ -2945,6 +3508,9 @@ def maybe_asr_eval(
                 language=payload.get("language"),
                 model=model,
             )
+            item["gpu"] = selected_gpu
+            if gpu_attempts:
+                item["gpuAttempts"] = gpu_attempts
             evaluations.append(item)
         if evaluations:
             asr.update(evaluations[0])
@@ -3747,11 +4313,35 @@ def _coqui_tts_clone_pair(
         model_path, config_path = local_model
         request_payload["modelPath"] = str(model_path.resolve())
         request_payload["configPath"] = str(config_path.resolve())
-    with _isolated_worker_gpu_lease(
-        COQUI_TTS_WORKER_SLOTS,
-        device,
-        "SEME2E_COQUI_TTS_CUDA_VISIBLE_DEVICES",
-        cancel_event,
+    worker_timeout = _env_int("SEME2E_COQUI_TTS_WORKER_TIMEOUT_SECONDS", 900)
+
+    def run_worker(
+        worker_device: str,
+        worker_env: Mapping[str, str] | None,
+        _selected_gpu: str | None,
+        attempt_timeout_seconds: float,
+    ) -> dict[str, Any]:
+        request_payload["device"] = worker_device
+        return _run_isolated_json_worker(
+            ROOT / "coqui_tts_worker.py",
+            request_payload,
+            timeout_seconds=attempt_timeout_seconds,
+            cancel_event=cancel_event,
+            **({"env_overrides": worker_env} if worker_env else {}),
+        )
+
+    def cleanup_retry(_attempt: dict[str, Any]) -> None:
+        original_output.unlink(missing_ok=True)
+        protected_output.unlink(missing_ok=True)
+
+    worker_result, selected_gpu, gpu_attempts = _run_gpu_worker_with_retry(
+        operation_name=f"coqui_tts:{model}",
+        worker_slot=COQUI_TTS_WORKER_SLOTS,
+        requested_device=device,
+        visible_devices_env="SEME2E_COQUI_TTS_CUDA_VISIBLE_DEVICES",
+        cancel_event=cancel_event,
+        operation=run_worker,
+        timeout_seconds=worker_timeout,
         explicit_device=bool(os.getenv("SEME2E_TTS_DEVICE", "").strip()),
         minimum_free_mib=max(
             0,
@@ -3760,17 +4350,13 @@ def _coqui_tts_clone_pair(
                 _env_int("SEME2E_GPU_MIN_FREE_MIB", 0),
             ),
         ),
-    ) as (worker_device, worker_env, selected_gpu):
-        request_payload["device"] = worker_device
-        if runtime_context is not None and selected_gpu:
-            runtime_context["gpuKey"] = selected_gpu
-        return _run_isolated_json_worker(
-            ROOT / "coqui_tts_worker.py",
-            request_payload,
-            timeout_seconds=_env_int("SEME2E_COQUI_TTS_WORKER_TIMEOUT_SECONDS", 900),
-            cancel_event=cancel_event,
-            **({"env_overrides": worker_env} if worker_env else {}),
-        )
+        before_retry=cleanup_retry,
+    )
+    if runtime_context is not None and selected_gpu:
+        runtime_context["gpuKey"] = selected_gpu
+        if gpu_attempts:
+            runtime_context["gpuAttempts"] = gpu_attempts
+    return worker_result
 
 
 def _is_cosyvoice_model(model: str) -> bool:
@@ -3779,6 +4365,92 @@ def _is_cosyvoice_model(model: str) -> bool:
 
 def _is_gpt_sovits_model(model: str) -> bool:
     return normalize_tts_model(model).lower() == "gpt-sovits:finetune"
+
+
+def _keep_gpt_sovits_work_dir() -> bool:
+    return any(
+        str(os.getenv(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+        for name in (
+            "SEME2E_KEEP_GPT_SOVITS_WORK_DIR",
+            "SEME2E_GPT_SOVITS_KEEP_WORK_DIR",
+            "SEME2E_DEBUG_KEEP_WORK_DIR",
+        )
+    )
+
+
+def _remove_or_isolate_gpt_sovits_work_dir(work_dir: Path, *, label: str) -> dict[str, Any]:
+    if not work_dir.exists():
+        return {"status": "absent", "path": None}
+    try:
+        shutil.rmtree(work_dir)
+        return {"status": "removed", "path": None}
+    except Exception as remove_error:
+        isolated_path = work_dir.with_name(f"{work_dir.name}.{label}-{uuid.uuid4().hex[:8]}")
+        try:
+            work_dir.replace(isolated_path)
+        except Exception as isolate_error:
+            raise RuntimeError(
+                f"无法清理或隔离 GPT-SoVITS 临时目录 {work_dir}: {isolate_error}"
+            ) from isolate_error
+        try:
+            shutil.rmtree(isolated_path)
+            return {
+                "status": "removed_after_isolation",
+                "path": None,
+                "initialError": _exception_diagnostics(remove_error),
+            }
+        except Exception as isolated_remove_error:
+            return {
+                "status": "isolated",
+                "path": str(isolated_path),
+                "initialError": _exception_diagnostics(remove_error),
+                "cleanupError": _exception_diagnostics(isolated_remove_error),
+            }
+
+
+def _reset_gpt_sovits_work_dir(
+    work_dir: Path,
+    *,
+    attempt_number: int,
+    keep_work_dir: bool,
+) -> dict[str, Any]:
+    if not work_dir.exists():
+        return {"status": "absent", "path": None}
+    if keep_work_dir:
+        retained_path = work_dir.with_name(
+            f"{work_dir.name}.failed-attempt-{attempt_number}-{uuid.uuid4().hex[:8]}"
+        )
+        work_dir.replace(retained_path)
+        return {"status": "retained_for_debug", "path": str(retained_path)}
+    return _remove_or_isolate_gpt_sovits_work_dir(
+        work_dir,
+        label=f"failed-attempt-{attempt_number}",
+    )
+
+
+def _path_is_inside(path_value: str, parent: Path) -> bool:
+    try:
+        return Path(path_value).resolve().is_relative_to(parent.resolve())
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _sanitize_gpt_sovits_result_paths(
+    payload: dict[str, Any],
+    work_dir: Path,
+    cleanup: dict[str, Any],
+) -> dict[str, Any]:
+    def sanitize_mapping(value: dict[str, Any]) -> None:
+        for key, item in list(value.items()):
+            if isinstance(item, dict):
+                sanitize_mapping(item)
+            elif isinstance(item, str) and _path_is_inside(item, work_dir):
+                value[key] = None
+
+    sanitize_mapping(payload)
+    payload["workDirRetained"] = False
+    payload["workDirCleanup"] = cleanup
+    return payload
 
 
 def _cosyvoice_clone_pair(
@@ -3799,20 +4471,14 @@ def _cosyvoice_clone_pair(
     if status != "available":
         raise RuntimeError(reason or "CosyVoice2 runtime is unavailable")
     worker = ROOT / "cosyvoice_worker.py"
-    with _isolated_worker_gpu_lease(
-        COSYVOICE_WORKER_SLOTS,
-        device,
-        "SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES",
-        cancel_event,
-        explicit_device=bool(os.getenv("SEME2E_TTS_DEVICE", "").strip()),
-        minimum_free_mib=max(
-            0,
-            _env_int(
-                "SEME2E_CLONE_GPU_MIN_FREE_MIB",
-                _env_int("SEME2E_GPU_MIN_FREE_MIB", 0),
-            ),
-        ),
-    ) as (worker_device, worker_env, selected_gpu):
+    worker_timeout = _env_int("SEME2E_COSYVOICE_TIMEOUT_SECONDS", 900)
+
+    def run_worker(
+        worker_device: str,
+        worker_env: Mapping[str, str] | None,
+        _selected_gpu: str | None,
+        attempt_timeout_seconds: float,
+    ) -> dict[str, Any]:
         command = [
             str(COSYVOICE_PYTHON),
             str(worker),
@@ -3841,24 +4507,51 @@ def _cosyvoice_clone_pair(
         ]
         environment = os.environ.copy()
         _apply_environment_overrides(environment, worker_env)
-        if runtime_context is not None and selected_gpu:
-            runtime_context["gpuKey"] = selected_gpu
         completed = _run_cancellable_subprocess(
             command,
             cwd=str(COSYVOICE_REPO_DIR),
             env=environment,
-            timeout_seconds=_env_int("SEME2E_COSYVOICE_TIMEOUT_SECONDS", 900),
+            timeout_seconds=attempt_timeout_seconds,
             cancel_event=cancel_event,
         )
-    marker = "VOICE_SHIELD_COSYVOICE_RESULT="
-    result_line = next((line for line in reversed(completed.stdout.splitlines()) if line.startswith(marker)), None)
-    if completed.returncode != 0 or result_line is None:
-        stderr_tail = completed.stderr[-4000:].strip()
-        stdout_tail = completed.stdout[-2000:].strip()
-        raise RuntimeError(
-            f"CosyVoice2 worker failed (exit={completed.returncode}): {stderr_tail or stdout_tail or 'missing worker result'}"
-        )
-    return json.loads(result_line[len(marker):])
+        marker = "VOICE_SHIELD_COSYVOICE_RESULT="
+        result_line = next((line for line in reversed(completed.stdout.splitlines()) if line.startswith(marker)), None)
+        if completed.returncode != 0 or result_line is None:
+            stderr_tail = completed.stderr[-4000:].strip()
+            stdout_tail = completed.stdout[-2000:].strip()
+            raise RuntimeError(
+                f"CosyVoice2 worker failed (exit={completed.returncode}): "
+                f"{stderr_tail or stdout_tail or 'missing worker result'}"
+            )
+        return json.loads(result_line[len(marker):])
+
+    def cleanup_retry(_attempt: dict[str, Any]) -> None:
+        original_output.unlink(missing_ok=True)
+        protected_output.unlink(missing_ok=True)
+
+    worker_result, selected_gpu, gpu_attempts = _run_gpu_worker_with_retry(
+        operation_name="cosyvoice2_clone",
+        worker_slot=COSYVOICE_WORKER_SLOTS,
+        requested_device=device,
+        visible_devices_env="SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES",
+        cancel_event=cancel_event,
+        operation=run_worker,
+        timeout_seconds=worker_timeout,
+        explicit_device=bool(os.getenv("SEME2E_TTS_DEVICE", "").strip()),
+        minimum_free_mib=max(
+            0,
+            _env_int(
+                "SEME2E_CLONE_GPU_MIN_FREE_MIB",
+                _env_int("SEME2E_GPU_MIN_FREE_MIB", 0),
+            ),
+        ),
+        before_retry=cleanup_retry,
+    )
+    if runtime_context is not None and selected_gpu:
+        runtime_context["gpuKey"] = selected_gpu
+        if gpu_attempts:
+            runtime_context["gpuAttempts"] = gpu_attempts
+    return worker_result
 
 
 def _gpt_sovits_clone_pair(
@@ -3882,7 +4575,7 @@ def _gpt_sovits_clone_pair(
     worker = ROOT / "gpt_sovits_live_finetune.py"
     work_dir = original_output.parent / "fine_tune"
     timeout_seconds = _env_int("SEME2E_GPT_SOVITS_TIMEOUT_SECONDS", 900)
-    command = [
+    base_command = [
         str(GPT_SOVITS_PYTHON),
         str(worker),
         "--repo",
@@ -3923,42 +4616,253 @@ def _gpt_sovits_clone_pair(
         str(GPT_SOVITS_PRETRAINED_S2D),
         "--timeout",
         str(timeout_seconds),
+        "--min-reference-seconds",
+        "3.0",
+        "--max-reference-seconds",
+        "10.0",
     ]
-    _acquire_worker_slot(GPT_SOVITS_WORKER_SLOTS, cancel_event)
-    try:
-        with _gpt_sovits_gpu_resource_lease(device, cancel_event) as leased_gpu:
-            if runtime_context is not None:
-                runtime_context["gpuKey"] = leased_gpu
-            # GPT-SoVITS s2_train.py rewrites CUDA_VISIBLE_DEVICES from gpu_numbers.
-            # Pass the physical lease there, while the worker itself uses logical cuda:0.
-            leased_command = [
-                *command,
-                "--gpu-numbers",
-                leased_gpu,
-                "--cuda-visible-devices",
-                leased_gpu,
-            ]
-            environment = os.environ.copy()
-            environment["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-            environment["CUDA_VISIBLE_DEVICES"] = leased_gpu
-            completed = _run_cancellable_subprocess(
-                leased_command,
-                cwd=str(GPT_SOVITS_REPO_DIR),
-                env=environment,
-                timeout_seconds=timeout_seconds * 3,
-                cancel_event=cancel_event,
+    candidates = _gpt_sovits_gpu_candidates(device)
+    deadline, retry_timeout = _gpu_retry_deadline(timeout_seconds * 3)
+    attempts: list[dict[str, Any]] = []
+    excluded_gpu_keys: set[str] = set()
+    failure_states: dict[str, dict[str, Any]] = {}
+    failure_counts: dict[str, int] = {}
+    cooldown_deadlines: dict[str, float] = {}
+    attempt_count = 0
+    exhausted_rounds = 0
+    last_resource_error: BaseException | None = None
+    keep_work_dir = _keep_gpt_sovits_work_dir()
+    initial_work_dir_cleanup: dict[str, Any] = {"status": "absent", "path": None}
+
+    if work_dir.exists():
+        try:
+            initial_work_dir_cleanup = _reset_gpt_sovits_work_dir(
+                work_dir,
+                attempt_number=0,
+                keep_work_dir=keep_work_dir,
             )
-    finally:
-        GPT_SOVITS_WORKER_SLOTS.release()
-    marker = "VOICE_SHIELD_GPT_SOVITS_LIVE_RESULT="
-    result_line = next((line for line in reversed(completed.stdout.splitlines()) if line.startswith(marker)), None)
-    if completed.returncode != 0 or result_line is None:
-        stderr_tail = completed.stderr[-4000:].strip()
-        stdout_tail = completed.stdout[-3000:].strip()
-        raise RuntimeError(
-            f"GPT-SoVITS live fine-tuning worker failed (exit={completed.returncode}): {stderr_tail or stdout_tail or 'missing worker result'}"
-        )
-    return json.loads(result_line[len(marker):])
+        except Exception as cleanup_error:
+            initial_work_dir_cleanup = {
+                "status": "cleanup_failed",
+                "path": str(work_dir),
+                "error": _exception_diagnostics(cleanup_error),
+            }
+            if runtime_context is not None:
+                runtime_context["initialWorkDirCleanup"] = initial_work_dir_cleanup
+            raise IsolatedWorkerError(
+                "GPT-SoVITS 启动前无法清理旧微调目录",
+                diagnostics={"initialWorkDirCleanup": initial_work_dir_cleanup},
+            ) from cleanup_error
+    if runtime_context is not None:
+        runtime_context["initialWorkDirCleanup"] = initial_work_dir_cleanup
+
+    try:
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("TASK_CANCELLED")
+            if time.monotonic() >= deadline:
+                if last_resource_error is not None:
+                    raise _gpu_retry_error(
+                        "gpt_sovits_live_fine_tune",
+                        retry_timeout,
+                        attempts,
+                        last_resource_error,
+                    ) from last_resource_error
+                raise RuntimeError(GPU_ACQUIRE_TIMEOUT_MESSAGE)
+
+            remaining_candidates = _remaining_gpu_candidates(candidates, excluded_gpu_keys)
+            if not remaining_candidates:
+                try:
+                    _wait_for_gpu_slot_change(
+                        cancel_event,
+                        deadline,
+                        maximum_wait_seconds=_next_gpu_retry_wait_seconds(
+                            candidates,
+                            excluded_gpu_keys,
+                            cooldown_deadlines,
+                            exhausted_rounds,
+                        ),
+                    )
+                except RuntimeError as wait_error:
+                    if (
+                        str(wait_error) == GPU_ACQUIRE_TIMEOUT_MESSAGE
+                        and last_resource_error is not None
+                    ):
+                        raise _gpu_retry_error(
+                            "gpt_sovits_live_fine_tune",
+                            retry_timeout,
+                            attempts,
+                            last_resource_error,
+                        ) from last_resource_error
+                    raise
+                recovered_keys = _recovered_gpu_keys(
+                    candidates,
+                    failure_states,
+                    minimum_free_mib=_gpt_sovits_minimum_free_mib(),
+                    cooldown_deadlines=cooldown_deadlines,
+                )
+                if recovered_keys:
+                    excluded_gpu_keys.difference_update(recovered_keys)
+                    for recovered_key in recovered_keys:
+                        cooldown_deadlines.pop(recovered_key, None)
+                    exhausted_rounds = 0
+                else:
+                    exhausted_rounds += 1
+                continue
+
+            leased_gpu: str | None = None
+            retry_error: BaseException | None = None
+            worker_result: dict[str, Any] | None = None
+            _acquire_worker_slot(GPT_SOVITS_WORKER_SLOTS, cancel_event, deadline=deadline)
+            try:
+                with _gpt_sovits_gpu_resource_lease(
+                    device,
+                    cancel_event,
+                    candidate_overrides=remaining_candidates,
+                    deadline=deadline,
+                ) as leased_gpu:
+                    # GPT-SoVITS s2_train.py rewrites CUDA_VISIBLE_DEVICES from gpu_numbers.
+                    # Pass the physical lease there, while the worker itself uses logical cuda:0.
+                    leased_command = [
+                        *base_command,
+                        "--gpu-numbers",
+                        leased_gpu,
+                        "--cuda-visible-devices",
+                        leased_gpu,
+                    ]
+                    environment = os.environ.copy()
+                    environment["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+                    environment["CUDA_VISIBLE_DEVICES"] = leased_gpu
+                    try:
+                        remaining_attempt_seconds = deadline - time.monotonic()
+                        if remaining_attempt_seconds <= 0:
+                            if last_resource_error is not None:
+                                raise _gpu_retry_error(
+                                    "gpt_sovits_live_fine_tune",
+                                    retry_timeout,
+                                    attempts,
+                                    last_resource_error,
+                                ) from last_resource_error
+                            raise RuntimeError(GPU_ACQUIRE_TIMEOUT_MESSAGE)
+                        completed = _run_cancellable_subprocess(
+                            leased_command,
+                            cwd=str(GPT_SOVITS_REPO_DIR),
+                            env=environment,
+                            timeout_seconds=min(
+                                max(0.01, float(timeout_seconds * 3)),
+                                remaining_attempt_seconds,
+                            ),
+                            cancel_event=cancel_event,
+                        )
+                        marker = "VOICE_SHIELD_GPT_SOVITS_LIVE_RESULT="
+                        result_line = next(
+                            (
+                                line
+                                for line in reversed(completed.stdout.splitlines())
+                                if line.startswith(marker)
+                            ),
+                            None,
+                        )
+                        if completed.returncode != 0 or result_line is None:
+                            stderr_tail = completed.stderr[-4000:].strip()
+                            stdout_tail = completed.stdout[-3000:].strip()
+                            message = (
+                                f"GPT-SoVITS live fine-tuning worker failed (exit={completed.returncode}): "
+                                f"{stderr_tail or stdout_tail or 'missing worker result'}"
+                            )
+                            raise IsolatedWorkerError(
+                                message,
+                                diagnostics={
+                                    "worker": str(worker),
+                                    "returnCode": completed.returncode,
+                                    "stdoutTail": stdout_tail,
+                                    "stderrTail": stderr_tail,
+                                    "gpu": leased_gpu,
+                                    "workDir": str(work_dir),
+                                },
+                            )
+                        worker_result = json.loads(result_line[len(marker):])
+                    except Exception as exc:
+                        if _gpu_resource_error_kind(exc) is None:
+                            raise
+                        retry_error = exc
+            finally:
+                _release_worker_slots([GPT_SOVITS_WORKER_SLOTS])
+
+            if retry_error is None and worker_result is not None:
+                if runtime_context is not None and leased_gpu:
+                    runtime_context["gpuKey"] = leased_gpu
+                    if attempts:
+                        runtime_context["gpuAttempts"] = attempts
+                if keep_work_dir:
+                    worker_result["workDirRetained"] = True
+                    worker_result["workDirCleanup"] = {
+                        "status": "retained_for_debug",
+                        "path": str(work_dir),
+                    }
+                else:
+                    cleanup = _remove_or_isolate_gpt_sovits_work_dir(
+                        work_dir,
+                        label="completed",
+                    )
+                    _sanitize_gpt_sovits_result_paths(worker_result, work_dir, cleanup)
+                worker_result["initialWorkDirCleanup"] = initial_work_dir_cleanup
+                if attempts:
+                    worker_result["gpuAttempts"] = attempts
+                return worker_result
+
+            if retry_error is None or leased_gpu is None:
+                raise RuntimeError("GPT-SoVITS worker ended without a result")
+            last_resource_error = retry_error
+            attempt_count += 1
+            attempt = _gpu_retry_attempt(
+                "gpt_sovits_live_fine_tune",
+                leased_gpu,
+                retry_error,
+                attempt_count,
+            )
+            canonical_key, failure_state = _gpu_failure_state(
+                leased_gpu,
+                str(attempt.get("reason") or "") or None,
+            )
+            attempt["freeMemoryMiBAfterFailure"] = failure_state.get("freeMemoryMiB")
+            failure_count = failure_counts.get(canonical_key, 0) + 1
+            failure_counts[canonical_key] = failure_count
+            retry_cooldown_seconds = _gpu_retry_backoff_seconds(failure_count - 1)
+            cooldown_until = time.monotonic() + retry_cooldown_seconds
+            cooldown_deadlines[canonical_key] = cooldown_until
+            cooldown_deadlines[leased_gpu] = cooldown_until
+            attempt["retryCooldownSec"] = retry_cooldown_seconds
+            _append_gpu_retry_attempt(attempts, attempt)
+            failure_states[canonical_key] = failure_state
+            failure_states[leased_gpu] = failure_state
+            excluded_gpu_keys.update((leased_gpu, canonical_key))
+            original_output.unlink(missing_ok=True)
+            protected_output.unlink(missing_ok=True)
+            attempt["workDirCleanup"] = _reset_gpt_sovits_work_dir(
+                work_dir,
+                attempt_number=attempt_count,
+                keep_work_dir=keep_work_dir,
+            )
+    except Exception as exc:
+        cleanup: dict[str, Any] | None = None
+        if work_dir.exists() and not keep_work_dir:
+            try:
+                cleanup = _remove_or_isolate_gpt_sovits_work_dir(
+                    work_dir,
+                    label="failed",
+                )
+            except Exception as cleanup_error:
+                cleanup = {
+                    "status": "cleanup_failed",
+                    "path": str(work_dir),
+                    "error": _exception_diagnostics(cleanup_error),
+                }
+        if isinstance(exc, IsolatedWorkerError) and cleanup is not None:
+            exc.diagnostics["workDirCleanup"] = cleanup
+        if isinstance(exc, IsolatedWorkerError):
+            exc.diagnostics["initialWorkDirCleanup"] = initial_work_dir_cleanup
+        raise
 
 
 def normalize_tts_model(value: str | None) -> str:
@@ -4146,6 +5050,8 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
             raise
         if isinstance(exc, IsolatedWorkerError):
             diagnostics["workerDiagnostics"] = exc.diagnostics
+        if clone_runtime:
+            diagnostics["cloneRuntime"] = dict(clone_runtime)
         original_output_exists = original_clone_path.exists()
         protected_output_exists = protected_clone_path.exists()
         original_clone_path.unlink(missing_ok=True)
@@ -4183,6 +5089,14 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
     clone_gpu_key = str(clone_runtime.get("gpuKey") or "").strip() or None
     if clone_gpu_key:
         diagnostics["workerGpu"] = clone_gpu_key
+    clone_gpu_attempts = clone_runtime.get("gpuAttempts")
+    if isinstance(clone_gpu_attempts, list) and clone_gpu_attempts:
+        diagnostics["gpuAttempts"] = clone_gpu_attempts
+    clone_runtime_diagnostics = dict(clone_runtime)
+    if clone_gpu_key:
+        clone_runtime_diagnostics["workerGpu"] = clone_gpu_key
+    if isinstance(clone_gpu_attempts, list) and clone_gpu_attempts:
+        clone_runtime_diagnostics["gpuAttempts"] = clone_gpu_attempts
     base_url = f"/api/artifacts/{task_id}/clones/{clone_id}"
     response = {
         "cloneId": clone_id,
@@ -4207,6 +5121,7 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
         },
         "originalCloneAudio": audio_meta(original_clone_path, f"{base_url}/{original_clone_path.name}"),
         "protectedCloneAudio": audio_meta(protected_clone_path, f"{base_url}/{protected_clone_path.name}"),
+        "runtimeDiagnostics": clone_runtime_diagnostics,
     }
     if gpt_sovits_model and worker_result is not None:
         response["fineTune"] = {
@@ -4242,6 +5157,21 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
         protected_clone_path,
         cancel_event=cancel_event,
     )
+    clone_runtime_diagnostics["cloneAsr"] = {
+        key: clone_transcription.get(key)
+        for key in ("status", "reason", "model", "gpu", "gpuAttempts", "diagnostics")
+        if clone_transcription.get(key) is not None
+    }
+    clone_runtime_diagnostics["cloneSemantic"] = {
+        key: clone_semantic_metrics.get(key)
+        for key in ("status", "reason", "gpu", "gpuAttempts", "diagnostics")
+        if clone_semantic_metrics.get(key) is not None
+    }
+    clone_runtime_diagnostics["cloneQuality"] = {
+        key: clone_quality_metrics.get(key)
+        for key in ("status", "reason", "provider", "diagnostics")
+        if clone_quality_metrics.get(key) is not None
+    }
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeError("TASK_CANCELLED")
     clone_eval = compute_clone_eval(
@@ -4254,6 +5184,7 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
         semantic_metrics=clone_semantic_metrics,
         quality_metrics=clone_quality_metrics,
     )
+    clone_eval["runtimeDiagnostics"] = clone_runtime_diagnostics
     clone_eval_sources = clone_eval.get("_metricSources") or {}
     response["cloneEval"] = clone_eval
     _sync_clone_eval_fields(response, clone_eval)

@@ -215,7 +215,7 @@ class ModelCapabilitiesTest(unittest.TestCase):
     def test_runtime_concurrency_snapshot_counts_training_and_inference_workers(self) -> None:
         with patch.multiple(
             api_server,
-            PROTECT_MAX_CONCURRENCY=3,
+            PROTECT_MAX_CONCURRENCY=2,
             ASR_WORKER_MAX_CONCURRENCY=2,
             clone_worker_capacity_snapshot=lambda: {
                 "maxConcurrency": 3,
@@ -228,12 +228,12 @@ class ModelCapabilitiesTest(unittest.TestCase):
         ):
             payload = api_server.runtime_concurrency_snapshot()
 
-        self.assertEqual(payload["protect"], 3)
+        self.assertEqual(payload["protect"], 2)
         self.assertEqual(payload["asr"], 2)
         self.assertEqual(payload["clone"], 3)
         self.assertEqual(payload["asrCloneShared"], 4)
         self.assertFalse(payload["protectSharesWorkerGpu"])
-        self.assertEqual(payload["total"], 7)
+        self.assertEqual(payload["total"], 6)
         self.assertEqual(payload["unit"], "worker")
         self.assertIn("HTTP", payload["definition"])
 
@@ -341,19 +341,24 @@ class ModelCapabilitiesTest(unittest.TestCase):
         self.assertTrue(snapshot["protectSharesWorkerGpu"])
         self.assertEqual(snapshot["protectGpuKeys"], ["GPU-AAAA"])
 
-    def test_remote_setup_uses_shared_dynamic_worker_pool_instead_of_role_pins(self) -> None:
+    def test_remote_setup_uses_one_dynamic_pool_for_training_and_inference(self) -> None:
         script = (ROOT.parents[1] / "remote-setup.ps1").read_text(encoding="utf-8")
 
-        self.assertIn('export SEME2E_GPU_POOL="$worker_gpu_pool"', script)
-        self.assertIn("unset SEME2E_ASR_CUDA_VISIBLE_DEVICES", script)
-        self.assertIn("unset SEME2E_CLONE_ASR_CUDA_VISIBLE_DEVICES", script)
-        self.assertIn("unset SEME2E_COQUI_TTS_CUDA_VISIBLE_DEVICES", script)
-        self.assertIn("unset SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES", script)
+        self.assertIn("export SEME2E_API_DEVICE='cpu'", script)
+        self.assertIn("export SEME2E_PROTECT_MAX_CONCURRENCY=2", script)
+        self.assertIn('export SEME2E_GPU_POOL="$gpu_pool"', script)
+        self.assertIn('export SEME2E_PROTECT_GPU_POOL="$gpu_pool"', script)
+        self.assertIn('export SEME2E_PROTECT_CUDA_VISIBLE_DEVICES="$gpu_pool"', script)
+        self.assertIn('export SEME2E_ASR_CUDA_VISIBLE_DEVICES="$gpu_pool"', script)
+        self.assertIn('export SEME2E_CLONE_ASR_CUDA_VISIBLE_DEVICES="$gpu_pool"', script)
+        self.assertIn('export SEME2E_SEMANTIC_CUDA_VISIBLE_DEVICES="$gpu_pool"', script)
+        self.assertIn('export SEME2E_COQUI_TTS_CUDA_VISIBLE_DEVICES="$gpu_pool"', script)
+        self.assertIn('export SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES="$gpu_pool"', script)
+        self.assertIn('export SEME2E_GPT_SOVITS_GPU_POOL="$gpu_pool"', script)
         self.assertIn("export SEME2E_PROTECT_GPU_SHARED_WITH_WORKERS=1", script)
-        self.assertIn("export SEME2E_PROTECT_GPU_SHARED_WITH_WORKERS=0", script)
-        self.assertIn("export SEME2E_PROTECT_CUDA_VISIBLE_DEVICES=\"$protect_gpu\"", script)
-        self.assertIn("export SEME2E_TOKENIZER_DEVICE='cuda:0'", script)
-        self.assertIn("export SEME2E_SEMANTIC_ENCODER_DEVICE='cuda:0'", script)
+        self.assertNotIn('export CUDA_VISIBLE_DEVICES="$protect_gpu"', script)
+        self.assertNotIn("export SEME2E_TOKENIZER_DEVICE='cuda:0'", script)
+        self.assertNotIn("export SEME2E_SEMANTIC_ENCODER_DEVICE='cuda:0'", script)
 
     def test_latest_runtime_performance_uses_latest_completed_real_average(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

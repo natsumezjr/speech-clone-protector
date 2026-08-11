@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import os
 import threading
 import time
 import unittest
@@ -20,6 +21,7 @@ class FakeProcess:
     def __init__(self, *, target: object, args: tuple[object, ...], daemon: bool) -> None:
         del target, daemon
         self.task_id = str(args[0])
+        self.selected_gpu = args[7] if len(args) > 7 else None
         self.started = False
         self.exitcode: int | None = None
         self._released = threading.Event()
@@ -55,6 +57,17 @@ def wait_until(predicate: object, timeout: float = 2.0) -> bool:
 
 class ProtectQueueTest(unittest.TestCase):
     def setUp(self) -> None:
+        self.environment = mock.patch.dict(
+            os.environ,
+            {
+                "SEME2E_API_DEVICE": "cpu",
+                "SEME2E_GPU_POOL": "",
+                "SEME2E_PROTECT_GPU_POOL": "",
+                "SEME2E_PROTECT_CUDA_VISIBLE_DEVICES": "",
+            },
+            clear=False,
+        )
+        self.environment.start()
         FakeProcess.instances.clear()
         with api_server.PROTECT_QUEUE_LOCK:
             api_server.PROTECT_PENDING_TASKS.clear()
@@ -65,17 +78,22 @@ class ProtectQueueTest(unittest.TestCase):
             api_server.TASK_PROCESSES.clear()
 
     def tearDown(self) -> None:
+        timer = api_server.PROTECT_DISPATCH_RETRY_TIMER
+        if timer is not None:
+            timer.cancel()
+            api_server.PROTECT_DISPATCH_RETRY_TIMER = None
         for process in FakeProcess.instances:
             process.release()
         wait_until(lambda: not api_server.PROTECT_ACTIVE_TASK_IDS)
         with api_server.PROTECT_QUEUE_LOCK:
             api_server.PROTECT_PENDING_TASKS.clear()
             api_server.PROTECT_ACTIVE_TASK_IDS.clear()
+        self.environment.stop()
 
     def test_protection_processes_use_spawn_context(self) -> None:
         self.assertEqual(api_server.PROTECT_PROCESS_CONTEXT.get_start_method(), "spawn")
 
-    def test_only_four_processes_start_and_fifth_waits_for_a_slot(self) -> None:
+    def test_only_two_processes_start_and_later_jobs_wait_for_a_slot(self) -> None:
         statuses: dict[str, dict[str, object]] = {}
 
         def write_status(task_id: str, **updates: object) -> dict[str, object]:
@@ -99,26 +117,78 @@ class ProtectQueueTest(unittest.TestCase):
             mock.patch.object(api_server, "read_task_status", side_effect=lambda task_id: statuses.get(task_id, {"status": "running"})),
             mock.patch.object(api_server, "is_task_deleted", return_value=False),
         ):
-            for index in range(1, 7):
+            for index in range(1, 5):
                 api_server.enqueue_protect_job(make_job(index))
 
-            self.assertEqual([process.task_id for process in FakeProcess.instances], ["task_1", "task_2", "task_3", "task_4"])
-            self.assertEqual(api_server.PROTECT_ACTIVE_TASK_IDS, {"task_1", "task_2", "task_3", "task_4"})
-            self.assertEqual([job["task_id"] for job in api_server.PROTECT_PENDING_TASKS], ["task_5", "task_6"])
-            self.assertEqual(statuses["task_5"]["queuePosition"], 1)
-            self.assertEqual(statuses["task_6"]["queuePosition"], 2)
+            self.assertEqual([process.task_id for process in FakeProcess.instances], ["task_1", "task_2"])
+            self.assertEqual(api_server.PROTECT_ACTIVE_TASK_IDS, {"task_1", "task_2"})
+            self.assertEqual([job["task_id"] for job in api_server.PROTECT_PENDING_TASKS], ["task_3", "task_4"])
+            self.assertEqual(statuses["task_3"]["queuePosition"], 1)
+            self.assertEqual(statuses["task_4"]["queuePosition"], 2)
 
             FakeProcess.instances[0].release()
-            self.assertTrue(wait_until(lambda: len(FakeProcess.instances) == 5))
-            self.assertEqual(FakeProcess.instances[4].task_id, "task_5")
-            self.assertEqual([job["task_id"] for job in api_server.PROTECT_PENDING_TASKS], ["task_6"])
+            self.assertTrue(wait_until(lambda: len(FakeProcess.instances) == 3))
+            self.assertEqual(FakeProcess.instances[2].task_id, "task_3")
+            self.assertEqual([job["task_id"] for job in api_server.PROTECT_PENDING_TASKS], ["task_4"])
 
             for process in tuple(FakeProcess.instances):
                 process.release()
-            self.assertTrue(wait_until(lambda: len(FakeProcess.instances) == 6))
+            self.assertTrue(wait_until(lambda: len(FakeProcess.instances) == 4))
             for process in tuple(FakeProcess.instances):
                 process.release()
             self.assertTrue(wait_until(lambda: not api_server.PROTECT_ACTIVE_TASK_IDS))
+
+    def test_dynamic_protect_gpu_is_passed_to_child_and_released_after_exit(self) -> None:
+        statuses: dict[str, dict[str, object]] = {}
+        gpu_slot = mock.Mock()
+        job = {
+            "task_id": "task_dynamic",
+            "request_id": "req_dynamic",
+            "uploaded_path": "audio.wav",
+            "uploaded_filename": "audio.wav",
+            "file_id": "file_dynamic",
+            "payload": {"fileId": "file_dynamic"},
+            "cancel_event": threading.Event(),
+        }
+
+        with (
+            mock.patch.object(api_server.PROTECT_PROCESS_CONTEXT, "Process", FakeProcess),
+            mock.patch.object(api_server, "_try_acquire_protect_gpu", return_value=("5", gpu_slot, True)),
+            mock.patch.object(api_server, "release_gpu_slot", side_effect=lambda slot: slot.release()),
+            mock.patch.object(api_server, "write_task_status", side_effect=lambda task_id, **updates: statuses.setdefault(task_id, {}).update(updates) or statuses[task_id]),
+            mock.patch.object(api_server, "read_task_status", side_effect=lambda task_id: statuses.get(task_id, {"status": "running"})),
+            mock.patch.object(api_server, "is_task_deleted", return_value=False),
+        ):
+            api_server.enqueue_protect_job(job)
+            self.assertEqual(len(FakeProcess.instances), 1)
+            self.assertEqual(FakeProcess.instances[0].selected_gpu, "5")
+            FakeProcess.instances[0].release()
+            self.assertTrue(wait_until(lambda: not api_server.PROTECT_ACTIVE_TASK_IDS))
+
+        gpu_slot.release.assert_called_once_with()
+
+    def test_protect_job_remains_queued_while_all_gpu_slots_are_busy(self) -> None:
+        job = {
+            "task_id": "task_waiting_gpu",
+            "request_id": "req_waiting_gpu",
+            "uploaded_path": "audio.wav",
+            "uploaded_filename": "audio.wav",
+            "file_id": "file_waiting_gpu",
+            "payload": {"fileId": "file_waiting_gpu"},
+            "cancel_event": threading.Event(),
+        }
+
+        with (
+            mock.patch.object(api_server, "_try_acquire_protect_gpu", return_value=(None, None, False)),
+            mock.patch.object(api_server, "_schedule_protect_dispatch_retry_locked") as schedule_retry,
+            mock.patch.object(api_server, "write_task_status", return_value={}),
+            mock.patch.object(api_server, "is_task_deleted", return_value=False),
+        ):
+            api_server.enqueue_protect_job(job)
+
+        self.assertEqual([queued["task_id"] for queued in api_server.PROTECT_PENDING_TASKS], ["task_waiting_gpu"])
+        self.assertFalse(api_server.PROTECT_ACTIVE_TASK_IDS)
+        schedule_retry.assert_called_once_with()
 
 
 if __name__ == "__main__":

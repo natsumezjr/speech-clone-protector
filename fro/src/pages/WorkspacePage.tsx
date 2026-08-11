@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import { useNavigate } from 'react-router-dom'
 import {
   CheckSquare,
@@ -849,7 +850,7 @@ function StrategyConfigCard({
 }
 
 function ArchitectureOverviewModal({ onClose }: { onClose: () => void }) {
-  return (
+  return createPortal(
     <div className="architecture-modal-backdrop fixed inset-0 z-[95] grid place-items-center px-4 backdrop-blur-md" role="dialog" aria-modal="true" aria-label="系统架构与优化目标">
       <div className="architecture-modal-card ui-card relative isolate max-h-[90vh] w-full max-w-[660px] overflow-x-hidden overflow-y-auto p-5">
         <div className="flex items-start justify-between gap-4">
@@ -881,7 +882,8 @@ function ArchitectureOverviewModal({ onClose }: { onClose: () => void }) {
           <LossTerm formula="\lVert \delta \rVert_{2}" title="扰动范数约束">限制整体扰动大小，避免保护音频被过度破坏。</LossTerm>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   )
 }
 

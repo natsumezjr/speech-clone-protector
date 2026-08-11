@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { ChevronDown, Loader2, Search, Sparkles, TestTube2, X } from 'lucide-react'
+import { createPortal } from 'react-dom'
 import { useNavigate } from 'react-router-dom'
 
 import { cloneVoice, createEvaluationBatch, getTaskStatus, listTasks, runAsrEval } from '@/services/apiClient'
@@ -9,6 +10,7 @@ import { useTaskStore } from '@/store/taskStore'
 import type { AsrEvalResponse, CapabilitiesResponse, CloneVoiceRequest, HistoryTask, ProtectionRuntimeConfig, RuntimeModelOption } from '@/types/task'
 import { cn } from '@/lib/utils'
 import { cloneModelRequiresReferenceText, normalizeCloneReferenceTextRequest } from '@/utils/cloneModelCapabilities'
+import { findReusableAsrAnnotation } from '@/utils/asrAnnotationReuse'
 
 type ModelOption = RuntimeModelOption & { label: string }
 type CloneDialogMode = 'single' | 'all'
@@ -298,9 +300,15 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
         try {
           const annotationModel = defaultAsrModel(asrModels, cloneLanguage)
           if (!annotationModel) throw new Error(`${cloneLanguage === 'zh-cn' ? '中文' : '英文'}自动标注模型当前不可用。`)
-          const asrQueued = await runAsrEval(cloneTaskId, { model: annotationModel.value, language: cloneLanguage })
-          if (!asrQueued.asrSubId) throw new Error('自动标注任务未返回有效编号。')
-          annotation = await waitForAsr(cloneTaskId, asrQueued.asrSubId)
+          const currentStatus = await getTaskStatus(cloneTaskId).catch(() => null)
+          annotation = currentStatus
+            ? findReusableAsrAnnotation(currentStatus, annotationModel.value, cloneLanguage)
+            : null
+          if (!annotation) {
+            const asrQueued = await runAsrEval(cloneTaskId, { model: annotationModel.value, language: cloneLanguage })
+            if (!asrQueued.asrSubId) throw new Error('自动标注任务未返回有效编号。')
+            annotation = await waitForAsr(cloneTaskId, asrQueued.asrSubId)
+          }
           const evaluatedAsr = annotation.asr
           const originalText = evaluatedAsr?.originalText?.trim() ?? ''
           const protectedText = evaluatedAsr?.protectedText?.trim() ?? ''
@@ -404,7 +412,7 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
         </div>
       </div>
 
-      {cloneDialogMode ? (
+      {cloneDialogMode ? createPortal((
         <div className="fixed inset-0 z-[95] grid place-items-center bg-slate-950/72 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="克隆测试设置">
           <div className="ui-card w-full max-w-[600px] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.48)]">
             <div className="flex items-start justify-between gap-4">
@@ -422,7 +430,7 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
             </div>
           </div>
         </div>
-      ) : null}
+      ), document.body) : null}
 
     </section>
   )

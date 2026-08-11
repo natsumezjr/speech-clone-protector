@@ -760,6 +760,20 @@ class MetricDefinitionsTest(unittest.TestCase):
             ) -> dict[str, object]:
                 self.assertEqual(original_reference, original)
                 self.assertEqual(protected_reference, protected)
+                runtime_context = kwargs.get("runtime_context")
+                self.assertIsInstance(runtime_context, dict)
+                runtime_context.update(
+                    {
+                        "gpuKey": "2",
+                        "gpuAttempts": [
+                            {
+                                "attempt": 1,
+                                "gpu": "1",
+                                "reason": "gpu_memory_exhausted",
+                            }
+                        ],
+                    }
+                )
                 write_wav(original_output, np.zeros(160, dtype=np.float32))
                 write_wav(protected_output, np.zeros(160, dtype=np.float32))
                 generated_paths.extend([original_output, protected_output])
@@ -784,9 +798,37 @@ class MetricDefinitionsTest(unittest.TestCase):
                 mock.patch.object(adapter, "_module_available", return_value=True),
                 mock.patch.object(adapter, "_tts_catalog_status", return_value=("available", None, "fake-model")),
                 mock.patch.object(adapter, "_coqui_tts_clone_pair", side_effect=fake_clone_pair) as clone_pair,
-                mock.patch.object(adapter, "_transcribe_clone_pair_isolated", return_value={"status": "unavailable", "reason": "not run"}),
-                mock.patch.object(adapter, "_compute_clone_semantic_isolated", return_value={"status": "unavailable", "tokenChangeRate": None, "semanticDrift": None}),
-                mock.patch.object(adapter, "_evaluate_dnsmos_pair_isolated", return_value={"status": "unavailable", "reason": "not run"}),
+                mock.patch.object(
+                    adapter,
+                    "_transcribe_clone_pair_isolated",
+                    return_value={
+                        "status": "unavailable",
+                        "reason": "not run",
+                        "gpu": "3",
+                        "diagnostics": {"stage": "clone_asr"},
+                    },
+                ),
+                mock.patch.object(
+                    adapter,
+                    "_compute_clone_semantic_isolated",
+                    return_value={
+                        "status": "unavailable",
+                        "tokenChangeRate": None,
+                        "semanticDrift": None,
+                        "gpu": "4",
+                        "diagnostics": {"stage": "clone_semantic"},
+                    },
+                ),
+                mock.patch.object(
+                    adapter,
+                    "_evaluate_dnsmos_pair_isolated",
+                    return_value={
+                        "status": "unavailable",
+                        "reason": "not run",
+                        "provider": "dnsmos",
+                        "diagnostics": {"stage": "clone_quality"},
+                    },
+                ),
                 mock.patch.object(adapter, "compute_clone_eval", return_value=fake_clone_eval),
             ):
                 response = adapter.create_clone_voice("task_test", {"text": "hello", "model": "xtts-v2"})
@@ -806,6 +848,15 @@ class MetricDefinitionsTest(unittest.TestCase):
         self.assertIsNone(response["request"]["annotationAsrSubId"])
         self.assertEqual(stored_result["details"]["cloneEval"]["originalSimilarity"], 0.9)
         self.assertEqual(stored_result["summary"]["metricSources"]["cloneEval.*"]["source"], "fake_speaker")
+        runtime_diagnostics = response["runtimeDiagnostics"]
+        self.assertEqual(runtime_diagnostics["workerGpu"], "2")
+        self.assertEqual(runtime_diagnostics["gpuAttempts"][0]["gpu"], "1")
+        self.assertEqual(runtime_diagnostics["cloneAsr"]["diagnostics"]["stage"], "clone_asr")
+        self.assertEqual(runtime_diagnostics["cloneSemantic"]["diagnostics"]["stage"], "clone_semantic")
+        self.assertEqual(runtime_diagnostics["cloneQuality"]["diagnostics"]["stage"], "clone_quality")
+        self.assertIs(stored_result["cloneResults"][0]["runtimeDiagnostics"], runtime_diagnostics)
+        self.assertIs(stored_result["details"]["cloneEval"]["runtimeDiagnostics"], runtime_diagnostics)
+        json.dumps(runtime_diagnostics)
 
     def test_create_clone_voice_preserves_structured_worker_error_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

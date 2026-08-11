@@ -88,6 +88,36 @@ def _training_audio(audio_path: Path, condition_dir: Path, max_seconds: float) -
     return trimmed_path, duration, max_seconds
 
 
+def _reference_audio(
+    audio_path: Path,
+    condition_dir: Path,
+    *,
+    min_seconds: float,
+    max_seconds: float,
+) -> tuple[Path, float, float]:
+    if min_seconds <= 0 or max_seconds < min_seconds:
+        raise ValueError("Invalid GPT-SoVITS reference-audio duration limits")
+    with wave.open(str(audio_path), "rb") as source:
+        sample_rate = source.getframerate()
+        frame_count = source.getnframes()
+        duration = frame_count / sample_rate if sample_rate else 0.0
+        if duration < min_seconds:
+            raise ValueError(
+                f"GPT-SoVITS reference audio must be at least {min_seconds:.2f} seconds; "
+                f"got {duration:.2f} seconds"
+            )
+        if duration <= max_seconds:
+            return audio_path, duration, duration
+        target_frames = max(1, int(max_seconds * sample_rate))
+        frames = source.readframes(target_frames)
+        trimmed_path = condition_dir / f"{audio_path.stem}_reference.wav"
+        with wave.open(str(trimmed_path), "wb") as destination:
+            destination.setparams(source.getparams())
+            destination.setnframes(target_frames)
+            destination.writeframes(frames)
+    return trimmed_path, duration, max_seconds
+
+
 def _prepare(
     *,
     args: argparse.Namespace,
@@ -302,6 +332,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         condition_dir = args.work_dir / condition
         condition_dir.mkdir(parents=True)
         training_audio, source_duration, training_duration = _training_audio(audio_path, condition_dir, args.max_training_seconds)
+        reference_audio, _, reference_duration = _reference_audio(
+            audio_path,
+            condition_dir,
+            min_seconds=args.min_reference_seconds,
+            max_seconds=args.max_reference_seconds,
+        )
         prepare_timings, phoneme_path, semantic_path = _prepare(
             args=args,
             condition=condition,
@@ -322,7 +358,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         inference_sec = _infer(
             args=args,
             condition=condition,
-            audio_path=audio_path,
+            audio_path=reference_audio,
             transcript=transcript,
             gpt_checkpoint=gpt_checkpoint,
             sovits_checkpoint=sovits_checkpoint,
@@ -337,10 +373,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "totalWallSec": round(time.perf_counter() - condition_started, 4),
             "gptCheckpoint": str(gpt_checkpoint),
             "sovitsCheckpoint": str(sovits_checkpoint),
-            "referencePath": str(audio_path),
+            "referencePath": str(reference_audio),
+            "sourceReferencePath": str(audio_path),
             "trainingAudioPath": str(training_audio),
             "sourceDurationSec": round(source_duration, 4),
             "trainingDurationSec": round(training_duration, 4),
+            "referenceDurationSec": round(reference_duration, 4),
             "outputPath": str(output_path),
         }
     return {
@@ -376,6 +414,8 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--pretrained-s2d", type=Path, required=True)
     value.add_argument("--timeout", type=int, default=900)
     value.add_argument("--max-training-seconds", type=float, default=54.0)
+    value.add_argument("--min-reference-seconds", type=float, default=3.0)
+    value.add_argument("--max-reference-seconds", type=float, default=10.0)
     return value
 
 

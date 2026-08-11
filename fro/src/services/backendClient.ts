@@ -928,14 +928,22 @@ function normalizeHistoryTask(payload: unknown): HistoryTask {
 
 export const backendClient: ApiClient = {
   async getCapabilities() {
-    const [capabilitiesResponse, configResponse] = await Promise.all([
+    const [capabilitiesResult, configResult] = await Promise.allSettled([
       http.get('/api/capabilities'),
       http.get('/api/config'),
     ])
-    const capabilities = asRecord(capabilitiesResponse.data)
-    const configEnvelope = asRecord(configResponse.data)
+    if (capabilitiesResult.status === 'rejected' && configResult.status === 'rejected') {
+      throw capabilitiesResult.reason
+    }
+    const capabilities = capabilitiesResult.status === 'fulfilled'
+      ? asRecord(capabilitiesResult.value.data)
+      : {}
+    const configEnvelope = configResult.status === 'fulfilled'
+      ? asRecord(configResult.value.data)
+      : {}
     return {
       ...capabilities,
+      ...configEnvelope,
       modelTypes: configEnvelope.modelTypes ?? capabilities.modelTypes,
       config: configEnvelope.config ?? capabilities.config,
       protectQueue: configEnvelope.protectQueue ?? capabilities.protectQueue,

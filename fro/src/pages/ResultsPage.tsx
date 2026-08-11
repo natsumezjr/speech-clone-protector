@@ -2150,7 +2150,7 @@ function AsrHistoryPanel({ history, batches, selectedAsrSubId, onSelect, onOpenB
             <col className="w-[9%]" />
           </colgroup>
           <thead className="sticky top-0 z-10 border-b border-cyan-300/12 bg-slate-950 text-[11px] text-slate-500">
-            <tr><th className="px-2 py-2 text-center">任务</th><th className="px-2 py-2 text-center">ASR 模型</th><th className="px-2 py-2 text-center">语言</th><th className="px-2 py-2 text-center">进度</th><th className="px-2 py-2 text-center">处理时长</th><th className="px-2 py-2 text-center">WER</th><th className="px-2 py-2 text-center">CER</th></tr>
+            <tr><th className="px-2 py-2 text-center font-bold text-[13.2px]">任务</th><th className="px-2 py-2 text-center font-bold text-[13.2px]">ASR 模型</th><th className="px-2 py-2 text-center font-bold text-[13.2px]">语言</th><th className="px-2 py-2 text-center font-bold text-[13.2px]">进度</th><th className="px-2 py-2 text-center font-bold text-[13.2px]">处理时长</th><th className="px-2 py-2 text-center font-bold text-[13.2px]">WER</th><th className="px-2 py-2 text-center font-bold text-[13.2px]">CER</th></tr>
           </thead>
           <tbody>
             {batches.map((batch) => {
@@ -2167,9 +2167,9 @@ function AsrHistoryPanel({ history, batches, selectedAsrSubId, onSelect, onOpenB
                     <div className="history-progress-track mx-auto h-1.5 max-w-[110px] overflow-hidden rounded-full bg-slate-800"><div className={cn('h-full rounded-full transition-all duration-300', tone.fill)} style={{ width: `${progressPercent}%` }} /></div>
                     <p className={cn('mt-1 text-center font-mono text-[10px] font-bold', tone.text)}>{progressPercent}% · {lifecycleStatusLabel(batch.status)}</p>
                   </td>
-                  <td className="px-2 py-3 text-center font-mono">{elapsed !== null ? seconds(elapsed) : '—'}</td>
-                  <td className="px-2 py-3 text-center font-mono">—</td>
-                  <td className="px-2 py-3 text-center font-mono">—</td>
+                  <td className="px-2 py-3 text-center font-mono font-bold text-[13.2px]">{elapsed !== null ? seconds(elapsed) : '—'}</td>
+                  <td className="px-2 py-3 text-center font-mono font-bold text-[13.2px]">—</td>
+                  <td className="px-2 py-3 text-center font-mono font-bold text-[13.2px]">—</td>
                 </tr>
               )
             })}
@@ -2192,9 +2192,9 @@ function AsrHistoryPanel({ history, batches, selectedAsrSubId, onSelect, onOpenB
                     <div className="history-progress-track mx-auto h-1.5 max-w-[110px] overflow-hidden rounded-full bg-slate-800"><div className={cn('h-full rounded-full transition-all duration-300', tone.fill)} style={{ width: `${progressPercent}%` }} /></div>
                     <p className={cn('mt-1 text-center font-mono text-[10px] font-bold', tone.text)}>{progressPercent}% · {statusLabel}</p>
                   </td>
-                  <td className="px-2 py-3 text-center font-mono">{elapsedSec !== null ? seconds(elapsedSec) : '—'}</td>
-                  <td className="px-2 py-3 text-center font-mono">{formatAsrRatePercent(evaluation?.wer)}</td>
-                  <td className="px-2 py-3 text-center font-mono">{formatAsrRatePercent(evaluation?.cer)}</td>
+                  <td className="px-2 py-3 text-center font-mono font-bold text-[13.2px]">{elapsedSec !== null ? seconds(elapsedSec) : '—'}</td>
+                  <td className="px-2 py-3 text-center font-mono font-bold text-[13.2px]">{formatAsrRatePercent(evaluation?.wer)}</td>
+                  <td className="px-2 py-3 text-center font-mono font-bold text-[13.2px]">{formatAsrRatePercent(evaluation?.cer)}</td>
                 </tr>
               )
             })}
@@ -2228,7 +2228,7 @@ function CloneHistoryPanel({ history, batches, modelOptions, selectedCloneKey, o
             <col className="w-[7%]" />
           </colgroup>
           <thead className="sticky top-0 z-10 border-b border-cyan-300/12 bg-slate-950 text-[11px] text-slate-500">
-            <tr><th className="px-2 py-2 text-center">任务</th><th className="px-2 py-2 text-center">克隆类型</th><th className="px-2 py-2 text-center">克隆模型</th><th className="px-2 py-2 text-center">标注来源</th><th className="px-2 py-2 text-center">进度</th><th className="px-2 py-2 text-center">处理时长</th><th className="px-2 py-2 text-center">参考标注</th><th className="px-2 py-2 text-center">原始相似度</th><th className="px-2 py-2 text-center">保护后相似度</th></tr>
+            <tr><th className="px-2 py-2 text-center font-bold text-[13.2px]">任务</th><th className="px-2 py-2 text-center font-bold text-[13.2px]">克隆类型</th><th className="px-2 py-2 text-center font-bold text-[13.2px]">克隆模型</th><th className="px-2 py-2 text-center font-bold text-[13.2px]">标注来源</th><th className="px-2 py-2 text-center font-bold text-[13.2px]">进度</th><th className="px-2 py-2 text-center font-bold text-[13.2px]">处理时长</th><th className="px-2 py-2 text-center font-bold text-[13.2px]">参考标注</th><th className="px-2 py-2 text-center font-bold text-[13.2px]">原始相似度</th><th className="px-2 py-2 text-center font-bold text-[13.2px]">保护后相似度</th></tr>
           </thead>
           <tbody>
             {batches.map((batch) => {
@@ -2245,10 +2245,10 @@ function CloneHistoryPanel({ history, batches, modelOptions, selectedCloneKey, o
                     <div className="history-progress-track mx-auto h-1.5 max-w-[110px] overflow-hidden rounded-full bg-slate-800"><div className={cn('h-full rounded-full transition-all duration-300', tone.fill)} style={{ width: `${progressPercent}%` }} /></div>
                     <p className={cn('mt-1 text-center font-mono text-[10px] font-bold', tone.text)}>{progressPercent}% · {lifecycleStatusLabel(batch.status)}</p>
                   </td>
-                  <td className="px-2 py-3 text-center font-mono">{elapsed !== null ? seconds(elapsed) : '—'}</td>
+                  <td className="px-2 py-3 text-center font-mono font-bold text-[13.2px]">{elapsed !== null ? seconds(elapsed) : '—'}</td>
                   <td className="px-2 py-3 text-center text-slate-500">—</td>
-                  <td className="px-2 py-3 text-center font-mono">—</td>
-                  <td className="px-2 py-3 text-center font-mono">—</td>
+                  <td className="px-2 py-3 text-center font-mono font-bold text-[13.2px]">—</td>
+                  <td className="px-2 py-3 text-center font-mono font-bold text-[13.2px]">—</td>
                 </tr>
               )
             })}
@@ -2284,12 +2284,12 @@ function CloneHistoryPanel({ history, batches, modelOptions, selectedCloneKey, o
                     <div className="history-progress-track mx-auto h-1.5 max-w-[110px] overflow-hidden rounded-full bg-slate-800"><div className={cn('h-full rounded-full transition-all duration-300', tone.fill)} style={{ width: `${progressPercent}%` }} /></div>
                     <p className={cn('mt-1 text-center font-mono text-[10px] font-bold', tone.text)}>{progressPercent}% · {lifecycleStatusLabel(lifecycleStatus)}</p>
                   </td>
-                  <td className="px-2 py-3 text-center font-mono">{elapsed !== null ? seconds(elapsed) : '—'}</td>
+                  <td className="px-2 py-3 text-center font-mono font-bold text-[13.2px]">{elapsed !== null ? seconds(elapsed) : '—'}</td>
                   <td className="px-2 py-2">
                     {hasAnnotation ? <button type="button" onClick={(event) => { event.stopPropagation(); openAnnotation() }} className="block w-full rounded-[5px] px-1 py-1 text-left hover:bg-cyan-300/[0.05]">{asrAnnotation ? <span className="block space-y-0.5 leading-5"><span className="block truncate" title={originalPrompt}>原始：{originalPrompt || '—'}</span><span className="block truncate" title={protectedPrompt}>保护：{protectedPrompt || '—'}</span></span> : <span className="block truncate" title={originalPrompt}>{originalPrompt || '—'}</span>}</button> : <span className="block text-center text-slate-500">—</span>}
                   </td>
-                  <td className="px-2 py-3 text-center font-mono">{formatCloneMetricNumber(item.result?.cloneEval?.originalSimilarity)}</td>
-                  <td className="px-2 py-3 text-center font-mono">{formatCloneMetricNumber(item.result?.cloneEval?.protectedSimilarity)}</td>
+                  <td className="px-2 py-3 text-center font-mono font-bold text-[13.2px]">{formatCloneMetricNumber(item.result?.cloneEval?.originalSimilarity)}</td>
+                  <td className="px-2 py-3 text-center font-mono font-bold text-[13.2px]">{formatCloneMetricNumber(item.result?.cloneEval?.protectedSimilarity)}</td>
                 </tr>
               )
             })}

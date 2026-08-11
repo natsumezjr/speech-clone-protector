@@ -27,11 +27,14 @@ from capability_cache import get_capabilities_snapshot
 from dnsmos_quality import dnsmos_model_status
 from result_adapter import (
     ASR_WORKER_MAX_CONCURRENCY,
+    GPU_ACQUIRE_TIMEOUT_MESSAGE,
     TASK_DIR,
     UPLOAD_DIR,
     AudioPreprocessError,
     CloneBackendUnavailableError,
     ProtectGenerationError,
+    _worker_gpu_candidates,
+    acquire_gpu_slot,
     create_asr_eval,
     create_clone_voice,
     clone_worker_capacity_snapshot,
@@ -44,6 +47,7 @@ from result_adapter import (
     new_task_id,
     new_file_id,
     refresh_result_scores,
+    release_gpu_slot,
     runtime_config,
     supported_tts_languages,
     tts_model_requires_reference_text,
@@ -87,10 +91,14 @@ def _positive_env_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
-PROTECT_MAX_CONCURRENCY = _positive_env_int("SEME2E_PROTECT_MAX_CONCURRENCY", 4)
+PROTECT_MAX_CONCURRENCY = min(
+    2,
+    _positive_env_int("SEME2E_PROTECT_MAX_CONCURRENCY", 2),
+)
 PROTECT_PENDING_TASKS: deque[dict[str, Any]] = deque()
 PROTECT_ACTIVE_TASK_IDS: set[str] = set()
 PROTECT_QUEUE_LOCK = threading.RLock()
+PROTECT_DISPATCH_RETRY_TIMER: threading.Timer | None = None
 DELETED_TASK_DIR = TASK_DIR.parent / "deleted_tasks"
 DELETED_TASK_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1595,7 +1603,16 @@ def run_protect_task_process(
     file_id: str,
     payload_dict: dict[str, Any],
     cancel_event: Any,
+    selected_gpu: str | None = None,
 ) -> None:
+    if selected_gpu:
+        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        os.environ["CUDA_VISIBLE_DEVICES"] = selected_gpu
+        os.environ["SEME2E_API_DEVICE"] = "cuda:0"
+        os.environ["SEME2E_PROTECT_CUDA_VISIBLE_DEVICES"] = selected_gpu
+        os.environ["SEME2E_TOKENIZER_DEVICE"] = "cuda:0"
+        os.environ["SEME2E_SEMANTIC_ENCODER_DEVICE"] = "cuda:0"
+        os.environ["SEME2E_PROTECT_SELECTED_GPU"] = selected_gpu
     uploaded = {"path": uploaded_path, "filename": uploaded_filename}
 
     def ensure_process_task_not_deleted() -> None:
@@ -1808,9 +1825,14 @@ def _refresh_protect_queue_statuses_locked() -> None:
             continue
 
 
-def _watch_protect_process(task_id: str, process: multiprocessing.Process, cancel_event: Any) -> None:
-    process.join()
+def _watch_protect_process(
+    task_id: str,
+    process: multiprocessing.Process,
+    cancel_event: Any,
+    gpu_slot: threading.BoundedSemaphore | None = None,
+) -> None:
     try:
+        process.join()
         if not is_task_deleted(task_id):
             try:
                 status = read_task_status(task_id)
@@ -1833,16 +1855,25 @@ def _watch_protect_process(task_id: str, process: multiprocessing.Process, cance
                     },
                 )
     finally:
+        if gpu_slot is not None:
+            release_gpu_slot(gpu_slot)
         with PROTECT_QUEUE_LOCK:
             PROTECT_ACTIVE_TASK_IDS.discard(task_id)
             cleanup_protect_process_runtime(task_id, process, cancel_event)
             _dispatch_protect_tasks_locked()
 
 
-def _start_protect_job_locked(job: dict[str, Any]) -> bool:
+def _start_protect_job_locked(
+    job: dict[str, Any],
+    *,
+    selected_gpu: str | None = None,
+    gpu_slot: threading.BoundedSemaphore | None = None,
+) -> bool:
     task_id = str(job["task_id"])
     cancel_event = job["cancel_event"]
     if cancel_event.is_set() or is_task_deleted(task_id):
+        if gpu_slot is not None:
+            release_gpu_slot(gpu_slot)
         cleanup_task_runtime(task_id)
         return False
 
@@ -1856,6 +1887,7 @@ def _start_protect_job_locked(job: dict[str, Any]) -> bool:
             job["file_id"],
             job["payload"],
             cancel_event,
+            selected_gpu,
         ),
         daemon=True,
     )
@@ -1864,6 +1896,8 @@ def _start_protect_job_locked(job: dict[str, Any]) -> bool:
     try:
         process.start()
     except Exception as exc:
+        if gpu_slot is not None:
+            release_gpu_slot(gpu_slot)
         PROTECT_ACTIVE_TASK_IDS.discard(task_id)
         cleanup_protect_process_runtime(task_id, process, cancel_event)
         write_task_status(
@@ -1883,7 +1917,7 @@ def _start_protect_job_locked(job: dict[str, Any]) -> bool:
 
     watcher = threading.Thread(
         target=_watch_protect_process,
-        args=(task_id, process, cancel_event),
+        args=(task_id, process, cancel_event, gpu_slot),
         name=f"protect-watch-{task_id}",
         daemon=True,
     )
@@ -1891,10 +1925,93 @@ def _start_protect_job_locked(job: dict[str, Any]) -> bool:
     return True
 
 
+def _protect_gpu_candidates() -> tuple[str, ...]:
+    requested_device = os.getenv("SEME2E_PROTECT_DEVICE") or os.getenv("SEME2E_API_DEVICE", "cpu")
+    pool_env = (
+        "SEME2E_PROTECT_GPU_POOL"
+        if os.getenv("SEME2E_PROTECT_GPU_POOL", "").strip()
+        else "SEME2E_PROTECT_CUDA_VISIBLE_DEVICES"
+    )
+    return _worker_gpu_candidates(
+        requested_device,
+        pool_env,
+        explicit_device=bool(os.getenv("SEME2E_PROTECT_DEVICE", "").strip()),
+    )
+
+
+def _try_acquire_protect_gpu() -> tuple[str | None, threading.BoundedSemaphore | None, bool]:
+    candidates = _protect_gpu_candidates()
+    if not candidates:
+        return None, None, True
+    retry_window = max(0.01, float(os.getenv("SEME2E_PROTECT_GPU_DISPATCH_WINDOW_SECONDS", "0.05")))
+    try:
+        selected_gpu, gpu_slot = acquire_gpu_slot(
+            candidates,
+            minimum_free_mib=max(
+                0,
+                _positive_env_int(
+                    "SEME2E_PROTECT_GPU_MIN_FREE_MIB",
+                    _positive_env_int("SEME2E_GPU_MIN_FREE_MIB", 1),
+                ),
+            ),
+            deadline=time.monotonic() + retry_window,
+        )
+        return selected_gpu, gpu_slot, True
+    except RuntimeError as exc:
+        if str(exc) == GPU_ACQUIRE_TIMEOUT_MESSAGE:
+            return None, None, False
+        raise
+
+
+def _retry_protect_dispatch() -> None:
+    global PROTECT_DISPATCH_RETRY_TIMER
+    with PROTECT_QUEUE_LOCK:
+        PROTECT_DISPATCH_RETRY_TIMER = None
+        _dispatch_protect_tasks_locked()
+
+
+def _schedule_protect_dispatch_retry_locked() -> None:
+    global PROTECT_DISPATCH_RETRY_TIMER
+    if PROTECT_DISPATCH_RETRY_TIMER is not None and PROTECT_DISPATCH_RETRY_TIMER.is_alive():
+        return
+    retry_seconds = max(0.05, float(os.getenv("SEME2E_PROTECT_GPU_RETRY_SECONDS", "0.5")))
+    timer = threading.Timer(retry_seconds, _retry_protect_dispatch)
+    timer.daemon = True
+    PROTECT_DISPATCH_RETRY_TIMER = timer
+    timer.start()
+
+
 def _dispatch_protect_tasks_locked() -> None:
     while len(PROTECT_ACTIVE_TASK_IDS) < PROTECT_MAX_CONCURRENCY and PROTECT_PENDING_TASKS:
-        job = PROTECT_PENDING_TASKS.popleft()
-        _start_protect_job_locked(job)
+        job = PROTECT_PENDING_TASKS[0]
+        cancel_event = job["cancel_event"]
+        if cancel_event.is_set() or is_task_deleted(str(job["task_id"])):
+            PROTECT_PENDING_TASKS.popleft()
+            cleanup_task_runtime(str(job["task_id"]))
+            continue
+        try:
+            selected_gpu, gpu_slot, ready = _try_acquire_protect_gpu()
+        except Exception as exc:
+            PROTECT_PENDING_TASKS.popleft()
+            write_task_status(
+                str(job["task_id"]),
+                status="failed",
+                stage="protect_generation",
+                message=f"无法分配保护任务 GPU：{exc}",
+                error={
+                    "code": "PROTECT_GPU_ALLOCATION_FAILED",
+                    "message": str(exc),
+                    "taskId": str(job["task_id"]),
+                    "stage": "protect_generation",
+                },
+            )
+            cleanup_task_runtime(str(job["task_id"]))
+            continue
+        if not ready:
+            _schedule_protect_dispatch_retry_locked()
+            break
+        PROTECT_PENDING_TASKS.popleft()
+        _start_protect_job_locked(job, selected_gpu=selected_gpu, gpu_slot=gpu_slot)
     _refresh_protect_queue_statuses_locked()
 
 

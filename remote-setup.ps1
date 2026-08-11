@@ -296,9 +296,9 @@ cd "$backend"
 export SEME2E_RUNTIME_DIR="$project/seme2e-runtime"
 export SEME2E_API_REAL_GUARD=1
 export SEME2E_ENABLE_ASR=1
-export SEME2E_API_DEVICE='cuda:0'
-export SEME2E_PROTECT_MAX_CONCURRENCY=1
-export SEME2E_ASR_WORKER_MAX_CONCURRENCY=1
+export SEME2E_API_DEVICE='cpu'
+export SEME2E_PROTECT_MAX_CONCURRENCY=2
+export SEME2E_ASR_WORKER_MAX_CONCURRENCY=2
 export SEME2E_SEMANTIC_WORKER_MAX_CONCURRENCY=1
 export SEME2E_COQUI_TTS_WORKER_MAX_CONCURRENCY=1
 export SEME2E_COSYVOICE_WORKER_MAX_CONCURRENCY=1
@@ -311,7 +311,9 @@ export SEME2E_PROTECT_GPU_SHARED_WITH_WORKERS=1
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export PYTHONUNBUFFERED=1
 gpt_worker_max_concurrency=1
+unset CUDA_VISIBLE_DEVICES
 unset SEME2E_GPU_POOL
+unset SEME2E_PROTECT_GPU_POOL
 unset SEME2E_PROTECT_CUDA_VISIBLE_DEVICES
 unset SEME2E_ASR_DEVICE
 unset SEME2E_CLONE_ASR_DEVICE
@@ -335,30 +337,20 @@ if command -v nvidia-smi >/dev/null 2>&1; then
       | awk '{print $2}'
   )
   if [ "${#gpu_candidates[@]}" -gt 0 ]; then
-    protect_gpu="${gpu_candidates[2]:-${gpu_candidates[0]}}"
-    worker_gpus=()
-    for candidate in "${gpu_candidates[@]}"; do
-      if [ "$candidate" != "$protect_gpu" ]; then
-        worker_gpus+=("$candidate")
-      fi
-    done
-    if [ "${#worker_gpus[@]}" -eq 0 ]; then
-      worker_gpus+=("$protect_gpu")
-      export SEME2E_PROTECT_GPU_SHARED_WITH_WORKERS=1
-    else
-      export SEME2E_PROTECT_GPU_SHARED_WITH_WORKERS=0
-    fi
-    worker_gpu_pool="$(IFS=,; printf '%s' "${worker_gpus[*]}")"
-    if [ "${#worker_gpus[@]}" -ge 2 ]; then
+    gpu_pool="$(IFS=,; printf '%s' "${gpu_candidates[*]}")"
+    if [ "${#gpu_candidates[@]}" -ge 2 ]; then
       gpt_worker_max_concurrency=2
     fi
-    export CUDA_VISIBLE_DEVICES="$protect_gpu"
-    export SEME2E_PROTECT_CUDA_VISIBLE_DEVICES="$protect_gpu"
-    export SEME2E_GPU_POOL="$worker_gpu_pool"
-    # Main-process speaker/semantic evaluation remains on the protect GPU.
-    export SEME2E_TOKENIZER_DEVICE='cuda:0'
-    export SEME2E_SEMANTIC_ENCODER_DEVICE='cuda:0'
-    printf 'GPU routing: protect-and-main-eval=%s dynamic-worker-pool=%s shared=%s min-free=%sMiB\n' "$protect_gpu" "$worker_gpu_pool" "$SEME2E_PROTECT_GPU_SHARED_WITH_WORKERS" "$min_free_gpu_mib"
+    export SEME2E_GPU_POOL="$gpu_pool"
+    export SEME2E_PROTECT_GPU_POOL="$gpu_pool"
+    export SEME2E_PROTECT_CUDA_VISIBLE_DEVICES="$gpu_pool"
+    export SEME2E_ASR_CUDA_VISIBLE_DEVICES="$gpu_pool"
+    export SEME2E_CLONE_ASR_CUDA_VISIBLE_DEVICES="$gpu_pool"
+    export SEME2E_SEMANTIC_CUDA_VISIBLE_DEVICES="$gpu_pool"
+    export SEME2E_COQUI_TTS_CUDA_VISIBLE_DEVICES="$gpu_pool"
+    export SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES="$gpu_pool"
+    export SEME2E_GPT_SOVITS_GPU_POOL="$gpu_pool"
+    printf 'GPU routing: api-main=cpu dynamic-training-inference-pool=%s min-free=%sMiB\n' "$gpu_pool" "$min_free_gpu_mib"
   fi
 fi
 export SEME2E_GPT_SOVITS_WORKER_MAX_CONCURRENCY="$gpt_worker_max_concurrency"
