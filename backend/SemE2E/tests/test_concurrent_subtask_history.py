@@ -59,28 +59,30 @@ class ConcurrentSubtaskHistoryTest(unittest.TestCase):
             with self.subTest(value=invalid_value), mock.patch.dict(api_server.os.environ, {name: invalid_value}):
                 self.assertEqual(api_server._positive_env_int(name, 4), 4)
 
-    def test_xtts_clone_annotation_defaults_to_none_and_clears_irrelevant_fields(self) -> None:
-        payload = api_server.CloneVoiceRequest(
-            text="clone text",
-            model="xtts-v2",
-            language="en",
-            speakerPrompt="must be ignored",
-            annotationSource="asr",
-            annotationAsrSubId="asr_must_be_ignored",
-        )
+    def test_reference_text_free_clone_models_clear_irrelevant_annotation_fields(self) -> None:
+        for model in ("xtts-v2", "your-tts"):
+            with self.subTest(model=model):
+                payload = api_server.CloneVoiceRequest(
+                    text="clone text",
+                    model=model,
+                    language="en",
+                    speakerPrompt="must be ignored",
+                    annotationSource="asr",
+                    annotationAsrSubId="asr_must_be_ignored",
+                )
 
-        resolved, error = api_server.resolve_clone_annotation("task_xtts", payload, "req_test")
+                resolved, error = api_server.resolve_clone_annotation("task_reference_text_free", payload, "req_test")
 
-        self.assertIsNone(error)
-        self.assertIsNotNone(resolved)
-        self.assertIsNone(api_server.CloneVoiceRequest(text="clone text", model="xtts-v2").annotationSource)
-        self.assertIsNone(resolved["annotationSource"])
-        self.assertIsNone(resolved["speakerPrompt"])
-        self.assertIsNone(resolved["originalSpeakerPrompt"])
-        self.assertIsNone(resolved["protectedSpeakerPrompt"])
-        self.assertIsNone(resolved["annotationAsrSubId"])
-        self.assertIsNone(resolved["annotationAsrModel"])
-        self.assertIsNone(resolved["annotationCreatedAt"])
+                self.assertIsNone(error)
+                self.assertIsNotNone(resolved)
+                self.assertIsNone(api_server.CloneVoiceRequest(text="clone text", model=model).annotationSource)
+                self.assertIsNone(resolved["annotationSource"])
+                self.assertIsNone(resolved["speakerPrompt"])
+                self.assertIsNone(resolved["originalSpeakerPrompt"])
+                self.assertIsNone(resolved["protectedSpeakerPrompt"])
+                self.assertIsNone(resolved["annotationAsrSubId"])
+                self.assertIsNone(resolved["annotationAsrModel"])
+                self.assertIsNone(resolved["annotationCreatedAt"])
 
     def test_prompt_required_clone_models_default_to_manual_annotation(self) -> None:
         for model in ("cosyvoice2:0.5b", "gpt-sovits:finetune"):
@@ -100,6 +102,23 @@ class ConcurrentSubtaskHistoryTest(unittest.TestCase):
                 self.assertEqual(resolved["speakerPrompt"], "manual transcript")
                 self.assertEqual(resolved["originalSpeakerPrompt"], "manual transcript")
                 self.assertEqual(resolved["protectedSpeakerPrompt"], "manual transcript")
+
+    def test_reference_text_required_models_reject_missing_annotation_immediately(self) -> None:
+        for model in ("cosyvoice2:0.5b", "gpt-sovits:finetune"):
+            with self.subTest(model=model):
+                payload = api_server.CloneVoiceRequest(
+                    text="clone text",
+                    model=model,
+                    language="zh-cn",
+                )
+
+                resolved, error = api_server.resolve_clone_annotation("task_missing_annotation", payload, "req_test")
+
+                self.assertIsNone(resolved)
+                self.assertIsNotNone(error)
+                body = json.loads(error.body.decode("utf-8"))
+                self.assertEqual(body["error"]["code"], "REFERENCE_TEXT_REQUIRED")
+                self.assertIn("参考音频对应文本", body["error"]["message"])
 
     def test_evaluation_batch_persists_expected_items_and_fixed_label(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

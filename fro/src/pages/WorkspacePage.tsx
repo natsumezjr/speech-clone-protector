@@ -201,7 +201,7 @@ export function WorkspacePage() {
     <div className="workspace-page-shell grid min-h-0 grid-rows-[minmax(0,1fr)]">
       <div className="workspace-grid grid min-h-0 grid-cols-[minmax(360px,0.9fr)_minmax(390px,1fr)_minmax(420px,1.05fr)] gap-3 max-xl:grid-cols-1">
         <AudioAccessCard maxAudioSizeBytes={runtimeConfig?.constraints?.maxAudioSizeBytes} />
-        <StrategyConfigCard running={running} runtimeConfig={runtimeConfig} configError={configError} onStart={(payload) => void startTask(payload)} />
+        <StrategyConfigCard running={running} runtimeConfig={runtimeConfig} configError={configError} averageStepSec={capabilities?.runtimePerformance?.averageStepSec} onStart={(payload) => void startTask(payload)} />
         <WorkspaceEvaluationPanel runtimeConfig={runtimeConfig} modelTypes={runtimeConfig?.modelTypes ?? capabilities?.modelTypes} />
       </div>
     </div>
@@ -490,11 +490,13 @@ function StrategyConfigCard({
   running,
   runtimeConfig,
   configError,
+  averageStepSec,
   onStart,
 }: {
   running: boolean
   runtimeConfig?: ProtectionRuntimeConfig
   configError?: string | null
+  averageStepSec?: number | null
   onStart: (payload: ProtectionTaskRequest) => void
 }) {
   const pushToast = useAppStore((state) => state.pushToast)
@@ -601,6 +603,9 @@ function StrategyConfigCard({
     joint: { Icon: ShieldCheck, tone: 'cyan' },
   } as const
   const targetLocked = selectedMode === 'custom'
+  const measuredAverageStepSec = typeof averageStepSec === 'number' && Number.isFinite(averageStepSec) && averageStepSec > 0
+    ? averageStepSec
+    : null
 
   const handleModeChange = (mode: string) => {
     setConfigurationChangedSinceSubmission(true)
@@ -833,7 +838,11 @@ function StrategyConfigCard({
             开始生成保护音频
           </button>
         </div>
-        <p className="mt-3 text-center text-xs text-slate-500">预计耗时：单步 0.90 s，总时长预计 {(steps * 0.9).toFixed(2)} s</p>
+        <p className="mt-3 text-center text-xs text-slate-500">
+          {measuredAverageStepSec === null
+            ? '预计耗时：完成一次保护任务后可按真实单步耗时估算'
+            : `预计耗时：单步 ${measuredAverageStepSec.toFixed(2)} s，总时长预计 ${(steps * measuredAverageStepSec).toFixed(2)} s`}
+        </p>
       </div>
     </section>
   )
@@ -841,14 +850,14 @@ function StrategyConfigCard({
 
 function ArchitectureOverviewModal({ onClose }: { onClose: () => void }) {
   return (
-    <div className="fixed inset-0 z-[95] grid place-items-center bg-slate-950/72 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="系统架构与优化目标">
-      <div className="ui-card max-h-[90vh] w-full max-w-[980px] overflow-y-auto p-5 shadow-[0_28px_80px_rgba(0,0,0,0.48)]">
+    <div className="architecture-modal-backdrop fixed inset-0 z-[95] grid place-items-center px-4 backdrop-blur-md" role="dialog" aria-modal="true" aria-label="系统架构与优化目标">
+      <div className="architecture-modal-card ui-card relative isolate max-h-[90vh] w-full max-w-[660px] overflow-x-hidden overflow-y-auto p-5">
         <div className="flex items-start justify-between gap-4">
           <div>
-            <h2 className="text-[21px] font-black text-white">系统架构与优化目标</h2>
+            <h2 className="text-[21px] font-black text-white">系统架构与<span className="architecture-modal-title-accent">优化目标</span></h2>
             <p className="mt-1 text-xs text-slate-500">保护音频由语义、声音身份和听感约束共同优化</p>
           </div>
-          <button type="button" onClick={onClose} className="grid h-9 w-9 place-items-center rounded-full border border-cyan-300/14 text-slate-300 hover:text-white" aria-label="关闭系统架构说明"><X className="h-4 w-4" /></button>
+          <button type="button" onClick={onClose} className="architecture-modal-close grid h-9 w-9 place-items-center rounded-full border text-slate-300" aria-label="关闭系统架构说明"><X className="h-4 w-4" /></button>
         </div>
         <div className="mt-5 grid grid-cols-[minmax(140px,1fr)_40px_minmax(170px,1.1fr)_40px_minmax(140px,1fr)] items-center gap-2">
           <ArchBox title="输入音频" sub={<VariableSymbol name="x" />} icon={<Waves className="h-10 w-10 text-sky-200" />} />
@@ -862,7 +871,7 @@ function ArchitectureOverviewModal({ onClose }: { onClose: () => void }) {
           <Branch title="身份分支" color="blue" items={['身份编码器', '声音身份约束', '说话人不可恢复']} />
           <Branch title="听感约束" color="purple" items={['心理声学模型', '掩蔽阈值建模', '听感优化']} />
         </div>
-        <div className="mt-5 rounded-[7px] border border-cyan-300/20 bg-sky-400/10 p-4 text-center text-sm text-slate-300">
+        <div className="architecture-objective-card mt-5 rounded-[7px] border p-4 text-center text-sm text-slate-300">
           <span className="mr-3 text-slate-400">联合优化目标</span><OptimizationFormula />
         </div>
         <div className="mt-5 grid gap-3 md:grid-cols-2">
@@ -878,7 +887,7 @@ function ArchitectureOverviewModal({ onClose }: { onClose: () => void }) {
 
 function LossTerm({ formula, title, children }: { formula: string; title: string; children: ReactNode }) {
   return (
-    <div className="rounded-[7px] border border-cyan-300/10 bg-slate-950/24 px-3 py-2.5">
+    <div className="architecture-loss-card relative overflow-hidden rounded-[7px] border px-3 py-2.5">
       <p className="flex items-center gap-2 font-black text-slate-100">
         <MathText formula={formula} className="text-cyan-200" />
         {title}
@@ -1136,7 +1145,7 @@ function VariableSymbol({ name, prime }: { name: string; prime?: boolean }) {
 
 function ArchBox({ title, sub, icon, active }: { title: string; sub: ReactNode; icon: ReactNode; active?: boolean }) {
   return (
-    <div className={cn('grid h-[118px] place-items-center rounded-[7px] border bg-slate-950/20 text-center', active ? 'border-cyan-400/35 bg-cyan-400/10' : 'border-cyan-300/14')}>
+    <div className={cn('architecture-arch-box relative grid h-[118px] place-items-center overflow-hidden rounded-[7px] border text-center', active && 'architecture-arch-box-active')}>
       {icon}
       <p className="font-black text-slate-200">{title}</p>
       {sub ? <p className="text-sm text-slate-400">{sub}</p> : null}
@@ -1146,11 +1155,11 @@ function ArchBox({ title, sub, icon, active }: { title: string; sub: ReactNode; 
 
 function Branch({ title, color, items }: { title: string; color: 'green' | 'blue' | 'purple'; items: string[] }) {
   return (
-    <div className={cn('rounded-[8px] border p-3 text-center', color === 'green' && 'border-emerald-400/35 bg-emerald-400/10', color === 'blue' && 'border-sky-400/35 bg-sky-400/10', color === 'purple' && 'border-violet-400/35 bg-violet-400/10')}>
+    <div className={cn('architecture-branch relative overflow-hidden rounded-[8px] border p-3 text-center', `architecture-branch-${color}`)}>
       <h3 className={cn('mb-3 text-[18px] font-black', color === 'green' && 'text-emerald-300', color === 'blue' && 'text-sky-300', color === 'purple' && 'text-violet-300')}>{title}</h3>
       <div className="space-y-2">
         {items.map((item) => (
-          <div key={item} className="rounded-[6px] border border-white/10 bg-slate-950/18 px-2 py-3 text-sm text-slate-200">
+          <div key={item} className="architecture-branch-item rounded-[6px] border px-2 py-3 text-sm text-slate-200">
             {item}
           </div>
         ))}
@@ -1160,7 +1169,7 @@ function Branch({ title, color, items }: { title: string; color: 'green' | 'blue
 }
 
 function Arrow() {
-  return <div className="text-center text-3xl text-slate-400">→</div>
+  return <div className="architecture-flow-arrow text-center text-3xl">→</div>
 }
 
 function TinyWave({ color, className }: { color: string; className?: string }) {

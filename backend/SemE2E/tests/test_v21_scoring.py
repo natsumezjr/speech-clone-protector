@@ -676,6 +676,7 @@ class VoiceShieldV21ScoringTest(unittest.TestCase):
         frontend = frontend_result(result)
         dimensions = {item["key"]: item["score"] for item in frontend["protectionEvaluation"]["dimensions"]}
 
+        self.assertEqual(frontend["score"], frontend["protectionEvaluation"]["overallScore"])
         self.assertEqual(frontend["cloneResults"][0]["cloneIdentityScore"], 80.0)
         self.assertEqual(frontend["cloneResults"][0]["cloneSemanticScore"], 70.0)
         self.assertEqual(frontend["cloneResults"][0]["cloneQualityScore"], 60.0)

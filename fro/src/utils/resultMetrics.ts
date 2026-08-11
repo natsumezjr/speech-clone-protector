@@ -24,7 +24,14 @@ export interface LossSlopeAnalysis {
   reference_mean_abs_slope: number | null
   final_mean_abs_slope: number | null
   final_to_reference_ratio: number | null
+  reference_max_abs_slope: number | null
+  final_max_abs_slope: number | null
+  final_to_reference_max_ratio: number | null
   normalized_final_slope: number | null
+  normalized_final_max_slope: number | null
+  endpoint_change_rate: number | null
+  robust_scale: number | null
+  tail_point_count: number
   segment_count: number
 }
 
@@ -36,9 +43,20 @@ export interface ConvergenceAnalysis {
 }
 
 const convergenceKeys: TrendMetricKey[] = ['Lid', 'Lsem', 'Lpsy', 'L2', 'total']
-const finalSegmentFraction = 0.2
-const finalToReferenceSlopeRatio = 0.6
-const minimumNormalizedFinalSlope = 0.01
+// Calibrated against real 200/300/400-step traces after the same 80-point
+// display downsampling used by ResultsPage. The still-changing examples had
+// ratio >= 0.74 and normalized tail maximum >= 0.22, while the plateaued
+// examples stayed at ratio <= 0.34 and normalized tail maximum <= 0.15.
+export const lossConvergenceThresholds = {
+  minimumPoints: 32,
+  segmentFraction: 0.25,
+  minimumSegmentPoints: 8,
+  endpointSegmentFraction: 0.2,
+  robustMaximumQuantile: 0.9,
+  minimumTailToInitialMaxSlopeRatio: 0.35,
+  minimumNormalizedTailMaxSlope: 0.18,
+  minimumValidLossCountForConverged: 3,
+} as const
 
 function finiteNumber(value: unknown): number | null {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null
@@ -190,57 +208,106 @@ export function analyzeLossTrend(points: LossTrendPoint[] | null | undefined, ke
 
 function analyzeLossSlope(points: LossTrendPoint[] | null | undefined, key: TrendMetricKey): LossSlopeAnalysis {
   const cleaned = cleanLossPoints(points, key)
-  const slopes: number[] = []
-  for (let index = 1; index < cleaned.length; index += 1) {
-    const stepDelta = cleaned[index].step - cleaned[index - 1].step
-    if (Math.abs(stepDelta) <= 1e-12) continue
-    slopes.push(Math.abs((cleaned[index].value - cleaned[index - 1].value) / stepDelta))
-  }
-  if (cleaned.length < 6 || slopes.length < 5) {
-    return {
-      key,
-      status: 'insufficient',
-      reference_mean_abs_slope: null,
-      final_mean_abs_slope: null,
-      final_to_reference_ratio: null,
-      normalized_final_slope: null,
-      segment_count: slopes.length,
-    }
+  const insufficient = (segmentCount = 0): LossSlopeAnalysis => ({
+    key,
+    status: 'insufficient',
+    reference_mean_abs_slope: null,
+    final_mean_abs_slope: null,
+    final_to_reference_ratio: null,
+    reference_max_abs_slope: null,
+    final_max_abs_slope: null,
+    final_to_reference_max_ratio: null,
+    normalized_final_slope: null,
+    normalized_final_max_slope: null,
+    endpoint_change_rate: null,
+    robust_scale: null,
+    tail_point_count: 0,
+    segment_count: segmentCount,
+  })
+  if (cleaned.length < lossConvergenceThresholds.minimumPoints) {
+    return insufficient(Math.max(0, cleaned.length - 1))
   }
 
-  const finalSegmentCount = Math.max(1, Math.ceil(slopes.length * finalSegmentFraction))
-  const referenceSlopes = slopes.slice(0, -finalSegmentCount)
-  const finalSlopes = slopes.slice(-finalSegmentCount)
-  if (referenceSlopes.length === 0) {
-    return {
-      key,
-      status: 'insufficient',
-      reference_mean_abs_slope: null,
-      final_mean_abs_slope: null,
-      final_to_reference_ratio: null,
-      normalized_final_slope: null,
-      segment_count: slopes.length,
+  let smoothingWindow = Math.max(3, Math.round(cleaned.length * 0.05))
+  if (smoothingWindow % 2 === 0) smoothingWindow += 1
+  const steps = cleaned.map((item) => item.step)
+  const smoothedValues = rollingMedian(cleaned.map((item) => item.value), smoothingWindow)
+  const tailPointCount = Math.max(
+    lossConvergenceThresholds.minimumSegmentPoints,
+    Math.ceil(smoothedValues.length * lossConvergenceThresholds.segmentFraction),
+  )
+  const initialSteps = steps.slice(0, tailPointCount)
+  const initialValues = smoothedValues.slice(0, tailPointCount)
+  const tailSteps = steps.slice(-tailPointCount)
+  const tailValues = smoothedValues.slice(-tailPointCount)
+  const initialStepSpan = initialSteps.at(-1)! - initialSteps[0]
+  const tailStepSpan = tailSteps.at(-1)! - tailSteps[0]
+  if (
+    initialValues.length < lossConvergenceThresholds.minimumSegmentPoints
+    || tailValues.length < lossConvergenceThresholds.minimumSegmentPoints
+    || initialStepSpan <= 1e-12
+    || tailStepSpan <= 1e-12
+  ) {
+    return insufficient(Math.max(0, cleaned.length - 1))
+  }
+
+  const robustScale = Math.max(
+    quantile(smoothedValues, 0.95) - quantile(smoothedValues, 0.05),
+    Math.abs(median(smoothedValues)) * 0.05,
+    1e-8,
+  )
+  const robustTailSlope = theilSenSlope(tailSteps, tailValues)
+  const normalizedFinalSlope = Math.abs(robustTailSlope) * tailStepSpan / robustScale
+  const endpointPointCount = Math.max(2, Math.ceil(tailValues.length * lossConvergenceThresholds.endpointSegmentFraction))
+  const endpointChangeRate = Math.abs(
+    median(tailValues.slice(-endpointPointCount)) - median(tailValues.slice(0, endpointPointCount)),
+  ) / robustScale
+
+  const localSlopes = (segmentSteps: number[], segmentValues: number[]) => {
+    const slopes: number[] = []
+    for (let index = 1; index < segmentValues.length; index += 1) {
+      const stepDelta = segmentSteps[index] - segmentSteps[index - 1]
+      if (Math.abs(stepDelta) <= 1e-12) continue
+      slopes.push(Math.abs((segmentValues[index] - segmentValues[index - 1]) / stepDelta))
     }
+    return slopes
+  }
+  const slopes: number[] = []
+  for (let index = 1; index < smoothedValues.length; index += 1) {
+    const stepDelta = steps[index] - steps[index - 1]
+    if (Math.abs(stepDelta) <= 1e-12) continue
+    slopes.push(Math.abs((smoothedValues[index] - smoothedValues[index - 1]) / stepDelta))
+  }
+  if (slopes.length < lossConvergenceThresholds.minimumPoints - 1) {
+    return insufficient(slopes.length)
+  }
+
+  const referenceSlopes = localSlopes(initialSteps, initialValues)
+  const finalSlopes = localSlopes(tailSteps, tailValues)
+  if (referenceSlopes.length === 0 || finalSlopes.length === 0) {
+    return insufficient(slopes.length)
   }
 
   const referenceSlope = mean(referenceSlopes)
   const finalSlope = mean(finalSlopes)
-  const values = cleaned.map((item) => item.value)
-  const stepSpan = Math.max(1e-8, cleaned.at(-1)!.step - cleaned[0].step)
-  const valueScale = Math.max(
-    Math.abs(median(values)),
-    Math.abs(quantile(values, 0.75) - quantile(values, 0.25)),
-    Math.abs(Math.max(...values) - Math.min(...values)),
-    1e-8,
-  )
-  const normalizedFinalSlope = finalSlope * stepSpan / valueScale
   const slopeRatio = referenceSlope > 1e-12
     ? finalSlope / referenceSlope
     : finalSlope <= 1e-12
       ? 0
       : Number.POSITIVE_INFINITY
-  const remainsActive = normalizedFinalSlope >= minimumNormalizedFinalSlope
-    && slopeRatio >= finalToReferenceSlopeRatio
+  // A literal maximum is overly sensitive to a single noisy step. The 90th
+  // percentile is used as a robust maximum while still reflecting the steepest
+  // visible part of the initial and final segments of the same curve.
+  const referenceMaxSlope = quantile(referenceSlopes, lossConvergenceThresholds.robustMaximumQuantile)
+  const finalMaxSlope = quantile(finalSlopes, lossConvergenceThresholds.robustMaximumQuantile)
+  const maxSlopeRatio = referenceMaxSlope > 1e-12
+    ? finalMaxSlope / referenceMaxSlope
+    : finalMaxSlope <= 1e-12
+      ? 0
+      : Number.POSITIVE_INFINITY
+  const normalizedFinalMaxSlope = finalMaxSlope * tailStepSpan / robustScale
+  const remainsActive = maxSlopeRatio >= lossConvergenceThresholds.minimumTailToInitialMaxSlopeRatio
+    && normalizedFinalMaxSlope >= lossConvergenceThresholds.minimumNormalizedTailMaxSlope
 
   return {
     key,
@@ -248,7 +315,14 @@ function analyzeLossSlope(points: LossTrendPoint[] | null | undefined, key: Tren
     reference_mean_abs_slope: referenceSlope,
     final_mean_abs_slope: finalSlope,
     final_to_reference_ratio: slopeRatio,
+    reference_max_abs_slope: referenceMaxSlope,
+    final_max_abs_slope: finalMaxSlope,
+    final_to_reference_max_ratio: maxSlopeRatio,
     normalized_final_slope: normalizedFinalSlope,
+    normalized_final_max_slope: normalizedFinalMaxSlope,
+    endpoint_change_rate: endpointChangeRate,
+    robust_scale: robustScale,
+    tail_point_count: tailPointCount,
     segment_count: slopes.length,
   }
 }
@@ -259,13 +333,14 @@ export function analyzeLossConvergence(points: LossTrendPoint[] | null | undefin
   ) as Record<TrendMetricKey, LossSlopeAnalysis>
   const validLosses = convergenceKeys.filter((key) => losses[key].status !== 'insufficient')
   const activeLosses = validLosses.filter((key) => losses[key].status === 'unconverged')
-  if (validLosses.length < 3) {
+  if (activeLosses.length > 0) {
+    return { status: 'unconverged', active_losses: activeLosses, valid_loss_count: validLosses.length, losses }
+  }
+  if (validLosses.length < lossConvergenceThresholds.minimumValidLossCountForConverged) {
     return { status: 'insufficient', active_losses: activeLosses, valid_loss_count: validLosses.length, losses }
   }
-  const requiredActiveLosses = Math.max(2, Math.ceil(validLosses.length / 2))
-  const unconverged = losses.total.status === 'unconverged' || activeLosses.length >= requiredActiveLosses
   return {
-    status: unconverged ? 'unconverged' : 'converged',
+    status: 'converged',
     active_losses: activeLosses,
     valid_loss_count: validLosses.length,
     losses,

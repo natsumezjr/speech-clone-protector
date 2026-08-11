@@ -71,10 +71,6 @@ export function formatAsrRatePercent(value: unknown) {
   return numberValue === null ? '未生成' : `${(numberValue * 100).toFixed(2)}%`
 }
 
-function formatCount(value: number) {
-  return Number.isInteger(value) ? String(value) : value.toFixed(2)
-}
-
 function completeEditCounts(value: AsrInsightEditCounts | undefined) {
   if (!value) return null
   const referenceLength = finiteNumber(value.referenceLength)
@@ -103,57 +99,47 @@ function fallbackEditCounts(value: AsrInsightFallback) {
   }
 }
 
-function resolvedShares(direct: AsrInsightErrorShares | undefined, counts: ReturnType<typeof completeEditCounts>, fallback: AsrInsightFallback) {
-  const fromCount = (count: number | undefined) => {
-    if (!counts || count === undefined) return null
-    return counts.totalErrors > 0 ? count / counts.totalErrors : 0
-  }
-  return {
-    substituteShare: firstNumber(direct?.substituteShare, fromCount(counts?.substitutions), fallback?.errorShares.substituteShare),
-    insertShare: firstNumber(direct?.insertShare, fromCount(counts?.insertions), fallback?.errorShares.insertShare),
-    deleteShare: firstNumber(direct?.deleteShare, fromCount(counts?.deletions), fallback?.errorShares.deleteShare),
-  }
+function higherIsBetterLevel(value: number, mediumThreshold: number, excellentThreshold: number) {
+  if (value >= excellentThreshold) return '优秀'
+  if (value >= mediumThreshold) return '中等'
+  return '较差'
 }
 
-function errorLevel(rate: number) {
-  if (rate === 0) return '未产生识别偏离'
-  if (rate < 0.1) return '识别偏离较小'
-  if (rate < 0.3) return '已产生一定识别偏离'
-  if (rate < 0.6) return '识别偏离较明显'
-  return '识别偏离显著'
+function asrEvidenceLevel(rate: number) {
+  return higherIsBetterLevel(rate, 0.2, 0.5)
 }
 
 function appendSharedSemanticInsights(items: string[], semantic: SharedSemanticInsightInput) {
   if (!semantic) {
-    items.push('保护任务共享语义指标：Token 指标与语义漂移尚未生成。')
+    items.push('Token 指标与语义表示漂移尚未生成。')
     return
   }
 
   const tokenChangeRate = finiteNumber(semantic.tokenChangeRate)
   const tokenErrorRate = finiteNumber(semantic.tokenErrorRate)
   const semanticDrift = finiteNumber(semantic.semanticDrift)
-  const rawDetails: string[] = []
-  if (tokenChangeRate !== null) {
-    rawDetails.push(`Token 变化率为 ${formatAsrRatePercent(tokenChangeRate)}，表示两侧较短 Token 序列内同位置 Token 不一致的比例`)
-  } else if (tokenErrorRate !== null) {
-    rawDetails.push(`Token 编辑率为 ${formatAsrRatePercent(tokenErrorRate)}，表示 Token 序列编辑距离相对原始 Token 序列长度的比例`)
-  }
-  if (semanticDrift !== null) {
-    rawDetails.push(semantic.semanticIsMfccProxy
-      ? `MFCC 代理漂移为 ${semanticDrift.toFixed(2)}，反映声学特征变化，不等同于深度语义表示`
-      : `语义表示漂移为 ${semanticDrift.toFixed(2)}，数值越高表示原音频与保护音频的连续语义表示差异越大`)
-  }
-  items.push(rawDetails.length
-    ? `保护任务共享语义指标：${rawDetails.join('；')}。两项由原音频和保护音频只计算一次，所有 ASR 模型共用。`
-    : '保护任务共享语义指标：Token 指标与语义漂移尚未生成。')
-
   const tokenScore = finiteNumber(semantic.tokenScore)
   const driftScore = finiteNumber(semantic.driftScore)
   const protectionSemanticScore = finiteNumber(semantic.protectionSemanticScore)
-  if (tokenScore !== null && driftScore !== null && protectionSemanticScore !== null) {
-    items.push(`语义干扰评分：Token 子分为 ${tokenScore.toFixed(2)} 分，语义漂移子分为 ${driftScore.toFixed(2)} 分；按 55% 与 45% 加权后，保护后音频语义干扰评分为 ${protectionSemanticScore.toFixed(2)} 分。分数越高，表示语义保护干扰越强。`)
-  } else if (protectionSemanticScore !== null) {
-    items.push(`语义干扰评分：保护后音频语义干扰评分为 ${protectionSemanticScore.toFixed(2)} 分；分数越高，表示语义保护干扰越强。`)
+  const tokenMetricName = tokenChangeRate !== null ? 'Token 变化率' : tokenErrorRate !== null ? 'Token 编辑率' : null
+  const tokenMetricValue = tokenChangeRate ?? tokenErrorRate
+  const driftMetricName = semantic.semanticIsMfccProxy ? 'MFCC 代理漂移' : '语义表示漂移'
+
+  // Token 句：变化率/编辑率 + Token 子分
+  const tokenParts: string[] = []
+  if (tokenMetricName && tokenMetricValue !== null) tokenParts.push(`${tokenMetricName}的值为 ${formatAsrRatePercent(tokenMetricValue)}`)
+  if (tokenScore !== null) tokenParts.push(`Token 子分的值为 ${tokenScore.toFixed(2)} 分，说明离散防护效果${higherIsBetterLevel(tokenScore, 50, 80)}`)
+
+  // 语义句：语义表示漂移 + 语义漂移子分 + ASR 语义保护分
+  const semanticParts: string[] = []
+  if (semanticDrift !== null) semanticParts.push(`${driftMetricName}的值为 ${semanticDrift.toFixed(2)}`)
+  if (driftScore !== null) semanticParts.push(`语义漂移子分的值为 ${driftScore.toFixed(2)} 分`)
+  if (protectionSemanticScore !== null) semanticParts.push(`ASR 语义保护分的值为 ${protectionSemanticScore.toFixed(2)} 分，说明语义保护效果${higherIsBetterLevel(protectionSemanticScore, 70, 85)}`)
+
+  if (tokenParts.length > 0) items.push(`${tokenParts.join('，')}。`)
+  if (semanticParts.length > 0) items.push(`${semanticParts.join('，')}。`)
+  if (tokenParts.length === 0 && semanticParts.length === 0) {
+    items.push('Token 指标与语义表示漂移尚未生成。')
   }
 }
 
@@ -167,14 +153,9 @@ export function generateAsrMetricInsights(
     ? explicitLevel
     : finiteNumber(input.cer) !== null && finiteNumber(input.wer) === null ? 'char' : 'word'
   const metricName = level === 'char' ? 'CER' : 'WER'
-  const auxiliaryMetricName = level === 'char' ? 'WER' : 'CER'
-  const unitName = level === 'char' ? '字符' : '词'
-  const primaryRate = level === 'char'
-    ? firstNumber(input.cer, fallback?.level === 'char' ? fallback.werOrCer : null)
-    : firstNumber(input.wer, fallback?.level === 'word' ? fallback.werOrCer : null)
-  const auxiliaryRate = level === 'char' ? finiteNumber(input.wer) : finiteNumber(input.cer)
-  const backendCounts = completeEditCounts(input.editCounts)
-  const counts = backendCounts ?? fallbackEditCounts(fallback)
+  const werRate = firstNumber(input.wer, fallback?.level === 'word' ? fallback.werOrCer : null)
+  const cerRate = firstNumber(input.cer, fallback?.level === 'char' ? fallback.werOrCer : null)
+  const counts = completeEditCounts(input.editCounts) ?? fallbackEditCounts(fallback)
   const rateFromCount = (count: number | undefined) => (
     counts && count !== undefined ? count / Math.max(counts.referenceLength, 1) : null
   )
@@ -183,53 +164,31 @@ export function generateAsrMetricInsights(
     insertions: firstNumber(input.insertRate, rateFromCount(counts?.insertions), fallback?.insertRate),
     deletions: firstNumber(input.deleteRate, rateFromCount(counts?.deletions), fallback?.deleteRate),
   }
-  const shares = resolvedShares(input.errorShares, counts, fallback)
   const items: string[] = []
 
-  if (primaryRate === null) {
-    const auxiliaryText = auxiliaryRate === null ? '' : `；辅助 ${auxiliaryMetricName} 为 ${formatAsrRatePercent(auxiliaryRate)}`
-    items.push(`本次按${unitName}统计的主指标 ${metricName} 尚未生成${auxiliaryText}，暂不能完成当前统计层级的数字解读。`)
+  if (werRate !== null && cerRate !== null) {
+    const werLevel = asrEvidenceLevel(werRate)
+    const cerLevel = asrEvidenceLevel(cerRate)
+    items.push(werLevel === cerLevel
+      ? `WER 的值为 ${formatAsrRatePercent(werRate)}，CER 的值为 ${formatAsrRatePercent(cerRate)}，说明 ASR 干扰效果${werLevel}。`
+      : `WER 的值为 ${formatAsrRatePercent(werRate)}，说明 ASR 干扰效果${werLevel}；CER 的值为 ${formatAsrRatePercent(cerRate)}，说明 ASR 干扰效果${cerLevel}。`)
+  } else if (werRate !== null) {
+    items.push(`WER 的值为 ${formatAsrRatePercent(werRate)}，说明 ASR 干扰效果${asrEvidenceLevel(werRate)}。`)
+  } else if (cerRate !== null) {
+    items.push(`CER 的值为 ${formatAsrRatePercent(cerRate)}，说明 ASR 干扰效果${asrEvidenceLevel(cerRate)}。`)
   } else {
-    const auxiliaryText = auxiliaryRate === null ? '' : `；辅助 ${auxiliaryMetricName} 为 ${formatAsrRatePercent(auxiliaryRate)}`
-    if (counts) {
-      const sourceText = backendCounts ? '后端统计' : '根据页面转写文本估算'
-      items.push(`文本错误：本次按${unitName}统计，${sourceText}共有 ${formatCount(counts.referenceLength)} 个参考${unitName}、${formatCount(counts.totalErrors)} 次编辑错误，${metricName} 为 ${formatAsrRatePercent(primaryRate)}${auxiliaryText}。`)
-    } else {
-      items.push(`文本错误：本次按${unitName}统计，${metricName} 为 ${formatAsrRatePercent(primaryRate)}${auxiliaryText}。`)
-    }
+    items.push(`${metricName} 尚未生成。`)
+  }
 
-    if (counts) {
-      const breakdown = [
-        { label: '替换', abbreviation: 'SR', count: counts.substitutions, rate: rates.substitutions, share: shares.substituteShare },
-        { label: '删除', abbreviation: 'DR', count: counts.deletions, rate: rates.deletions, share: shares.deleteShare },
-        { label: '插入', abbreviation: 'IR', count: counts.insertions, rate: rates.insertions, share: shares.insertShare },
-      ]
-      const maxCount = Math.max(...breakdown.map((item) => item.count))
-      const dominant = maxCount > 0 ? breakdown.filter((item) => item.count === maxCount).map((item) => item.label).join('、') : ''
-      const details = breakdown.map((item) => {
-        const annotations = [
-          item.rate === null ? null : `${item.abbreviation} ${formatAsrRatePercent(item.rate)}`,
-          item.share === null ? null : `占全部错误 ${formatAsrRatePercent(item.share)}`,
-        ].filter((value): value is string => Boolean(value))
-        return `${item.label} ${formatCount(item.count)} 次${annotations.length ? `（${annotations.join('，')}）` : ''}`
-      }).join('、')
-      items.push(`错误构成：${details}；${dominant ? `主要错误类型为${dominant}` : '三类编辑错误均为 0 次'}。`)
-    } else if (Object.values(rates).some((value) => value !== null)) {
-      const rateDetails = [
-        ['替换率 SR', rates.substitutions],
-        ['删除率 DR', rates.deletions],
-        ['插入率 IR', rates.insertions],
-      ].filter((item): item is [string, number] => item[1] !== null)
-      const maxRate = Math.max(...rateDetails.map(([, rate]) => rate))
-      const dominant = rateDetails.filter(([, rate]) => rate === maxRate).map(([label]) => label.replace(/率\s[A-Z]+$/, '')).join('、')
-      items.push(`错误构成：${rateDetails.map(([label, rate]) => `${label} 为 ${formatAsrRatePercent(rate)}`).join('、')}；占参考${unitName}比例最高的是${dominant}。`)
-    }
-
-    let conclusion = `识别影响：${metricName} 为 ${formatAsrRatePercent(primaryRate)}，${errorLevel(primaryRate)}。`
-    if (primaryRate > 1) {
-      conclusion += ` ${metricName} 允许超过 100%，因为插入、删除和替换的编辑错误总数可以多于参考${unitName}数，这不是百分比溢出。`
-    }
-    items.push(conclusion)
+  const errorRates = [
+    { label: '替换率', value: rates.substitutions },
+    { label: '删除率', value: rates.deletions },
+    { label: '插入率', value: rates.insertions },
+  ].filter((item): item is { label: string; value: number } => item.value !== null)
+  if (errorRates.length > 0) {
+    const maximum = Math.max(...errorRates.map((item) => item.value))
+    const dominant = errorRates.filter((item) => item.value === maximum).map((item) => item.label.replace('率', '')).join('、')
+    items.push(`${errorRates.map((item) => `${item.label}的值为 ${formatAsrRatePercent(item.value)}`).join('，')}，说明主要错误类型为${dominant}。`)
   }
 
   appendSharedSemanticInsights(items, semantic)

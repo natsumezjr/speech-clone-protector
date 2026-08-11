@@ -43,6 +43,7 @@ import { analyzeLossConvergence, analyzeLossTrend, type TrendDirection } from '@
 import { resolveEpsilonUsageRate } from '@/utils/perturbationMetrics'
 import { resolveAsrErrorShares } from '@/utils/metricNormalization'
 import { seconds } from '@/utils/format'
+import { cloneModelRequiresReferenceText, normalizeCloneReferenceTextRequest } from '@/utils/cloneModelCapabilities'
 
 const statusText: Record<TaskResult['status'], string> = {
   queued: '排队中',
@@ -172,7 +173,6 @@ export function ResultsPage() {
   const setCurrentTaskResult = useTaskStore((state) => state.setCurrentTaskResult)
   const missingTaskGuardRef = useRef(false)
   const [asrOverrideState, setAsrOverrideState] = useState<{ taskId: string; asr: AsrMetrics }>()
-  const [taskInfoOpen, setTaskInfoOpen] = useState(false)
   const [downloadOpen, setDownloadOpen] = useState(false)
   const { data, isLoading, error } = useQuery({
     queryKey: ['task-result', taskId],
@@ -238,10 +238,16 @@ export function ResultsPage() {
 
   return (
     <div className="-mx-5 max-w-none space-y-5 pb-6">
-      <SummaryBar result={displayData} onTaskInfoClick={() => setTaskInfoOpen(true)} onDownloadClick={() => setDownloadOpen(true)} />
+      <SummaryBar
+        result={displayData}
+        onTaskInfoClick={() => {
+          navigator.clipboard.writeText(displayData.taskId)
+          pushToast({ kind: 'success', title: '已复制', description: `任务 ID ${displayData.taskId} 已复制到剪贴板。` })
+        }}
+        onDownloadClick={() => setDownloadOpen(true)}
+      />
 
       <AudioCompare result={displayData} onAsrUpdated={(asr) => setAsrOverrideState({ taskId, asr })} />
-      {taskInfoOpen ? <TaskInfoModal result={displayData} onClose={() => setTaskInfoOpen(false)} /> : null}
       {downloadOpen ? <DownloadModal result={displayData} onClose={() => setDownloadOpen(false)} /> : null}
     </div>
   )
@@ -255,12 +261,23 @@ function SummaryBar({ result, onTaskInfoClick, onDownloadClick }: { result: Task
     refetchInterval: (query) => (hasRunningLinkedEvaluation(query.state.data) ? 1500 : false),
   })
   const cloneScore = summarizeCloneDefenseScore(result, linkedTaskStatus)
-  const hasCloneScore = cloneScore.score !== null
-  const cloneScoreText = cloneScore.score === null ? '未生成' : `${cloneScore.score.toFixed(2)} 分`
+  const overallScore = optionalNumber(result.protectionEvaluation?.overallScore)
+  const taskScore = optionalNumber(result.score)
+  const displayedScore = overallScore ?? taskScore ?? cloneScore.score
+  const scoreSource = overallScore !== null ? 'overall' : taskScore !== null ? 'task' : cloneScore.score !== null ? 'clone' : 'none'
+  const hasScore = displayedScore !== null
+  const scoreText = displayedScore === null ? '未生成' : `${displayedScore.toFixed(2)} 分`
+  const scoreTitle = scoreSource === 'overall'
+    ? '综合防护评分'
+    : scoreSource === 'task'
+      ? '保护任务评分'
+      : scoreSource === 'clone'
+        ? `基于 ${cloneScore.count} 次可用克隆评估的身份保护结果`
+        : '等待语音克隆测试'
 
   return (
     <section className="ui-card grid min-h-[74px] grid-cols-[250px_180px_250px_170px_230px_minmax(290px,1fr)] items-center px-5 max-2xl:grid-cols-[1.05fr_0.78fr_1.08fr_0.75fr_1fr_1.55fr] max-xl:h-auto max-xl:grid-cols-3 max-xl:gap-y-4 max-xl:py-4">
-      <SummaryItem icon={<ClipboardList />} label="保护任务" value={result.taskId} copy buttonTitle="查看任务信息" onClick={onTaskInfoClick} />
+      <SummaryItem icon={<ClipboardList />} label="保护任务" value={result.taskId} copy buttonTitle="点击复制任务 ID" onClick={onTaskInfoClick} />
       <SummaryItem icon={<ShieldCheck />} label="保护状态" value={statusText[result.status] ?? result.status} green={result.status === 'completed' || result.status === 'success'} />
       <SummaryItem icon={<Clock3 />} label="完成时间" value={result.completedAt ?? '-'} />
       <SummaryItem icon={<Clock3 />} label="处理耗时" value={typeof result.elapsedSec === 'number' ? formatElapsed(result.elapsedSec) : '-'} />
@@ -268,16 +285,16 @@ function SummaryBar({ result, onTaskInfoClick, onDownloadClick }: { result: Task
       <button
         type="button"
         onClick={onDownloadClick}
-        title={hasCloneScore ? `基于 ${cloneScore.count} 次可用克隆评估的综合结果` : '等待语音克隆测试'}
+        title={scoreTitle}
         className="flex h-full min-h-[58px] items-center justify-center gap-3 border-l border-cyan-300/10 pl-5 transition hover:bg-cyan-400/[0.035]"
       >
-        {hasCloneScore ? <ShieldCheck className="h-11 w-11 text-cyan-300" /> : null}
-        <p className={cn('shrink-0 font-mono text-[27px] font-black leading-none', hasCloneScore ? 'text-emerald-300' : 'text-rose-300')}>
-          {cloneScoreText}
+        {hasScore ? <ShieldCheck className="h-11 w-11 text-cyan-300" /> : null}
+        <p className={cn('shrink-0 font-mono text-[27px] font-black leading-none', hasScore ? 'text-emerald-300' : 'text-rose-300')}>
+          {scoreText}
         </p>
         <div className="min-w-0 text-left">
-          <p className="truncate text-[16px] font-black leading-tight text-cyan-100">{hasCloneScore ? '保护结果已生成' : '等待克隆测试'}</p>
-          <p className="mt-1 truncate text-xs text-slate-400">{hasCloneScore ? '点击此处下载' : '完成评估后自动更新'}</p>
+          <p className="truncate text-[16px] font-black leading-tight text-cyan-100">{hasScore ? '保护结果已生成' : '等待克隆测试'}</p>
+          <p className="mt-1 truncate text-xs text-slate-400">{hasScore ? '点击此处下载' : '完成评估后自动更新'}</p>
         </div>
       </button>
     </section>
@@ -337,17 +354,52 @@ function SectionTitle({ children, info }: { children: ReactNode; info?: boolean 
   )
 }
 
-function MetricInfoButton({ title, children }: { title: ReactNode; children: ReactNode }) {
-  const [open, setOpen] = useState(false)
-
+function MetricInfoDialog({
+  open,
+  title,
+  children,
+  onClose,
+  wide = false,
+}: {
+  open: boolean
+  title: ReactNode
+  children: ReactNode
+  onClose: () => void
+  wide?: boolean
+}) {
   useEffect(() => {
     if (!open) return undefined
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setOpen(false)
+      if (event.key === 'Escape') onClose()
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [open])
+  }, [onClose, open])
+
+  if (!open) return null
+  return createPortal(
+    <div className="fixed inset-0 z-[240] grid place-items-center bg-slate-950/80 px-4 py-8" role="dialog" aria-modal="true" aria-label="指标说明" onClick={onClose}>
+      <div className={cn('ui-card max-h-full w-full overflow-y-auto !bg-[#061426] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.56)]', wide ? 'max-w-[1012px]' : 'max-w-[572px]')} onClick={(event) => event.stopPropagation()}>
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <p className="text-xs font-bold tracking-[0.12em] text-cyan-300">指标说明</p>
+            <h3 className="mt-2 text-lg font-black text-white">{title}</h3>
+          </div>
+          <button type="button" onClick={onClose} className="grid h-9 w-9 shrink-0 place-items-center rounded-full border border-cyan-300/14 text-slate-300 hover:text-white" aria-label="关闭指标说明">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="mt-5 rounded-[8px] border border-cyan-300/12 bg-slate-950 p-4 text-sm leading-7 text-slate-300">
+          {typeof children === 'string' ? <RichMathText text={children} /> : children}
+        </div>
+      </div>
+    </div>,
+    document.body,
+  )
+}
+
+function MetricInfoButton({ title, children, wide = false }: { title: ReactNode; children: ReactNode; wide?: boolean }) {
+  const [open, setOpen] = useState(false)
 
   return (
     <>
@@ -364,25 +416,50 @@ function MetricInfoButton({ title, children }: { title: ReactNode; children: Rea
       >
         <Search className="h-3.5 w-3.5" />
       </button>
-      {open ? createPortal(
-        <div className="fixed inset-0 z-[240] grid place-items-center bg-slate-950/80 px-4" role="dialog" aria-modal="true" aria-label="指标说明" onClick={() => setOpen(false)}>
-          <div className="ui-card w-full max-w-[520px] !bg-[#061426] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.56)]" onClick={(event) => event.stopPropagation()}>
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <p className="text-xs font-bold tracking-[0.12em] text-cyan-300">指标说明</p>
-                <h3 className="mt-2 text-lg font-black text-white">{title}</h3>
-              </div>
-              <button type="button" onClick={() => setOpen(false)} className="grid h-9 w-9 shrink-0 place-items-center rounded-full border border-cyan-300/14 text-slate-300 hover:text-white" aria-label="关闭指标说明">
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-            <div className="mt-5 rounded-[8px] border border-cyan-300/12 bg-slate-950 p-4 text-sm leading-7 text-slate-300">
-              {typeof children === 'string' ? <RichMathText text={children} /> : children}
-            </div>
-          </div>
-        </div>,
-        document.body,
-      ) : null}
+      <MetricInfoDialog open={open} title={title} wide={wide} onClose={() => setOpen(false)}>{children}</MetricInfoDialog>
+    </>
+  )
+}
+
+function MetricInfoSurface({
+  title,
+  info,
+  children,
+  className,
+  tooltip,
+}: {
+  title: ReactNode
+  info?: ReactNode
+  children: ReactNode
+  className?: string
+  tooltip?: string
+}) {
+  const [open, setOpen] = useState(false)
+  const interactive = Boolean(info)
+  const accessibleTitle = typeof title === 'string' ? title : '该指标'
+
+  return (
+    <>
+      <div
+        className={cn(
+          className,
+          interactive && 'cursor-pointer transition duration-200 ease-out hover:-translate-y-0.5 hover:border-cyan-300/32 hover:bg-cyan-300/[0.035] hover:shadow-[0_14px_38px_rgba(34,211,238,0.10)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/45 motion-reduce:transform-none motion-reduce:transition-none',
+        )}
+        role={interactive ? 'button' : undefined}
+        tabIndex={interactive ? 0 : undefined}
+        aria-label={interactive ? `查看${accessibleTitle}说明` : undefined}
+        title={tooltip ?? (interactive ? '点击查看指标说明' : undefined)}
+        onClick={interactive ? () => setOpen(true) : undefined}
+        onKeyDown={interactive ? (event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault()
+            setOpen(true)
+          }
+        } : undefined}
+      >
+        {children}
+      </div>
+      {info ? <MetricInfoDialog open={open} title={title} onClose={() => setOpen(false)}>{info}</MetricInfoDialog> : null}
     </>
   )
 }
@@ -481,7 +558,7 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
   const ttsOptions = useMemo(() => ttsModelOptions.filter(isAvailableModel).map((option) => option.value), [ttsModelOptions])
   const selectedTtsOption = ttsModelOptions.find((option) => option.value === cloneForm.model) ?? ttsModelOptions[0]
   const oneClickAsrLimit = Math.max(1, asrOptions.filter(isAvailableModel).length)
-  const oneClickCloneLimit = Math.max(1, ttsModelOptions.filter(isAvailableModel).reduce((count, option) => count + (option.promptRequired ? 2 : 1), 0))
+  const oneClickCloneLimit = Math.max(1, ttsModelOptions.filter(isAvailableModel).reduce((count, option) => count + (cloneModelRequiresReferenceText(option) ? 2 : 1), 0))
   const cloneLanguages = useMemo(
     () => (selectedTtsOption?.languages?.length ? selectedTtsOption.languages : runtimeConfig?.clone?.languages?.length ? runtimeConfig.clone.languages : ['zh-cn', 'en']),
     [runtimeConfig, selectedTtsOption],
@@ -786,20 +863,20 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
   }
 
   const validateCloneRequest = (request: CloneVoiceRequest) => {
-    const modelOption = ttsModelOptions.find((option) => option.value === request.model)
+    const modelOption = cloneModelOption(ttsModelOptions, request.model)
     const modelLanguages = modelOption?.languages?.length ? modelOption.languages : cloneLanguages
     if (!request.text.trim()) return '请输入用于语音克隆的文本。'
-    if (!ttsOptions.includes(request.model) || !modelOption) return '请选择当前可用的克隆模型。'
-    if (modelOption.promptRequired && request.annotationSource !== 'asr' && !request.speakerPrompt?.trim()) return '该模型需要填写一条人工标注。'
-    if (modelOption.promptRequired && request.annotationSource === 'asr' && (!request.annotationAsrSubId || !request.originalSpeakerPrompt?.trim() || !request.protectedSpeakerPrompt?.trim())) return '请选择一条同时包含原始音频和保护音频转写的 ASR 标注。'
+    if (!modelOption || !isAvailableModel(modelOption)) return '请选择当前可用的克隆模型。'
+    if (cloneModelRequiresReferenceText(modelOption) && request.annotationSource !== 'asr' && !request.speakerPrompt?.trim()) return '所选模型需要参考音频对应文本，请填写人工标注。'
+    if (cloneModelRequiresReferenceText(modelOption) && request.annotationSource === 'asr' && (!request.annotationAsrSubId || !request.originalSpeakerPrompt?.trim() || !request.protectedSpeakerPrompt?.trim())) return '所选模型需要参考音频对应文本，请选择一条同时包含原始音频和保护音频转写的 ASR 标注。'
     if (!modelLanguages.includes(request.language ?? '')) return '请选择当前模型支持的克隆语言。'
     if (!cloneSpeeds.includes(Number(request.speed))) return '请选择当前支持的克隆语速。'
     return undefined
   }
 
   const submitCloneTest = async (requestOverride = cloneForm) => {
-    const modelOption = ttsModelOptions.find((option) => option.value === requestOverride.model)
-    const request = normalizeCloneAnnotationRequest(requestOverride, modelOption)
+    const modelOption = cloneModelOption(ttsModelOptions, requestOverride.model)
+    const request = normalizeCloneReferenceTextRequest(requestOverride, modelOption)
     const validationError = validateCloneRequest(request)
     if (validationError) {
       setCloneError(validationError)
@@ -853,7 +930,7 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
       language: requestedLanguage,
       speed: cloneSpeeds.includes(Number(cloneForm.speed)) ? cloneForm.speed : 1,
     }
-    if (modelOption.promptRequired && latestAnnotation) {
+    if (cloneModelRequiresReferenceText(modelOption) && latestAnnotation) {
       quickRequest.annotationSource = 'asr'
       quickRequest.annotationAsrSubId = latestAnnotation.asrSubId
       quickRequest.annotationAsrModel = latestAnnotation.asr?.model
@@ -861,7 +938,7 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
       quickRequest.speakerPrompt = latestAnnotation.asr?.originalText ?? ''
       quickRequest.originalSpeakerPrompt = latestAnnotation.asr?.originalText ?? ''
       quickRequest.protectedSpeakerPrompt = latestAnnotation.asr?.protectedText ?? ''
-    } else if (modelOption.promptRequired) {
+    } else if (cloneModelRequiresReferenceText(modelOption)) {
       quickRequest.annotationSource = 'manual'
       quickRequest.speakerPrompt = manualPrompt
       quickRequest.originalSpeakerPrompt = undefined
@@ -870,7 +947,7 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
       quickRequest.annotationAsrModel = undefined
       quickRequest.annotationCreatedAt = undefined
     }
-    const normalizedQuickRequest = normalizeCloneAnnotationRequest(quickRequest, modelOption)
+    const normalizedQuickRequest = normalizeCloneReferenceTextRequest(quickRequest, modelOption)
     setCloneForm(normalizedQuickRequest)
     await submitCloneTest(normalizedQuickRequest)
   }
@@ -1085,7 +1162,7 @@ function ProtectTab({
           </div>
         </div>
       </div>
-      <div className="grid grid-cols-[minmax(0,1fr)_minmax(360px,0.72fr)] items-stretch gap-5 max-xl:grid-cols-1">
+      <div className="grid grid-cols-[minmax(0,1.15fr)_minmax(420px,1fr)] items-stretch gap-5 max-xl:grid-cols-1">
         <TrendPanel result={result} embedded />
         <div className="relative min-h-0 max-xl:static">
           <div className="absolute inset-0 min-h-0 max-xl:static">
@@ -1195,7 +1272,6 @@ function ComprehensiveProtectionEvaluation({ evaluation }: { evaluation?: Protec
   const complete = evaluation?.status === 'complete' && overallScore !== null && dimensions.every((dimension) => optionalNumber(dimension.score) !== null)
   const animatedOverall = useAnimatedScore(overallScore)
   const missing = dimensions.filter((dimension) => optionalNumber(dimension.score) === null)
-  const recommendations = evaluation?.recommendations ?? []
 
   return (
     <section className="relative overflow-hidden rounded-[11px] border border-cyan-300/16 bg-slate-950/16 p-5 shadow-[0_18px_60px_rgba(2,132,199,0.06)] transition duration-200 ease-out hover:-translate-y-0.5 hover:border-cyan-300/26 hover:shadow-[0_22px_70px_rgba(2,132,199,0.1)] motion-reduce:transform-none motion-reduce:transition-none">
@@ -1204,15 +1280,18 @@ function ComprehensiveProtectionEvaluation({ evaluation }: { evaluation?: Protec
         <div>
           <div className="flex items-center gap-2">
             <SectionTitle>综合防护评估</SectionTitle>
-            <MetricInfoButton title="综合防护评分">
-              <MetricFormulaContent
-                description="六项对应测试均生成后，使用加权几何平均计算综合分数。"
-                formulas={[
-                  'S_{\\mathrm{overall}}=\\exp\\!\\left(\\sum_{i=1}^{6}\\alpha_i\\ln(\\max(S_i,1))\\right)',
-                  '(\\alpha_1,\\ldots,\\alpha_6)=(0.20,0.10,0.20,0.15,0.15,0.20)',
-                ]}
-                note="任一必需分数缺失时不以 0 或 100 代替，综合分数保持待生成。"
-              />
+            <MetricInfoButton title="综合防护评分" wide>
+              <div className="space-y-5">
+                <MetricFormulaContent
+                  description="六项对应测试均生成后，使用加权几何平均计算综合分数。"
+                  formulas={[
+                    'S_{\\mathrm{overall}}=\\exp\\!\\left(\\sum_{i=1}^{6}\\alpha_i\\ln(\\max(S_i,1))\\right)',
+                    '(\\alpha_1,\\ldots,\\alpha_6)=(0.20,0.10,0.20,0.15,0.15,0.20)',
+                  ]}
+                  note="任一必需分数缺失时不以 0 或 100 代替，综合分数保持待生成。"
+                />
+                <ProtectionScoreThresholdTable />
+              </div>
             </MetricInfoButton>
           </div>
           <p className="mt-2 text-xs leading-5 text-slate-500">六项分数均来自实际测试结果，分数越高表示对应防护效果越强。</p>
@@ -1227,7 +1306,7 @@ function ComprehensiveProtectionEvaluation({ evaluation }: { evaluation?: Protec
           <ProtectionHexRadar dimensions={dimensions} />
         </div>
         <div className="flex flex-col items-center justify-center rounded-[9px] border border-cyan-300/12 bg-[radial-gradient(circle_at_50%_18%,rgba(34,211,238,0.11),transparent_58%)] px-5 py-7 text-center">
-          <p className="text-xs font-black tracking-[0.14em] text-cyan-200/80">综合防护评分</p>
+          <p className="text-[17px] font-black tracking-[0.10em] text-cyan-100">综合防护评分</p>
           <p className={cn('mt-5 bg-gradient-to-r from-cyan-200 via-emerald-200 to-violet-200 bg-clip-text font-mono text-[42px] font-black leading-none text-transparent drop-shadow-[0_0_18px_rgba(103,232,249,0.12)]', overallScore === null && 'text-slate-500')}>
             {animatedOverall === null ? '待生成' : <MathText formula={`${animatedOverall.toFixed(2)}\\,/\\,100`} />}
           </p>
@@ -1249,20 +1328,6 @@ function ComprehensiveProtectionEvaluation({ evaluation }: { evaluation?: Protec
           </div>
         </div>
       </div>
-      <div className="mt-4 rounded-[9px] border border-cyan-300/12 bg-slate-950/20 px-4 py-3">
-        <h3 className="text-xs font-black tracking-[0.08em] text-cyan-100">调参建议</h3>
-        {recommendations.length ? (
-          <div className="mt-2 flex flex-wrap gap-2">
-            {recommendations.map((recommendation) => (
-              <span key={`${recommendation.key}-${recommendation.message}`} className="rounded-[6px] border border-cyan-300/12 bg-cyan-400/[0.055] px-3 py-2 text-xs leading-5 text-slate-300">
-                <RichMathText text={recommendation.message} />
-              </span>
-            ))}
-          </div>
-        ) : (
-          <p className="mt-2 text-xs leading-5 text-slate-500">{complete ? '当前各项没有触发明确的调参建议。' : '待生成更多对应测试结果后给出调参建议。'}</p>
-        )}
-      </div>
     </section>
   )
 }
@@ -1275,6 +1340,45 @@ function MetricFormulaContent({ description, formulas, note }: { description: Re
         <MathBlock key={formula} formula={formula} className="rounded-[6px] border border-cyan-300/10 bg-cyan-400/[0.035] px-2 text-[13px] text-cyan-50" />
       ))}
       {note ? <p>{note}</p> : null}
+    </div>
+  )
+}
+
+function ProtectionScoreThresholdTable() {
+  const rows = [
+    ['WER（仅证据）', '<20\\%', '20\\%\\text{～}50\\%', '\\ge50\\%'],
+    ['CER（仅证据）', '<20\\%', '20\\%\\text{～}50\\%', '\\ge50\\%'],
+    ['Drift/Token 子分', '<50', '50\\text{～}80', '\\ge80'],
+    ['ASR 语义保护分', '<70', '70\\text{～}85', '\\ge85'],
+    ['Protected SIM', '>0.45', '0.25\\text{～}0.45', '\\le0.25'],
+    ['Protected 声纹距离', '<0.55', '0.55\\text{～}0.75', '\\ge0.75'],
+    ['克隆身份保护分', '<70', '70\\text{～}85', '\\ge85'],
+    ['克隆语义保护分', '<70', '70\\text{～}85', '\\ge85'],
+    ['克隆文本误差/变化率', '<10\\%', '10\\%\\text{～}30\\%', '\\ge30\\%'],
+    ['克隆质量退化分', '<70', '70\\text{～}85', '\\ge85'],
+  ]
+  return (
+    <div>
+      <h4 className="mb-3 text-sm font-black text-cyan-100">结果解读分档参考</h4>
+      <div className="overflow-x-auto rounded-[7px] border border-cyan-300/12">
+        <table className="w-full min-w-[720px] border-collapse text-left text-xs leading-5">
+          <thead className="bg-cyan-400/[0.08] text-cyan-100">
+            <tr>
+              {['内容', '偏低/较差', '中等', '较高/优秀'].map((heading) => <th key={heading} className="border-b border-cyan-300/12 px-3 py-2.5 font-black">{heading}</th>)}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(([label, weak, medium, strong]) => (
+              <tr key={label} className="border-b border-cyan-300/8 last:border-0 odd:bg-white/[0.012]">
+                <th className="whitespace-nowrap px-3 py-2 font-bold text-slate-200">{label}</th>
+                <td className="whitespace-nowrap px-3 py-2 text-rose-200"><MathText formula={weak} /></td>
+                <td className="whitespace-nowrap px-3 py-2 text-amber-100"><MathText formula={medium} /></td>
+                <td className="whitespace-nowrap px-3 py-2 text-emerald-200"><MathText formula={strong} /></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   )
 }
@@ -1340,8 +1444,8 @@ function ProtectionHexRadar({ dimensions }: { dimensions: ProtectionEvaluationDi
         ) : null}
         {axes.map((axis) => (
           <g key={`label-${axis.dimension.key}`}>
-            <text x={axis.labelX} y={axis.labelY} textAnchor={axis.labelX < centerX - 15 ? 'end' : axis.labelX > centerX + 15 ? 'start' : 'middle'} fontSize="11" fontWeight="700" fill="#cbd5e1">{protectionRadarLabels[axis.dimension.key]}</text>
-            <text x={axis.labelX} y={axis.labelY + 16} textAnchor={axis.labelX < centerX - 15 ? 'end' : axis.labelX > centerX + 15 ? 'start' : 'middle'} fontSize="11" fill={optionalNumber(axis.dimension.score) === null ? '#64748b' : '#67e8f9'}>{optionalNumber(axis.dimension.score) === null ? '待生成' : optionalNumber(axis.dimension.score)?.toFixed(2)}</text>
+            <text x={axis.labelX} y={axis.labelY} textAnchor={axis.labelX < centerX - 15 ? 'end' : axis.labelX > centerX + 15 ? 'start' : 'middle'} fontSize="11.5" fontWeight="800" fill="#334155">{protectionRadarLabels[axis.dimension.key]}</text>
+            <text x={axis.labelX} y={axis.labelY + 17} textAnchor={axis.labelX < centerX - 15 ? 'end' : axis.labelX > centerX + 15 ? 'start' : 'middle'} fontSize="12" fontWeight="800" fill={optionalNumber(axis.dimension.score) === null ? '#475569' : '#0e7490'}>{optionalNumber(axis.dimension.score) === null ? '待生成' : optionalNumber(axis.dimension.score)?.toFixed(2)}</text>
           </g>
         ))}
       </svg>
@@ -1449,7 +1553,6 @@ function AsrTab({ result, asrEval, editStats, history, batches = [], selectedAsr
   const tokenDiff = sharedSemantic?.tokenChangeRate ?? sharedSemantic?.tokenErrorRate
   const tokenUsesEditDistance = sharedSemantic?.tokenChangeRate == null && sharedSemantic?.tokenErrorRate != null
   const tokenDetailLabel = tokenUsesEditDistance ? 'Token 编辑率' : 'Token 变化率'
-  const textMetricLevel = asrEval.metricLevel ?? editStats?.level ?? 'word'
   const tokenUnavailableReason = tokenDiff == null
     ? sharedSemantic?.error || sharedSemantic?.reason || metricReason(result, ['semanticEval.tokenChangeRate', 'semanticEval.tokenErrorRate', 'asrEval.tokenChangeRate', 'asrEval.tokenErrorRate'])
     : ''
@@ -1457,9 +1560,6 @@ function AsrTab({ result, asrEval, editStats, history, batches = [], selectedAsr
     ? '当前回退值为 \\(R_{\\mathrm{token}}=\\frac{D_{\\mathrm{edit}}(z,z^{\\prime})}{\\max(|z|,1)}\\)，即保护前后离散语音 Token 序列的编辑距离除以原始序列长度。'
     : '后端使用语义 tokenizer 编码保护前后音频，并按 \\(R_{\\mathrm{token}}=\\frac{1}{\\max(L,1)}\\sum_{i=1}^{L}\\mathbf{1}[z_i\\ne z_i^{\\prime}],\\ L=\\min(|z|,|z^{\\prime}|)\\) 统计两侧较短序列内同位置离散语音 Token 不同的比例。'
   const tokenFoot = `${tokenUnavailableReason ? `${tokenUnavailableReason}。` : ''}${tokenFormulaText}该指标不按 ASR 文本的字符或单词切分。`
-  const metricLevelFoot = textMetricLevel === 'char'
-    ? '中文按字/字符（char）作为 CER 与文本编辑操作的统计单位。'
-    : '英文按词（word）作为 WER 与文本编辑操作的统计单位。'
   const semanticSourceInfo = metricSource(result, ['semanticEval.semanticDrift', 'asrEval.semanticDrift'])
   const semanticIsMfccProxy = String(semanticSourceInfo?.source ?? '').toLowerCase() === 'mfcc_proxy'
   const semanticFoot = sharedSemantic?.semanticDrift == null
@@ -1488,19 +1588,24 @@ function AsrTab({ result, asrEval, editStats, history, batches = [], selectedAsr
         </div>
         <TextBox title="保护音频转写（ASR）" text={protectedText || '未生成'} foot="红色为新增内容，绿色删除线为原文缺失内容" content={diffOps.length ? renderDiffOps(diffOps) : undefined} />
       </div>
-      <div className="grid grid-cols-[1.05fr_0.95fr] gap-5 max-lg:grid-cols-1">
-        <MetricPanel title="保护任务共享语义指标">
-          <ScoreBox label={semanticDetailLabel} value={formatMetricValue(sharedSemantic?.semanticDrift, 'number')} foot={semanticFoot} />
-          <ScoreBox label={tokenDetailLabel} value={formatAsrRatePercent(tokenDiff)} foot={tokenFoot} />
-          <ScoreBox label="指标层级" value={textMetricLevel} foot={metricLevelFoot} />
-        </MetricPanel>
-        <RateBreakdown substituteShare={errorShares?.substituteShare} insertShare={errorShares?.insertShare} />
+      <div className="grid grid-cols-[minmax(300px,1fr)_minmax(0,2fr)] items-stretch gap-5 max-lg:grid-cols-1">
+        <div className="min-h-0 space-y-5">
+          <MetricPanel title="保护任务共享语义指标">
+            <ScoreBox label={semanticDetailLabel} value={formatMetricValue(sharedSemantic?.semanticDrift, 'number')} foot={semanticFoot} />
+            <ScoreBox label={tokenDetailLabel} value={formatAsrRatePercent(tokenDiff)} foot={tokenFoot} />
+          </MetricPanel>
+          <RateBreakdown substituteShare={errorShares?.substituteShare} insertShare={errorShares?.insertShare} />
+        </div>
+        <div className="relative min-h-0 max-lg:min-h-[320px]">
+          <div className="absolute inset-0 max-lg:static max-lg:h-[360px]">
+            <InsightPanel
+              title="ASR 保护结果解读"
+              items={generateAsrMetricInsights(asrEval, editStats, sharedSemantic ? { ...sharedSemantic, semanticIsMfccProxy } : null)}
+              fillHeight
+            />
+          </div>
+        </div>
       </div>
-      <InsightPanel
-        title="ASR 结果解读"
-        items={generateAsrMetricInsights(asrEval, editStats, sharedSemantic ? { ...sharedSemantic, semanticIsMfccProxy } : null)}
-        naturalHeight
-      />
     </div>
   )
 }
@@ -1557,13 +1662,16 @@ function CloneTab({ result, cloneResult, cloneEval, cloneHistory, cloneBatches, 
     cloneDetail = <EmptyState title="未执行语音克隆测试" text="请在防护工作台选择已完成的保护任务并开始语音克隆测试。" />
   } else {
     const cloneReason = cloneEval.reason ? shortMetricReason(cloneEval.reason) : ''
-    const cloneModelLabel = shortCloneModelName(cloneEval.cloneModel ?? cloneResult?.request.model)
-    const cloneModelValue = cloneEval.cloneModel ?? cloneResult?.request.model
+    const cloneRequest = cloneResult?.request ?? selectedCloneEntry?.request
+    const cloneModelLabel = shortCloneModelName(cloneEval.cloneModel ?? cloneRequest?.model)
+    const cloneModelValue = cloneEval.cloneModel ?? cloneRequest?.model
     const cloneModelOption = cloneModelOptions.find((item) => item.value === cloneModelValue || item.backendValue === cloneModelValue) ?? null
+    const cloneAnnotation = cloneAnnotationTitle(cloneRequest, cloneModelOption, cloneResult?.fineTune)
+    const cloneTitle = cloneAnnotation ? `TTS 克隆 · ${cloneAnnotation} · ${cloneModelLabel}` : cloneModelLabel
     cloneDetail = (
       <>
         <div className="flex flex-wrap items-center justify-center gap-2 text-center text-sm font-black text-violet-100">
-          <span>TTS 克隆 · {cloneModelLabel}</span>
+          <span>{cloneTitle}</span>
           {cloneModelOption ? <ModelInfoButton model={cloneModelOption} onOpen={setInformationModel} /> : null}
         </div>
         <div id="clone-result-detail" className="scroll-mt-24 space-y-5">
@@ -1574,10 +1682,7 @@ function CloneTab({ result, cloneResult, cloneEval, cloneHistory, cloneBatches, 
           {cloneEval.protectedCloneAudio ? <AudioCard title="保护后克隆语音" audio={cloneEval.protectedCloneAudio} color="#f59e0b" /> : <EmptyMetricCard title="保护后克隆语音" text="暂未生成保护后克隆语音" />}
         </div>
         <CloneCoreMetricCards cloneEval={cloneEval} />
-        <CloneSemanticExpressionPanel cloneEval={cloneEval} />
-        <div className="grid grid-cols-1 gap-5">
-          <InsightPanel title="克隆结果解读" items={generateCloneInsights(cloneEval)} />
-        </div>
+        <CloneSemanticExpressionPanel cloneEval={cloneEval} insights={generateCloneInsights(cloneEval)} />
         </div>
       </>
     )
@@ -1660,21 +1765,19 @@ function RateBreakdown({ substituteShare, insertShare }: { substituteShare?: num
     ['替换占比', substituteShare, 'bg-yellow-300'],
     ['插入占比', insertShare, 'bg-red-300'],
   ] as const
+  const info = (
+    <MetricFormulaContent
+      description="分别统计替换与插入在全部编辑错误中的占比，用于判断保护音频主要通过哪类文本变化干扰识别。"
+      formulas={[
+        'p_{\\mathrm{sub}}=\\frac{S}{\\max(S+D+I,1)}',
+        'p_{\\mathrm{ins}}=\\frac{I}{\\max(S+D+I,1)}',
+      ]}
+      note="分母中的删除数量仍参与总错误数计算；页面只单独展示替换与插入两类占比。"
+    />
+  )
   return (
-    <section className="rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
-      <div className="flex items-start justify-between gap-3">
-        <SectionTitle>错误类型占比</SectionTitle>
-        <MetricInfoButton title="错误类型占比">
-          <MetricFormulaContent
-            description="分别统计替换与插入在全部编辑错误中的占比，用于判断保护音频主要通过哪类文本变化干扰识别。"
-            formulas={[
-              'p_{\\mathrm{sub}}=\\frac{S}{\\max(S+D+I,1)}',
-              'p_{\\mathrm{ins}}=\\frac{I}{\\max(S+D+I,1)}',
-            ]}
-            note="分母中的删除数量仍参与总错误数计算；页面只单独展示替换与插入两类占比。"
-          />
-        </MetricInfoButton>
-      </div>
+    <MetricInfoSurface title="错误类型占比" info={info} className="rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-4">
+      <SectionTitle>错误类型占比</SectionTitle>
       <div className="mt-5 space-y-4">
         {rows.map(([label, value, color]) => {
           const numberValue = optionalNumber(value)
@@ -1695,7 +1798,7 @@ function RateBreakdown({ substituteShare, insertShare }: { substituteShare?: num
           )
         })}
       </div>
-    </section>
+    </MetricInfoSurface>
   )
 }
 
@@ -1768,40 +1871,42 @@ function CloneCoreMetricCards({ cloneEval }: { cloneEval: CloneEval }) {
   )
 }
 
-function CloneCoreCardHeader({ children, action, className }: { children: ReactNode; action: ReactNode; className?: string }) {
+function CloneCoreCardHeader({ children, className }: { children: ReactNode; className?: string }) {
   return (
-    <div className="relative min-h-7 pr-9">
-      <div className={cn('flex min-h-7 items-center gap-2 text-xs font-black', className)}>{children}</div>
-      <div className="absolute right-0 top-0">{action}</div>
-    </div>
+    <div className={cn('flex min-h-9 items-center gap-2 text-[14px] font-black leading-5', className)}>{children}</div>
   )
 }
 
 function CloneDistanceCoreCard({ before, after, delta, reason }: { before: number | null; after: number | null; delta: number | null; reason?: string | null }) {
   const available = before !== null && after !== null
-  const infoAction = (
-    <MetricInfoButton title="指标信息">
-      <MetricFormulaContent
-        description="ECAPA-TDNN 是用于表示说话人声音身份的声纹模型。这里分别计算原音频与两段克隆语音的声纹距离。"
-        formulas={[
-          '\\operatorname{SIM}(a,b)=\\cos(\\operatorname{Emb}(a),\\operatorname{Emb}(b))',
-          'd^0=1-\\operatorname{SIM}(x,c^0),\\qquad d^1=1-\\operatorname{SIM}(x,c^1)',
-          '\\Delta d=d^1-d^0',
-        ]}
-        note="右侧距离越大，表示保护后的克隆声音越远离原说话人。"
-      />
-    </MetricInfoButton>
+  const info = (
+    <MetricFormulaContent
+      description="ECAPA-TDNN 是用于表示说话人声音身份的声纹模型。这里分别计算原音频与两段克隆语音的声纹距离。"
+      formulas={[
+        '\\operatorname{SIM}(a,b)=\\cos(\\operatorname{Emb}(a),\\operatorname{Emb}(b))',
+        'd^0=1-\\operatorname{SIM}(x,c^0),\\qquad d^1=1-\\operatorname{SIM}(x,c^1)',
+        '\\Delta d=d^1-d^0',
+      ]}
+      note="右侧距离越大，表示保护后的克隆声音越远离原说话人。"
+    />
   )
+  const deltaText = delta === null
+    ? '变化未生成'
+    : delta > 0
+      ? `身份距离增大 ${delta.toFixed(2)}`
+      : delta < 0
+        ? `身份距离减小 ${Math.abs(delta).toFixed(2)}`
+        : '身份距离无明显变化'
   return (
-    <div className="relative min-h-[154px] overflow-hidden rounded-[9px] border border-cyan-300/14 bg-slate-950/22 p-4 transition duration-200 ease-out hover:-translate-y-0.5 hover:border-cyan-300/30 hover:shadow-[0_14px_36px_rgba(34,211,238,0.08)] motion-reduce:transform-none motion-reduce:transition-none" title={!available ? friendlyCloneMetricReason(reason) : undefined}>
-      <CloneCoreCardHeader action={infoAction} className="text-cyan-100"><Fingerprint className="h-4 w-4 text-cyan-300" />克隆后身份差异（核心）</CloneCoreCardHeader>
+    <MetricInfoSurface title="指标信息" info={info} tooltip={!available ? friendlyCloneMetricReason(reason) : undefined} className="relative min-h-[154px] overflow-hidden rounded-[9px] border border-cyan-300/14 bg-slate-950/22 p-4">
+      <CloneCoreCardHeader className="text-cyan-100"><Fingerprint className="h-4 w-4 text-cyan-300" />克隆后身份差异（核心）</CloneCoreCardHeader>
       {available ? (
         <>
-          <div className="mt-6 flex items-center justify-center gap-2 font-mono text-[25px] font-black"><span className="text-slate-200">{before.toFixed(2)}</span><MathText formula={'\\longrightarrow'} className="text-slate-500" /><span className="text-emerald-300">{after.toFixed(2)}</span></div>
-          <p className={cn('mt-3 text-center font-mono text-sm font-black', (delta ?? 0) >= 0 ? 'text-emerald-300' : 'text-rose-300')}>{delta === null ? '变化未生成' : <MathText formula={`\\Delta d=${delta >= 0 ? '+' : ''}${delta.toFixed(2)}`} />}</p>
+          <div className="mt-5 flex items-center justify-center gap-3 font-mono text-[34px] font-black leading-none"><span className="text-slate-100">{before.toFixed(2)}</span><MathText formula={'\\longrightarrow'} className="text-[33px] text-slate-400" /><span className="text-emerald-400">{after.toFixed(2)}</span></div>
+          <p className={cn('mt-4 text-center text-[15px] font-black', (delta ?? 0) >= 0 ? 'text-emerald-300' : 'text-rose-300')}>{deltaText}</p>
         </>
       ) : <p className="mt-7 text-center text-sm font-bold text-slate-500">待生成</p>}
-    </div>
+    </MetricInfoSurface>
   )
 }
 
@@ -1810,16 +1915,16 @@ function CloneScoreCoreCard({ title, score, reason, detail, icon, tone, info }: 
   const toneClass = tone === 'violet' ? 'text-violet-300' : tone === 'amber' ? 'text-amber-300' : 'text-cyan-300'
   const barClass = tone === 'violet' ? 'from-violet-400 to-fuchsia-300' : tone === 'amber' ? 'from-amber-400 to-orange-300' : 'from-cyan-400 to-emerald-300'
   return (
-    <div className="min-h-[154px] rounded-[9px] border border-cyan-300/14 bg-slate-950/22 p-4 transition duration-200 ease-out hover:-translate-y-0.5 hover:border-cyan-300/30 hover:shadow-[0_14px_36px_rgba(34,211,238,0.08)] motion-reduce:transform-none motion-reduce:transition-none" title={score === null ? friendlyCloneMetricReason(reason) : undefined}>
-      <CloneCoreCardHeader action={<MetricInfoButton title={title}>{info}</MetricInfoButton>} className="text-slate-200"><span className={toneClass}>{icon}</span>{title}</CloneCoreCardHeader>
+    <MetricInfoSurface title={title} info={info} tooltip={score === null ? friendlyCloneMetricReason(reason) : undefined} className="min-h-[154px] rounded-[9px] border border-cyan-300/14 bg-slate-950/22 p-4">
+      <CloneCoreCardHeader className="text-slate-100"><span className={toneClass}>{icon}</span>{title}</CloneCoreCardHeader>
       <p className={cn('mt-5 text-center font-mono text-[30px] font-black leading-none', score === null ? 'text-slate-500' : toneClass)}>{animatedScore === null ? '待生成' : `${animatedScore.toFixed(2)} 分`}</p>
       <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-slate-800">{animatedScore !== null ? <div className={cn('h-full rounded-full bg-gradient-to-r', barClass)} style={{ width: `${clamp(animatedScore, 0, 100)}%` }} /> : null}</div>
       <p className="mt-2 truncate text-center text-[11px] text-slate-500">{score === null ? friendlyCloneMetricReason(reason) : detail}</p>
-    </div>
+    </MetricInfoSurface>
   )
 }
 
-function CloneSemanticExpressionPanel({ cloneEval }: { cloneEval: CloneEval }) {
+function CloneSemanticExpressionPanel({ cloneEval, insights }: { cloneEval: CloneEval; insights: string[] }) {
   const targetText = cloneEval.targetText ?? ''
   const cleanText = cloneEval.cleanCloneTranscription ?? ''
   const protectedText = cloneEval.protectedCloneTranscription ?? ''
@@ -1834,10 +1939,17 @@ function CloneSemanticExpressionPanel({ cloneEval }: { cloneEval: CloneEval }) {
         <CloneTranscriptColumn title="原始克隆语音文本（自动转写）" text={cleanText} reference={targetText} />
         <CloneTranscriptColumn title="保护后克隆语音文本（自动转写）" text={protectedText} reference={targetText} />
       </div>
-      <div className="mt-4 grid grid-cols-3 gap-3 max-lg:grid-cols-1">
-        <CloneTextMetric label="原始克隆文本误差" value={cloneEval.cleanCloneTextError} />
-        <CloneTextMetric label="保护后克隆文本误差" value={cloneEval.protectedCloneTextError} />
-        <CloneTextMetric label="文本变化率" value={cloneEval.cloneTextChangeRate} />
+      <div className="mt-4 grid grid-cols-[minmax(180px,1fr)_minmax(0,5fr)] items-stretch gap-5 max-lg:grid-cols-1">
+        <div className="grid content-start gap-3">
+          <CloneTextMetric label="原始克隆文本误差" value={cloneEval.cleanCloneTextError} />
+          <CloneTextMetric label="保护后克隆文本误差" value={cloneEval.protectedCloneTextError} />
+          <CloneTextMetric label="文本变化率" value={cloneEval.cloneTextChangeRate} />
+        </div>
+        <div className="relative min-h-0 max-lg:min-h-[320px]">
+          <div className="absolute inset-0 max-lg:static max-lg:h-[360px]">
+            <InsightPanel title="克隆结果解读" items={insights} fillHeight />
+          </div>
+        </div>
       </div>
       {(!cleanText || !protectedText) && cloneEval.cloneAsrReason ? <p className="mt-3 text-xs leading-5 text-slate-500">未生成原因：{friendlyCloneMetricReason(cloneEval.cloneAsrReason)}</p> : null}
     </section>
@@ -1858,10 +1970,9 @@ function CloneTranscriptColumn({ title, text, reference }: { title: string; text
 function CloneTextMetric({ label, value }: { label: string; value?: number | null }) {
   const numberValue = optionalNumber(value)
   return (
-    <div className="rounded-[8px] border border-cyan-300/10 bg-slate-950/22 px-4 py-3 text-center">
+    <div className="rounded-[8px] border border-cyan-300/10 bg-slate-950/22 px-4 py-4 text-center">
       <p className="text-xs font-bold text-slate-400">{label}</p>
       <p className={cn('mt-2 font-mono text-xl font-black', numberValue === null ? 'text-slate-500' : 'text-cyan-200')}>{numberValue === null ? '待生成' : formatMetricValue(numberValue, 'percent')}</p>
-      <p className="mt-1 text-[10px] text-slate-600">结果范围为 <MathText formula={'[0\\%,100\\%]'} className="align-[-1px]" /></p>
     </div>
   )
 }
@@ -1954,29 +2065,21 @@ function annotationSourceLabel(source?: CloneVoiceRequest['annotationSource'] | 
   return '—'
 }
 
-function normalizeCloneAnnotationRequest(request: CloneVoiceRequest, modelOption?: BackendSelectOption) {
-  if (!modelOption?.promptRequired) {
-    return {
-      ...request,
-      annotationSource: undefined,
-      annotationAsrSubId: undefined,
-      annotationAsrModel: undefined,
-      annotationCreatedAt: undefined,
-      speakerPrompt: undefined,
-      originalSpeakerPrompt: undefined,
-      protectedSpeakerPrompt: undefined,
-    }
-  }
-  if (request.annotationSource === 'asr') return request
-  return {
-    ...request,
-    annotationSource: 'manual' as const,
-    annotationAsrSubId: undefined,
-    annotationAsrModel: undefined,
-    annotationCreatedAt: undefined,
-    originalSpeakerPrompt: undefined,
-    protectedSpeakerPrompt: undefined,
-  }
+function cloneAnnotationTitle(
+  request: CloneVoiceRequest | undefined,
+  modelOption: BackendSelectOption | null,
+  fineTune: CloneVoiceResult['fineTune'],
+) {
+  const explicitSource = request?.annotationSource
+  const asrEvidence = Boolean(
+    request?.annotationAsrSubId
+      || request?.annotationAsrModel
+      || (request?.originalSpeakerPrompt?.trim() && request?.protectedSpeakerPrompt?.trim()),
+  )
+  const needsAnnotation = cloneModelRequiresReferenceText(modelOption) || Boolean(explicitSource) || asrEvidence || Boolean(fineTune)
+  if (!needsAnnotation) return null
+  if (explicitSource === 'asr' || asrEvidence) return 'ASR 标注'
+  return '人工标注'
 }
 
 function cloneModelOption(modelOptions: BackendSelectOption[], model?: string) {
@@ -2151,8 +2254,8 @@ function CloneHistoryPanel({ history, batches, modelOptions, selectedCloneKey, o
             })}
             {history.map((item, index) => {
               const request = item.request
-              const promptRequired = cloneModelOption(modelOptions, request?.model)?.promptRequired === true
-              const annotationSource = promptRequired ? request?.annotationSource : undefined
+              const requiresReferenceText = cloneModelRequiresReferenceText(cloneModelOption(modelOptions, request?.model))
+              const annotationSource = requiresReferenceText ? request?.annotationSource : undefined
               const hasAnnotation = annotationSource === 'manual' || annotationSource === 'asr'
               const asrAnnotation = annotationSource === 'asr'
               const originalPrompt = request?.originalSpeakerPrompt ?? request?.speakerPrompt ?? ''
@@ -2262,7 +2365,7 @@ function CloneVoiceModal({
   const [annotationSearch, setAnnotationSearch] = useState('')
   const [informationModel, setInformationModel] = useState<BackendSelectOption | null>(null)
   const visibleModels = modelOptions
-  const selectedModel = modelOptions.find((item) => item.value === form.model)
+  const selectedModel = cloneModelOption(modelOptions, form.model)
   const reusableAsrAnnotations = asrAnnotations
     .filter((item) => item.asrSubId && item.asr?.originalText?.trim() && item.asr?.protectedText?.trim())
     .filter((item) => {
@@ -2275,7 +2378,7 @@ function CloneVoiceModal({
 
   const selectModel = (selected: BackendSelectOption) => {
     const languages = selected.languages?.length ? selected.languages : languageOptions
-    onChange(normalizeCloneAnnotationRequest({
+    onChange(normalizeCloneReferenceTextRequest({
       ...form,
       model: selected.value,
       language: languages.includes(form.language ?? '') ? form.language : languages[0],
@@ -2288,7 +2391,7 @@ function CloneVoiceModal({
         <div className="mb-4 flex items-center justify-between">
           <div>
             <h3 className="text-[20px] font-black text-white">语音克隆测试</h3>
-            <p className="mt-1 text-xs text-slate-500">选择文本和模型{selectedModel?.promptRequired ? '，并提供参考标注' : ''}后开始测试</p>
+            <p className="mt-1 text-xs text-slate-500">选择文本和模型{cloneModelRequiresReferenceText(selectedModel) ? '，并提供参考标注' : ''}后开始测试</p>
           </div>
           <button type="button" onClick={onClose} className="grid h-9 w-9 place-items-center rounded-full border border-cyan-300/14 bg-white/[0.035] text-slate-300 hover:text-white" aria-label="关闭语音克隆测试表单">
             <X className="h-4 w-4" />
@@ -2340,7 +2443,7 @@ function CloneVoiceModal({
             </select>
           </label>
         </div>
-        {selectedModel?.promptRequired ? (
+        {cloneModelRequiresReferenceText(selectedModel) ? (
           <div className="mt-4 rounded-[7px] border border-cyan-300/14 bg-slate-950/35 p-3">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <p className="text-sm font-bold text-slate-300">参考音频标注（必填）</p>
@@ -2510,7 +2613,7 @@ function BatchProgressModal({ batch, cloneModelOptions, onClose }: { batch: Eval
             const itemTone = progressTone(item.status)
             const itemError = typeof item.error === 'string' ? item.error : item.error?.message
             const modelLabel = item.modelName || (batch.type === 'asr' ? shortAsrModelName(item.model) : shortCloneModelName(item.model))
-            const showAnnotationSource = batch.type === 'clone' && cloneModelOption(cloneModelOptions, item.model)?.promptRequired === true && Boolean(item.annotationSource)
+            const showAnnotationSource = batch.type === 'clone' && cloneModelRequiresReferenceText(cloneModelOption(cloneModelOptions, item.model)) && Boolean(item.annotationSource)
             return (
               <div key={item.batchItemId} className={cn('rounded-[8px] border p-3', ['failed', 'error', 'cancelled'].includes(String(item.status).toLowerCase()) ? 'border-rose-300/18 bg-rose-400/[0.05]' : 'border-cyan-300/10 bg-slate-950/24')}>
                 <div className="flex flex-wrap items-start justify-between gap-3">
@@ -2615,7 +2718,11 @@ function computeEditMetrics(originalText: string, protectedText: string, level: 
 }
 
 function renderDiffOps(diffOps: DiffOp[]): ReactNode[] {
-  const joiner = diffOps.some((op) => ('text' in op ? /\s/.test(op.text) : /\s/.test(`${op.from}${op.to}`))) ? ' ' : ''
+  const diffTokens = diffOps.flatMap((op) => ('text' in op ? [op.text] : [op.from, op.to])).filter(Boolean)
+  const lexicalTokens = diffTokens.filter((token) => /[\p{L}\p{N}]/u.test(token))
+  const latinTokens = lexicalTokens.filter((token) => /[\p{Script=Latin}\p{N}]/u.test(token))
+  const wordLevelLatin = latinTokens.length > 0 && latinTokens.length / Math.max(lexicalTokens.length, 1) >= 0.6
+  const joiner = wordLevelLatin ? ' ' : ''
   const nodes: ReactNode[] = []
   diffOps.forEach((op, index) => {
     const spacer = index === diffOps.length - 1 ? '' : joiner
@@ -2659,17 +2766,16 @@ function renderDiffOps(diffOps: DiffOp[]): ReactNode[] {
 
 function ScoreBox({ label, value, red, compact, foot }: { label: ReactNode; value: string; red?: boolean; compact?: boolean; foot?: ReactNode }) {
   return (
-    <div className={cn('relative rounded-[9px] border border-cyan-300/12 bg-slate-950/16 text-center', compact ? 'p-2.5' : 'p-3')}>
+    <MetricInfoSurface title={label} info={foot} className={cn('relative rounded-[9px] border border-cyan-300/12 bg-slate-950/16 text-center', compact ? 'p-2.5' : 'p-3')}>
       <div className={cn('relative', compact ? 'min-h-9' : 'min-h-8')}>
-        <p className={cn('absolute inset-x-0 top-1/2 line-clamp-2 -translate-y-1/2 break-words px-8 text-center font-black text-slate-300', compact ? 'text-[12px] leading-4' : 'text-[13px] leading-5')}>{label}</p>
-        {foot ? <div className="absolute right-0 top-1/2 -translate-y-1/2"><MetricInfoButton title={label}>{foot}</MetricInfoButton></div> : null}
+        <p className={cn('absolute inset-x-0 top-1/2 line-clamp-2 -translate-y-1/2 break-words px-2 text-center font-black text-slate-300', compact ? 'text-[12px] leading-4' : 'text-[13px] leading-5')}>{label}</p>
       </div>
       <div className="mt-2 grid justify-items-center">
         <span className={cn(compact ? 'text-[19px]' : 'text-[24px]', 'break-words font-black leading-none', red ? 'text-red-300' : 'text-cyan-300')}>
           {value}
         </span>
       </div>
-    </div>
+    </MetricInfoSurface>
   )
 }
 
@@ -2695,20 +2801,54 @@ function QualityPanel({ result, embedded }: { result: TaskResult; embedded?: boo
           tone="green"
           foot={(
             <MetricFormulaContent
-              description="比较原始语音功率与保护扰动功率。"
-              formulas={['\\mathrm{SNR}=10\\log_{10}\\!\\left(\\frac{P_x+10^{-12}}{P_{\\delta}+10^{-12}}\\right)\\,\\mathrm{dB}']}
-              note="数值越高，表示扰动相对越弱，保护音频越接近原音。"
+              description="SNR 是 Signal-to-Noise Ratio（信噪比）。在本系统中，有效信号是原始音频，噪声是保护音频减去原始音频得到的保护扰动，用于衡量原音功率与扰动功率的关系。"
+              formulas={[
+                '\\delta=x_{\\mathrm{protected}}-x_{\\mathrm{original}},\\qquad P_x=\\operatorname{mean}(x_{\\mathrm{original}}^2),\\qquad P_{\\delta}=\\operatorname{mean}(\\delta^2)',
+                '\\mathrm{SNR}=10\\log_{10}\\!\\left(\\frac{P_x+10^{-12}}{P_{\\delta}+10^{-12}}\\right)\\,\\mathrm{dB}',
+                '\\mathrm{SNR}\\in(-\\infty,+\\infty)\\,\\mathrm{dB}',
+              ]}
+              note={<>SNR 没有固定上限，数值越高表示保护音频越接近原音、扰动越不明显；低值表示扰动功率相对更高、听感可能更容易受影响，但不等同于保护一定更有效。<MathText formula="10,20,30\\,\\mathrm{dB}" className="mx-0.5 align-[-1px]" /> 分别约对应原音功率为扰动功率的 <MathText formula="10,100,1000" className="mx-0.5 align-[-1px]" /> 倍；在防护任务中不能脱离身份与语义保护效果而单独追求更高 SNR。</>}
             />
           )}
         />
-        <QualityMetric label="PESQ" value={formatMetricValue(pesq, 'number')} tag={pesq === null ? '未生成' : '听感质量'} tone="blue" foot="模拟人耳评价语音质量，分数越高表示听感越好。" />
-        <QualityMetric label="STOI" value={formatMetricValue(stoi, 'number')} tag={stoi === null ? '未生成' : '可懂度'} tone="blue" foot="衡量语音是否容易听懂，越接近 1 表示可懂度越高。" />
+        <QualityMetric
+          label="PESQ"
+          value={formatMetricValue(pesq, 'number')}
+          tag={pesq === null ? '未生成' : '听感质量'}
+          tone="blue"
+          foot={(
+            <MetricFormulaContent
+              description="PESQ 是 Perceptual Evaluation of Speech Quality（语音质量感知评估），是一项有参考指标，通过比较原始参考语音与保护语音，综合评估噪声、失真、编码和时序偏差对听感质量的影响。"
+              formulas={['\\text{PESQ 常见范围约为 }-0.5\\text{～}4.5\\text{，无量纲}']}
+              note="PESQ 没有物理单位，分数越高越好。声音发闷、明显失真或带有机械伪影时，分数通常会下降；原始语音本身的“呃”等语气或内容不是 PESQ 专门判断的对象，只有处理新增的停顿、尾音延长等变化偏离参考语音时，才可能间接导致分数下降。"
+            />
+          )}
+        />
+        <QualityMetric
+          label="STOI"
+          value={formatMetricValue(stoi, 'number')}
+          tag={stoi === null ? '未生成' : '可懂度'}
+          tone="blue"
+          foot={(
+            <MetricFormulaContent
+              description="STOI 是 Short-Time Objective Intelligibility（短时客观可懂度），是一项有参考指标，通过比较短时频带包络，衡量元音、辅音和音节是否仍能被清楚辨认。"
+              formulas={['\\mathrm{STOI}\\in[0,1]\\text{，无量纲}']}
+              note="STOI 没有物理单位，越接近 1 越好。例如句子每个音节都清楚时得分较高；噪声掩盖辅音、导致词语难以分辨时得分会降低。STOI 衡量可懂度，不等同于自然度，也不直接判断文本语义。"
+            />
+          )}
+        />
         <QualityMetric
           label={<span className="block min-w-0 whitespace-nowrap text-[11px] sm:text-[12px]"><span className="hidden sm:inline">DNSMOS</span><span className="sm:hidden">DNS</span></span>}
           value={formatMetricValue(dnsMos, 'number')}
           tag={dnsMos === null ? '未生成' : '语音质量评分'}
           tone="orange"
-          foot={'语音质量评分，范围为 \\([1,5]\\) 分；分数越高表示听感越好。'}
+          foot={(
+            <MetricFormulaContent
+              description="DNSMOS 是 Deep Noise Suppression Mean Opinion Score（深度降噪平均意见分），是一种无需原始参考音频的语音质量估计模型。P.835 同时估计 SIG（语音信号质量）、BAK（背景噪声质量）和 OVRL（总体质量）；后端对原音与保护音频分别推理，页面仅展示保护音频的 OVRL。"
+              formulas={['\\mathrm{DNSMOS}_{\\mathrm{OVRL}}\\in[1,5]\\text{ 分}']}
+              note="单位为分，数值越高越好。OVRL 综合反映语音失真、背景噪声和自然度，例如清晰自然、背景干净的语音通常得分较高，噪声或失真明显时得分较低。该结果是模型预测，不是人工现场评分，也不应作为绝对听感结论。"
+            />
+          )}
         />
       </div>
       {missingReasons.length ? (
@@ -2902,29 +3042,15 @@ function PsychoacousticModeDropdown({ label, open, onToggle, onMean, onFrame }: 
   )
 }
 
-function QualityMetric({ label, value, tag, tone, onClick, title, foot }: { label: ReactNode; value: ReactNode; tag: string; tone: 'green' | 'blue' | 'orange'; onClick?: () => void; title?: string; foot?: ReactNode }) {
+function QualityMetric({ label, value, tag, tone, title, foot }: { label: ReactNode; value: ReactNode; tag: string; tone: 'green' | 'blue' | 'orange'; title?: string; foot?: ReactNode }) {
   return (
-    <div
-      className={cn('relative min-w-0 rounded-[9px] border border-cyan-300/12 bg-slate-950/16 px-3 py-3.5 text-center', onClick && 'cursor-pointer transition hover:border-orange-300/28 hover:bg-orange-300/[0.04]')}
-      onClick={onClick}
-      onKeyDown={(event) => {
-        if (!onClick) return
-        if (event.key === 'Enter' || event.key === ' ') {
-          event.preventDefault()
-          onClick()
-        }
-      }}
-      role={onClick ? 'button' : undefined}
-      tabIndex={onClick ? 0 : undefined}
-      title={title}
-    >
+    <MetricInfoSurface title={label} info={foot} tooltip={title} className="relative min-w-0 rounded-[9px] border border-cyan-300/12 bg-slate-950/16 px-3 py-3.5 text-center">
       <div className="relative min-h-7">
-        <p className="absolute inset-x-0 top-1/2 min-w-0 -translate-y-1/2 truncate whitespace-nowrap px-8 text-center text-[12px] font-black text-slate-300">{label}</p>
-        {foot ? <div className="absolute right-0 top-1/2 -translate-y-1/2"><MetricInfoButton title={label}>{foot}</MetricInfoButton></div> : null}
+        <p className="absolute inset-x-0 top-1/2 min-w-0 -translate-y-1/2 truncate whitespace-nowrap px-2 text-center text-[12px] font-black text-slate-300">{label}</p>
       </div>
       <div className={cn('mt-1 flex h-6 items-center justify-center text-[20px] font-black leading-none', tone === 'green' && 'text-emerald-300', tone === 'blue' && 'text-cyan-300', tone === 'orange' && 'text-orange-300')}>{value}</div>
       <span className={cn('mt-1.5 inline-block rounded px-3 py-0.5 text-[11px] font-bold', tone === 'green' && 'bg-emerald-400/14 text-emerald-300', tone === 'blue' && 'bg-cyan-400/14 text-cyan-300', tone === 'orange' && 'bg-orange-400/14 text-orange-300')}>{tag}</span>
-    </div>
+    </MetricInfoSurface>
   )
 }
 
@@ -2956,7 +3082,7 @@ function TrendPanel({ result, embedded }: { result: TaskResult; embedded?: boole
   return (
     <section className={cn('flex min-h-0 flex-col overflow-hidden', embedded ? 'rounded-[9px] border border-cyan-300/12 bg-slate-950/12 p-5' : 'ui-card p-7')}>
       <SectionTitle>优化损失趋势</SectionTitle>
-      <div className="mt-7 grid min-h-0 grid-cols-[minmax(0,1fr)_280px] gap-6 max-lg:grid-cols-1">
+      <div className="mt-7 grid min-h-0 grid-cols-[minmax(0,2.8fr)_minmax(240px,1fr)] gap-6 max-lg:grid-cols-1">
         <div className="relative min-h-0 max-lg:static">
           <div className="absolute inset-0 flex min-h-0 flex-col overflow-hidden rounded-[7px] border border-cyan-300/12 bg-slate-950/18 p-5 max-lg:static max-lg:min-h-[560px]">
             <div className="mb-4 flex flex-wrap items-center gap-x-8 gap-y-2 text-[11px] text-slate-400">
@@ -3060,47 +3186,6 @@ function RichMathText({ text }: { text: string }) {
         return match ? <MathText key={`${part}-${index}`} formula={match[1]} className="mx-0.5 align-[-1px]" /> : <span key={`${part}-${index}`}>{part}</span>
       })}
     </span>
-  )
-}
-
-function taskInfoRows(result: TaskResult): Array<[string, string]> {
-  return [
-    ['保护任务', result.taskId],
-    ['提交时间', result.submittedAt ?? result.createdAt ?? result.originalAudio.uploadedAt ?? '-'],
-    ['完成时间', result.completedAt ?? '-'],
-    ['处理耗时', typeof result.elapsedSec === 'number' ? formatElapsed(result.elapsedSec) : '-'],
-    ['输入来源', result.inputSource ?? '手动上传'],
-    ['音频时长', formatDurationSeconds(getAudioDuration(result.originalAudio))],
-    ['语言类型', result.language ?? '未标注'],
-    ['处理模型', result.processingModel ?? result.asrModel ?? modeText[result.mode] ?? result.mode],
-    ['优化目标', result.optimizationTarget ?? result.mode],
-    ['防护模式', modeText[result.mode] ?? result.mode],
-  ]
-}
-
-function TaskInfoModal({ result, onClose }: { result: TaskResult; onClose: () => void }) {
-  return (
-    <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/68 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="任务信息">
-      <div className="ui-card w-full max-w-[560px] !bg-[#061426] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.46)]">
-        <div className="mb-4 flex items-center justify-between gap-4">
-          <div>
-            <h3 className="text-[20px] font-black text-white">任务信息</h3>
-            <p className="mt-1 text-xs text-slate-500">查看本次保护任务的完整配置与状态</p>
-          </div>
-          <button type="button" onClick={onClose} className="grid h-9 w-9 place-items-center rounded-full border border-cyan-300/14 bg-white/[0.035] text-slate-300 hover:text-white" aria-label="关闭任务信息">
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-        <div className="max-h-[520px] overflow-y-auto rounded-[9px] border border-cyan-300/12 bg-slate-950/18 p-4 pr-2">
-          {taskInfoRows(result).map(([label, value]) => (
-            <p key={label} className="mb-3 grid grid-cols-[88px_minmax(0,1fr)] text-[13px] leading-5 last:mb-0">
-              <span className="text-slate-500">{label}</span>
-              <span className="min-w-0 break-words font-semibold text-slate-300">{value}</span>
-            </p>
-          ))}
-        </div>
-      </div>
-    </div>
   )
 }
 
@@ -3290,36 +3375,68 @@ function averageStepSecFromTrace(trace: LossTrendPoint[]) {
   return values.reduce((sum, value) => sum + value, 0) / values.length
 }
 
-function lossTrendText(key: LossDisplayKey, direction: TrendDirection) {
-  if (direction === 'insufficient') return '当前优化记录较少，暂不判断该曲线的整体趋势。'
-  const messages = {
-    Lid: {
-      up: '由图所示，\\(L_{\\mathrm{id}}\\) 整体呈上升趋势，当前声音身份保护效果较弱。若更重视声音身份保护，可适当提高 \\(\\lambda_{\\mathrm{id}}\\)。',
-      down: '由图所示，\\(L_{\\mathrm{id}}\\) 整体呈下降趋势，声音身份保护目标正在稳定优化。',
-      stable: '由图所示，\\(L_{\\mathrm{id}}\\) 整体保持稳定，声音身份保护过程较为平稳。',
-    },
-    Lsem: {
-      up: '由图所示，\\(L_{\\mathrm{sem}}\\) 整体呈上升趋势，当前语义链路保护效果较弱。若更重视语义保护，可适当提高 \\(\\lambda_{\\mathrm{sem}}\\)。',
-      down: '由图所示，\\(L_{\\mathrm{sem}}\\) 整体呈下降趋势，语义链路保护目标正在稳定优化。',
-      stable: '由图所示，\\(L_{\\mathrm{sem}}\\) 整体保持稳定，语义链路保护过程较为平稳。',
-    },
-    Lpsy: {
-      up: '由图所示，\\(L_{\\mathrm{psy}}\\) 整体呈上升趋势，这一般为正常现象。',
-      down: '由图所示，\\(L_{\\mathrm{psy}}\\) 整体呈下降趋势，扰动与心理声学掩蔽范围的匹配正在改善。',
-      stable: '由图所示，\\(L_{\\mathrm{psy}}\\) 整体保持稳定，心理声学保真过程较为平稳。',
-    },
-    L2: {
-      up: '由图所示，\\(L_2\\) 整体呈上升趋势，这一般为正常现象。',
-      down: '由图所示，\\(L_2\\) 整体呈下降趋势，扰动能量正在得到有效约束。',
-      stable: '由图所示，\\(L_2\\) 整体保持稳定，扰动能量控制较为平稳。',
-    },
-    total: {
-      up: '由图所示，\\(L_{\\mathrm{total}}\\) 整体呈上升趋势，优化过程仍在持续变化。',
-      down: '由图所示，\\(L_{\\mathrm{total}}\\) 整体呈下降趋势，优化过程正在稳定收敛。',
-      stable: '由图所示，\\(L_{\\mathrm{total}}\\) 整体保持稳定，优化过程已进入平稳阶段。',
-    },
-  } as const
-  return messages[key][direction]
+const lossTrendFormulas: Record<LossDisplayKey, string> = {
+  Lid: '\\(L_{\\mathrm{id}}\\)',
+  Lsem: '\\(L_{\\mathrm{sem}}\\)',
+  Lpsy: '\\(L_{\\mathrm{psy}}\\)',
+  L2: '\\(L_2\\)',
+  total: '\\(L_{\\mathrm{total}}\\)',
+}
+
+const lossTrendLabels: Record<LossDisplayKey, string> = {
+  Lid: '身份保护',
+  Lsem: '语义保护',
+  Lpsy: '心理声学保真',
+  L2: '扰动能量',
+  total: '优化收敛',
+}
+
+function joinLossTrendFormulas(keys: LossDisplayKey[]) {
+  const formulas = keys.map((key) => lossTrendFormulas[key])
+  if (formulas.length <= 1) return formulas[0] ?? ''
+  if (formulas.length === 2) return `${formulas[0]} 与 ${formulas[1]}`
+  return `${formulas.slice(0, -1).join('、')} 与 ${formulas.at(-1)}`
+}
+
+function lossTrendConclusion(key: LossDisplayKey, direction: TrendDirection) {
+  if (direction === 'insufficient') return '优化记录较少，暂不判断整体趋势。'
+  if (key === 'Lid' || key === 'Lsem') {
+    if (direction === 'up') return '整体上升，保护目标仍在持续变化。'
+    if (direction === 'down') return '整体下降，正在稳\u2060定\u2060收\u2060敛。'
+    return '整体稳定，优化过程较为平稳。'
+  }
+  if (key === 'Lpsy') {
+    if (direction === 'up') return '整体上升，属于正\u2060常\u2060现\u2060象。'
+    if (direction === 'down') return '整体下降，心理声学匹配正在改善。'
+    return '整体稳定，心理声学保真过程较为平稳。'
+  }
+  if (key === 'L2') {
+    if (direction === 'up') return '整体上升，属于正\u2060常\u2060现\u2060象。'
+    if (direction === 'down') return '整体下降，扰动能量正在得到有效约束。'
+    return '整体稳定，扰动能量控制较为平稳。'
+  }
+  if (direction === 'up') return '整体上升，优化过程仍在持续变化。'
+  if (direction === 'down') return '整体下降，正在稳\u2060定\u2060收\u2060敛。'
+  return '整体稳定，已进入稳\u2060定\u2060收\u2060敛阶段。'
+}
+
+function groupedLossTrendItems(trends: Record<LossDisplayKey, { direction: TrendDirection }>) {
+  const sections: LossDisplayKey[][] = [['Lid', 'Lsem', 'total'], ['Lpsy', 'L2']]
+  const items: string[] = []
+  sections.forEach((section) => {
+    const conclusionGroups = new Map<string, LossDisplayKey[]>()
+    section.forEach((key) => {
+      const conclusion = lossTrendConclusion(key, trends[key].direction)
+      conclusionGroups.set(conclusion, [...(conclusionGroups.get(conclusion) ?? []), key])
+    })
+    conclusionGroups.forEach((keys, conclusion) => {
+      const label = keys.length > 1
+        ? keys.map((key) => lossTrendLabels[key]).join('、')
+        : lossTrendLabels[keys[0]]
+      items.push(`${label}：由图所示，${joinLossTrendFormulas(keys)} ${conclusion}`)
+    })
+  })
+  return items
 }
 
 type ProtectionEvaluationContext = {
@@ -3333,6 +3450,31 @@ type ProtectionEvaluationContext = {
 function averageAvailable(values: Array<number | null>) {
   const available = values.filter((value): value is number => value !== null && Number.isFinite(value))
   return available.length ? available.reduce((sum, value) => sum + value, 0) / available.length : null
+}
+
+function protectionQualityWeightAdvice(score: number | null) {
+  if (score === null) {
+    return '保护听感质量评分尚未生成，暂不只依据损失曲线调整 \\(\\lambda_{\\mathrm{psy}}\\) 与 \\(\\lambda_2\\)。'
+  }
+  const scoreText = score.toFixed(2)
+  if (score >= 85) {
+    return `保护听感质量评分为 ${scoreText} 分，说明听感质量优秀；当前可保持 \\(\\lambda_{\\mathrm{psy}}\\) 与 \\(\\lambda_2\\)。`
+  }
+  if (score >= 70) {
+    return `保护听感质量评分为 ${scoreText} 分，说明听感质量中等；建议适当提高 \\(\\lambda_{\\mathrm{psy}}\\) 与 \\(\\lambda_2\\)，加强心理声学保真并约束扰动能量。`
+  }
+  return `保护听感质量评分为 ${scoreText} 分，说明听感质量较差；建议优先明显提高 \\(\\lambda_{\\mathrm{psy}}\\) 与 \\(\\lambda_2\\)，降低扰动对听感的影响后重新保护。`
+}
+
+function iterationStepsOptimizationAdvice(convergence: ReturnType<typeof analyzeLossConvergence>) {
+  if (convergence.status === 'unconverged') {
+    const activeLossText = joinLossTrendFormulas(convergence.active_losses)
+    return `迭代步数优化建议：如图所示，训练后期${activeLossText ? ` ${activeLossText}` : ''} 曲线仍较陡峭，应当增大迭代次数 steps。`
+  }
+  if (convergence.status === 'converged') {
+    return '迭代步数优化建议：如图所示，训练后期曲线平滑，当前迭代步数应当保持。'
+  }
+  return '迭代步数优化建议：当前优化记录不足，暂不判断高迭代次数阶段是否稳定收敛。'
 }
 
 function linkedAsrTuningAdvice({ linkedTaskStatus, asrEval, asrHistory }: ProtectionEvaluationContext) {
@@ -3380,18 +3522,18 @@ function linkedAsrTuningAdvice({ linkedTaskStatus, asrEval, asrHistory }: Protec
   const metricNames = new Set(metrics.map((item) => item.name))
   const metricName = metricNames.size === 1 ? metrics[0]?.name ?? 'WER/CER' : 'WER/CER 识别错误率'
   if (metric === null) {
-    return '调参建议（ASR 平均联动）：现有 ASR 任务均未返回可用 WER/CER，暂不据此调整 \\(\\lambda_{\\mathrm{sem}}\\)。'
+    return '语义相关参数调参建议（ASR 平均联动）：现有 ASR 任务均未返回可用 WER/CER，暂不据此调整 \\(\\lambda_{\\mathrm{sem}}\\)。'
   }
 
   const metricText = formatRatioPercent(metric)
   const sampleText = `基于 ${metrics.length} 次可用 ASR 结果，平均 ${metricName} 为 ${metricText}`
   if (metric < asrWeakDisruptionThreshold) {
-    return `调参建议（ASR 平均联动）：${sampleText}，整体语义干扰较弱；建议提高 \\(\\lambda_{\\mathrm{sem}}\\) 后重新保护并复测。`
+    return `语义相关参数调参建议（ASR 平均联动）：${sampleText}，整体语义干扰较弱；建议提高 \\(\\lambda_{\\mathrm{sem}}\\) 后重新保护并复测。`
   }
   if (metric < asrStrongDisruptionThreshold) {
-    return `调参建议（ASR 平均联动）：${sampleText}，整体语义干扰已有一定效果；若优先阻断语义链路，可小幅提高 \\(\\lambda_{\\mathrm{sem}}\\)。`
+    return `语义相关参数调参建议（ASR 平均联动）：${sampleText}，整体语义干扰已有一定效果；若优先阻断语义链路，可小幅提高 \\(\\lambda_{\\mathrm{sem}}\\)。`
   }
-  return `调参建议（ASR 平均联动）：${sampleText}，整体语义干扰效果较明显，当前可保持 \\(\\lambda_{\\mathrm{sem}}\\)。`
+  return `语义相关参数调参建议（ASR 平均联动）：${sampleText}，整体语义干扰效果较明显，当前可保持 \\(\\lambda_{\\mathrm{sem}}\\)。`
 }
 
 function linkedCloneTuningAdvice({ linkedTaskStatus, cloneEval, cloneHistory }: ProtectionEvaluationContext) {
@@ -3429,22 +3571,22 @@ function linkedCloneTuningAdvice({ linkedTaskStatus, cloneEval, cloneHistory }: 
   const protectedSimilarity = averageAvailable(validEvaluations.map((evaluation) => optionalNumber(evaluation.protectedSimilarity)))
   const similarityDropRate = averageAvailable(validEvaluations.map((evaluation) => optionalNumber(evaluation.similarityDropRate)))
   if (protectedSimilarity === null) {
-    return '调参建议（克隆平均联动）：现有克隆任务均未返回保护后声纹相似度，暂不据此调整 \\(\\lambda_{\\mathrm{id}}\\)。'
+    return '声音身份相关参数调参建议（克隆平均联动）：现有克隆任务均未返回保护后声纹相似度，暂不据此调整 \\(\\lambda_{\\mathrm{id}}\\)。'
   }
 
   const similarityText = protectedSimilarity.toFixed(2)
   const sampleText = `基于 ${validEvaluations.length} 次可用克隆结果，保护后声纹相似度平均值为 ${similarityText}`
   const dropText = similarityDropRate === null ? '' : `，相对原始克隆的平均下降幅度为 ${formatRatioPercent(similarityDropRate)}`
   if (originalSimilarity !== null && originalSimilarity < speakerSameIdentityThreshold) {
-    return `调参建议（克隆平均联动）：基于 ${validEvaluations.length} 次可用克隆结果，原始克隆声纹相似度平均值为 ${originalSimilarity.toFixed(2)}，原始克隆效果偏弱；建议先更换克隆模型或样本复测，暂不据此调整 \\(\\lambda_{\\mathrm{id}}\\)。`
+    return `声音身份相关参数调参建议（克隆平均联动）：基于 ${validEvaluations.length} 次可用克隆结果，原始克隆声纹相似度平均值为 ${originalSimilarity.toFixed(2)}，原始克隆效果偏弱；建议先更换克隆模型或样本复测，暂不据此调整 \\(\\lambda_{\\mathrm{id}}\\)。`
   }
   if (protectedSimilarity >= speakerHighSimilarityThreshold) {
-    return `调参建议（克隆平均联动）：${sampleText}${dropText}，整体声音身份残留较高；建议提高 \\(\\lambda_{\\mathrm{id}}\\) 后重新保护并复测。`
+    return `声音身份相关参数调参建议（克隆平均联动）：${sampleText}${dropText}，整体声音身份残留较高；建议提高 \\(\\lambda_{\\mathrm{id}}\\) 后重新保护并复测。`
   }
   if (protectedSimilarity >= speakerSameIdentityThreshold) {
-    return `调参建议（克隆平均联动）：${sampleText}${dropText}，整体仍有一定声音身份特征残留；建议小幅提高 \\(\\lambda_{\\mathrm{id}}\\)。`
+    return `声音身份相关参数调参建议（克隆平均联动）：${sampleText}${dropText}，整体仍有一定声音身份特征残留；建议小幅提高 \\(\\lambda_{\\mathrm{id}}\\)。`
   }
-  return `调参建议（克隆平均联动）：${sampleText}${dropText}，整体声音身份相似度已明显降低，当前可保持 \\(\\lambda_{\\mathrm{id}}\\)。`
+  return `声音身份相关参数调参建议（克隆平均联动）：${sampleText}${dropText}，整体声音身份相似度已明显降低，当前可保持 \\(\\lambda_{\\mathrm{id}}\\)。`
 }
 
 function generateProtectionInsights(result: TaskResult, evaluationContext: ProtectionEvaluationContext = {}) {
@@ -3455,6 +3597,8 @@ function generateProtectionInsights(result: TaskResult, evaluationContext: Prote
   const pesq = optionalNumber(quality?.pesq)
   const stoi = optionalNumber('stoi' in (quality ?? {}) ? (quality as { stoi?: number | null }).stoi : null)
   const dnsMos = optionalNumber('dnsMos' in (quality ?? {}) ? (quality as { dnsMos?: number | null }).dnsMos : null)
+  const qualityScore = optionalNumber('qualityScore' in (quality ?? {}) ? (quality as { qualityScore?: number | null }).qualityScore : null)
+    ?? optionalNumber(result.protectionEvaluation?.dimensions.find((dimension) => dimension.key === 'protectionQuality')?.score)
   const epsilonUsageRate = resolveEpsilonUsageRate(perturbation)
   const trends = {
     Lid: analyzeLossTrend(trace, 'Lid'),
@@ -3492,11 +3636,7 @@ function generateProtectionInsights(result: TaskResult, evaluationContext: Prote
     qualityNotes.push(`语音质量评分为 ${dnsMos.toFixed(2)}，${level}。`)
   }
   items.push(`听感质量：${qualityNotes.length ? qualityNotes.join('') : '该指标尚未完成评估。'}`)
-  items.push(`心理声学保真：${lossTrendText('Lpsy', trends.Lpsy.direction)}`)
-  items.push(`身份保护：${lossTrendText('Lid', trends.Lid.direction)}`)
-  items.push(`语义保护：${lossTrendText('Lsem', trends.Lsem.direction)}`)
-  items.push(`扰动能量：${lossTrendText('L2', trends.L2.direction)}`)
-  items.push(`优化收敛：${lossTrendText('total', trends.total.direction)}`)
+  items.push(...groupedLossTrendItems(trends))
 
   const tuning: string[] = []
   if (trends.Lid.direction === 'up' && trends.Lsem.direction === 'up') {
@@ -3505,11 +3645,9 @@ function generateProtectionInsights(result: TaskResult, evaluationContext: Prote
     if (trends.Lid.direction === 'up') tuning.push('可适当提高 \\(\\lambda_{\\mathrm{id}}\\) 强化声音身份保护。')
     if (trends.Lsem.direction === 'up') tuning.push('可适当提高 \\(\\lambda_{\\mathrm{sem}}\\) 强化语义保护。')
   }
-  if (trends.Lpsy.direction === 'up') tuning.push('可适当提高 \\(\\lambda_{\\mathrm{psy}}\\) 强化听感保真。')
-  if (trends.L2.direction === 'up') tuning.push('可适当提高 \\(\\lambda_2\\) 约束扰动能量。')
-  if (convergence.status === 'unconverged') tuning.push('如图所示，可能没有收敛，为了更好的效果可以尝试增大迭代次数。')
-  if (snr !== null && snr < 18) tuning.push('若优先提升听感，可适当降低扰动预算。')
+  tuning.push(protectionQualityWeightAdvice(qualityScore))
   items.push(`调参建议：${tuning.length ? tuning.join('') : '当前曲线运行平稳，保持现有参数即可。'}`)
+  items.push(iterationStepsOptimizationAdvice(convergence))
   items.push(linkedAsrTuningAdvice(evaluationContext))
   items.push(linkedCloneTuningAdvice(evaluationContext))
   return items

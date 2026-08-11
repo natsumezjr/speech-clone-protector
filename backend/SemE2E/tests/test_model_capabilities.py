@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -52,6 +53,29 @@ class ModelCapabilitiesTest(unittest.TestCase):
         self.assertEqual(gpt_sovits["fineTuneMode"], "live_fine_tune")
         self.assertTrue(gpt_sovits["promptRequired"])
         self.assertNotIn("fineTuneDatasetSeconds", gpt_sovits)
+
+    def test_tts_reference_text_capability_matches_real_backend_contract(self) -> None:
+        options = {option["value"]: option for option in self.config["models"]["tts"]}
+        expected = {
+            "XTTS-v2": False,
+            "YourTTS": False,
+            "CosyVoice2-0.5B": True,
+            "GPT-SoVITS": True,
+        }
+
+        self.assertEqual(set(options), set(expected))
+        for model, requires_reference_text in expected.items():
+            with self.subTest(model=model):
+                option = options[model]
+                self.assertIs(option["requiresReferenceText"], requires_reference_text)
+                self.assertIs(option["promptRequired"], requires_reference_text)
+                self.assertEqual(option["annotationSources"], ["manual", "asr"] if requires_reference_text else [])
+                self.assertIs(
+                    result_adapter.tts_model_requires_reference_text(option["backendValue"]),
+                    requires_reference_text,
+                )
+
+        self.assertFalse(result_adapter.tts_model_requires_reference_text("XTTS-v1.1"))
 
     def test_xtts_v11_is_not_advertised_for_new_clone_tasks(self) -> None:
         tts_values = {option["value"] for option in self.config["models"]["tts"]}
@@ -187,6 +211,113 @@ class ModelCapabilitiesTest(unittest.TestCase):
         self.assertEqual(payload["config"]["models"]["tts"], [{"value": "XTTS-v2"}])
         self.assertEqual(payload["modelTypes"], fresh["modelTypes"])
         self.assertEqual(payload["cache"]["revision"], 1)
+
+    def test_runtime_concurrency_snapshot_counts_training_and_inference_workers(self) -> None:
+        with patch.multiple(
+            api_server,
+            PROTECT_MAX_CONCURRENCY=3,
+            ASR_WORKER_MAX_CONCURRENCY=2,
+            clone_worker_capacity_snapshot=lambda: {
+                "maxConcurrency": 3,
+                "backendLimits": {"coquiTts": 1, "cosyVoice": 1, "gptSoVits": 2},
+                "gpuSlotLimit": 1,
+                "gpuKeys": {"coquiTts": ["4"], "cosyVoice": ["4"], "gptSoVits": ["0", "1"]},
+            },
+        ):
+            payload = api_server.runtime_concurrency_snapshot()
+
+        self.assertEqual(payload["protect"], 3)
+        self.assertEqual(payload["asr"], 2)
+        self.assertEqual(payload["clone"], 3)
+        self.assertEqual(payload["total"], 8)
+        self.assertEqual(payload["unit"], "worker")
+        self.assertIn("HTTP", payload["definition"])
+
+    def test_clone_concurrency_respects_shared_gpu_slots(self) -> None:
+        maximum = result_adapter.maximum_clone_worker_concurrency(
+            coqui_limit=1,
+            cosyvoice_limit=1,
+            gpt_sovits_limit=2,
+            clone_gpu_limit=1,
+            coqui_gpu_keys=("4",),
+            cosyvoice_gpu_keys=("4",),
+            gpt_sovits_gpu_keys=("0", "1"),
+        )
+        self.assertEqual(maximum, 3)
+
+    def test_clone_concurrency_counts_separate_backend_gpus(self) -> None:
+        maximum = result_adapter.maximum_clone_worker_concurrency(
+            coqui_limit=1,
+            cosyvoice_limit=1,
+            gpt_sovits_limit=2,
+            clone_gpu_limit=1,
+            coqui_gpu_keys=("2",),
+            cosyvoice_gpu_keys=("3",),
+            gpt_sovits_gpu_keys=("0", "1"),
+        )
+        self.assertEqual(maximum, 4)
+
+    def test_clone_concurrency_avoids_double_counting_overlapping_gpt_gpu(self) -> None:
+        maximum = result_adapter.maximum_clone_worker_concurrency(
+            coqui_limit=1,
+            cosyvoice_limit=1,
+            gpt_sovits_limit=2,
+            clone_gpu_limit=1,
+            coqui_gpu_keys=("0",),
+            cosyvoice_gpu_keys=("0",),
+            gpt_sovits_gpu_keys=("0", "1"),
+        )
+        self.assertEqual(maximum, 2)
+
+    def test_latest_runtime_performance_uses_latest_completed_real_average(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+
+            def write_result(name: str, modified_at: int, payload: dict[str, object]) -> None:
+                task_dir = root / name
+                task_dir.mkdir()
+                (task_dir / "result.json").write_text(json.dumps(payload), encoding="utf-8")
+                os.utime(task_dir, (modified_at, modified_at))
+
+            write_result(
+                "task_older",
+                100,
+                {"taskId": "task_older", "status": "completed", "details": {"generation": {"averageStepSec": 0.45}}},
+            )
+            write_result(
+                "task_latest_failed",
+                300,
+                {"taskId": "task_latest_failed", "status": "failed", "details": {"generation": {"averageStepSec": 0.1}}},
+            )
+            write_result(
+                "task_latest_completed",
+                200,
+                {"taskId": "task_latest_completed", "status": "completed", "details": {"generation": {"averageStepSec": 0.37}}},
+            )
+
+            with patch.object(api_server, "TASK_DIR", root):
+                payload = api_server.latest_runtime_performance_snapshot()
+
+        self.assertEqual(payload["averageStepSec"], 0.37)
+        self.assertEqual(payload["sourceTaskId"], "task_latest_completed")
+        self.assertEqual(payload["source"], "latest_completed_protection_result")
+
+    def test_config_exposes_runtime_concurrency_and_measured_timing(self) -> None:
+        concurrency = {"protect": 1, "asr": 1, "clone": 2, "total": 4, "unit": "worker"}
+        performance = {"averageStepSec": 0.37, "sourceTaskId": "task_demo"}
+        with patch.object(api_server, "runtime_config", return_value={"modelTypes": {}}), patch.object(
+            api_server,
+            "runtime_concurrency_snapshot",
+            return_value=concurrency,
+        ), patch.object(
+            api_server,
+            "latest_runtime_performance_snapshot",
+            return_value=performance,
+        ):
+            payload = api_server.config()
+
+        self.assertEqual(payload["runtimeConcurrency"], concurrency)
+        self.assertEqual(payload["runtimePerformance"], performance)
 
     def test_hugging_face_model_ids_resolve_to_project_checkpoints(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

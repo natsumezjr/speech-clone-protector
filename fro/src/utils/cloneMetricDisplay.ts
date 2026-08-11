@@ -10,6 +10,9 @@ export type CloneMetricInput = {
   cloneQualityRelevance?: number | null
   cloneQualityScore?: number | null
   cloneQualityDropRate?: number | null
+  cleanCloneTextError?: number | null
+  protectedCloneTextError?: number | null
+  cloneTextChangeRate?: number | null
   cloneSemanticStatus?: string | null
   cloneSemanticReason?: string | null
   cloneQualityStatus?: string | null
@@ -75,53 +78,106 @@ export function cloneMetricDisplay(input: CloneMetricInput) {
   }
 }
 
+function higherIsBetterLevel(value: number, mediumThreshold: number, excellentThreshold: number) {
+  if (value >= excellentThreshold) return '优秀'
+  if (value >= mediumThreshold) return '中等'
+  return '较差'
+}
+
+type ChangeDirection = 'up' | 'down' | 'stable'
+
+function changeDirection(delta: number): ChangeDirection {
+  if (Math.abs(delta) < 0.005) return 'stable'
+  return delta > 0 ? 'up' : 'down'
+}
+
+function changeText(label: string, before: number, after: number, kind: 'similarity' | 'distance') {
+  const delta = after - before
+  const direction = changeDirection(delta)
+  if (direction === 'stable') return `${label}由 ${before.toFixed(2)} 变为 ${after.toFixed(2)}，无明显变化（变化量 0.00）`
+  const transition = direction === 'up' ? '升至' : '降至'
+  const change = kind === 'distance'
+    ? direction === 'up' ? '增大' : '减小'
+    : direction === 'up' ? '上升' : '下降'
+  return `${label}由 ${before.toFixed(2)} ${transition} ${after.toFixed(2)}，${change} ${Math.abs(delta).toFixed(2)}`
+}
+
+function identityDirectionConclusion(similarityDirection: ChangeDirection | null, distanceDirection: ChangeDirection | null) {
+  if (similarityDirection !== null && distanceDirection !== null) {
+    if (similarityDirection === 'down' && distanceDirection === 'up') return '说明保护后的克隆声音与原说话人更不相似，两个声纹嵌入向量的夹角更大。'
+    if (similarityDirection === 'up' && distanceDirection === 'down') return '说明保护后的克隆声音与原说话人更相似，两个声纹嵌入向量的夹角更小。'
+    if (similarityDirection === 'stable' && distanceDirection === 'stable') return '说明保护后的克隆声音与原说话人的相似程度基本不变，两个声纹嵌入向量的夹角基本不变。'
+    return '两项变化方向不一致，暂不能判断保护后的克隆声音与原说话人的相似程度及声纹嵌入向量夹角变化。'
+  }
+  if (similarityDirection === 'down') return '说明保护后的克隆声音与原说话人更不相似。'
+  if (similarityDirection === 'up') return '说明保护后的克隆声音与原说话人更相似。'
+  if (similarityDirection === 'stable') return '说明保护后的克隆声音与原说话人的相似程度基本不变。'
+  if (distanceDirection === 'up') return '说明保护后的克隆声音与原说话人更不相似，两个声纹嵌入向量的夹角更大。'
+  if (distanceDirection === 'down') return '说明保护后的克隆声音与原说话人更相似，两个声纹嵌入向量的夹角更小。'
+  if (distanceDirection === 'stable') return '说明保护后的克隆声音与原说话人的相似程度基本不变，两个声纹嵌入向量的夹角基本不变。'
+  return ''
+}
+
+function identityChangeInsight(input: CloneMetricInput) {
+  const originalSimilarity = optionalMetricNumber(input.originalSimilarity)
+  const protectedSimilarity = optionalMetricNumber(input.protectedSimilarity)
+  const distanceBefore = optionalMetricNumber(input.embeddingDistanceBefore)
+  const distanceAfter = optionalMetricNumber(input.embeddingDistanceAfter)
+  const similarityComplete = originalSimilarity !== null && protectedSimilarity !== null
+  const distanceComplete = distanceBefore !== null && distanceAfter !== null
+  const details: string[] = []
+  let similarityDirection: ChangeDirection | null = null
+  let distanceDirection: ChangeDirection | null = null
+
+  if (similarityComplete) {
+    similarityDirection = changeDirection(protectedSimilarity - originalSimilarity)
+    details.push(changeText('声纹相似度', originalSimilarity, protectedSimilarity, 'similarity'))
+  } else {
+    details.push('声纹相似度前后值尚未完整生成')
+  }
+  if (distanceComplete) {
+    distanceDirection = changeDirection(distanceAfter - distanceBefore)
+    details.push(changeText('声纹嵌入距离', distanceBefore, distanceAfter, 'distance'))
+  } else {
+    details.push('声纹距离前后值尚未完整生成')
+  }
+
+  // 后端 compute_clone_identity_score 明确定义 embeddingDistance = 1 - cosineSimilarity，
+  // 因此距离增减可用于解释两个声纹向量夹角的增减。
+  const conclusion = identityDirectionConclusion(similarityDirection, distanceDirection)
+  return `${details.join('；')}${conclusion ? `，${conclusion}` : '。'}`
+}
+
 export function generateCloneMetricInsights(input: CloneMetricInput) {
-  const embeddingDistanceDelta = optionalMetricNumber(input.embeddingDistanceDelta)
-    ?? computeAbsoluteDelta(input.embeddingDistanceBefore, input.embeddingDistanceAfter)
   const identityScore = optionalMetricNumber(input.cloneIdentityScore)
   const semanticScore = optionalMetricNumber(input.cloneSemanticScore)
   const qualityScore = optionalMetricNumber(input.cloneQualityScore)
-  const qualityRawScore = optionalMetricNumber(input.cloneQualityRawScore)
-  const qualityRelevance = optionalMetricNumber(input.cloneQualityRelevance)
-  const qualityDropRate = optionalMetricNumber(input.cloneQualityDropRate)
-  const items: string[] = []
-  if (embeddingDistanceDelta !== null) {
-    const level = embeddingDistanceDelta >= 0.2 ? '明显' : embeddingDistanceDelta >= 0.05 ? '中等' : '偏低'
-    items.push(`身份差异${level}：声纹嵌入距离由 ${formatCloneMetricNumber(input.embeddingDistanceBefore)} 变为 ${formatCloneMetricNumber(input.embeddingDistanceAfter)}，克隆后的声音身份${embeddingDistanceDelta > 0 ? '与原说话人进一步分离' : embeddingDistanceDelta < 0 ? '与原说话人更加接近' : '未出现明显变化'}。`)
+  const items: string[] = [identityChangeInsight(input)]
+
+  if (identityScore !== null) {
+    items.push(`克隆身份保护评分的值为 ${identityScore.toFixed(2)} 分，说明克隆身份保护效果${higherIsBetterLevel(identityScore, 70, 85)}。`)
   }
   if (semanticScore !== null) {
-    const level = semanticScore >= 70 ? '较高' : semanticScore >= 40 ? '中等' : '偏低'
-    items.push(`语义干扰${level}：克隆后语义干扰评分为 ${semanticScore.toFixed(2)} 分，反映保护前后克隆表达内容的实际变化。`)
+    items.push(`克隆后语义干扰评分的值为 ${semanticScore.toFixed(2)} 分，说明克隆语义保护效果${higherIsBetterLevel(semanticScore, 70, 85)}。`)
   } else if (input.cloneSemanticReason) {
-    items.push('语义干扰暂不可用：克隆语音文本尚未完整生成。')
+    items.push('克隆后语义干扰评分尚未生成。')
   }
   if (qualityScore !== null) {
-    const dropText = qualityDropRate === null ? '' : `，语音质量相对下降 ${(qualityDropRate * 100).toFixed(2)}%`
-    if (qualityRawScore !== null && qualityRelevance !== null) {
-      const relevanceText = `${(qualityRelevance * 100).toFixed(2)}%`
-      const explanation = qualityRelevance < 0.5
-        ? '身份与语义保护已较充分，额外降低听感质量的必要性较低'
-        : '当前结果仍需较多参考实际语音质量下降'
-      items.push(`克隆后语音质量下降评分为 ${qualityScore.toFixed(2)} 分：${explanation}；原始质量退化分为 ${qualityRawScore.toFixed(2)} 分，参考占比为 ${relevanceText}${dropText}。`)
+    const qualityPrefix = `克隆音频质量退化评分的值为 ${qualityScore.toFixed(2)} 分，说明听感质量保护效果${higherIsBetterLevel(qualityScore, 70, 85)}`
+    if (identityScore !== null && semanticScore !== null) {
+      const lowestScore = Math.min(identityScore, semanticScore, qualityScore)
+      if (lowestScore >= 85) {
+        items.push(`${qualityPrefix}，保护之后在听感、身份、语义综合保护上达到了良好的效果。`)
+      } else if (lowestScore >= 70) {
+        items.push(`${qualityPrefix}，保护之后在听感、身份、语义综合保护上达到了中等效果。`)
+      } else {
+        items.push(`${qualityPrefix}，保护之后在听感、身份、语义综合保护上的效果较差。`)
+      }
     } else {
-      items.push(`克隆后语音质量下降评分为 ${qualityScore.toFixed(2)} 分${dropText}。`)
+      items.push(`${qualityPrefix}，但身份或语义评分尚未完整生成，暂不能给出综合保护结论。`)
     }
-  } else if (input.cloneQualityReason) {
-    items.push('克隆质量退化暂不可用：语音质量评分尚未生成。')
+  } else {
+    items.push('克隆音频质量退化评分尚未生成，身份、语义或听感评分尚未完整生成，暂不能给出综合保护结论。')
   }
-  if (identityScore !== null) {
-    const level = identityScore >= 85 ? '优秀' : identityScore >= 70 ? '中等' : '较差'
-    items.push(`身份保护效果${level}：克隆身份保护评分为 ${identityScore.toFixed(2)} 分。`)
-  }
-  if (identityScore !== null && semanticScore !== null && qualityScore !== null) {
-    const scores = [identityScore, semanticScore, qualityScore]
-    const conclusion = scores.every((score) => score >= 70)
-      ? '总体克隆防护效果良好。'
-      : scores.filter((score) => score >= 40).length >= 2
-        ? '总体克隆防护效果中等。'
-        : '总体克隆防护效果偏弱。'
-    items.push(conclusion)
-  }
-  if (items.length === 0) items.push('语音克隆评估已执行，但身份、语义或质量评分尚未生成。')
   return items
 }

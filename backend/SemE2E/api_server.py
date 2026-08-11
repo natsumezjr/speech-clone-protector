@@ -26,6 +26,7 @@ from audio_preprocess import probe_audio_metadata
 from capability_cache import get_capabilities_snapshot
 from dnsmos_quality import dnsmos_model_status
 from result_adapter import (
+    ASR_WORKER_MAX_CONCURRENCY,
     TASK_DIR,
     UPLOAD_DIR,
     AudioPreprocessError,
@@ -33,6 +34,7 @@ from result_adapter import (
     ProtectGenerationError,
     create_asr_eval,
     create_clone_voice,
+    clone_worker_capacity_snapshot,
     create_psychoacoustic_slice,
     create_task,
     diagnose_capabilities,
@@ -44,7 +46,7 @@ from result_adapter import (
     refresh_result_scores,
     runtime_config,
     supported_tts_languages,
-    tts_model_requires_prompt,
+    tts_model_requires_reference_text,
 )
 from result_schema import utc_now_iso
 
@@ -897,7 +899,7 @@ def _clear_clone_annotation_fields(payload: dict[str, Any]) -> None:
 
 def resolve_clone_annotation(task_id: str, payload: CloneVoiceRequest, req_id: str) -> tuple[dict[str, Any] | None, JSONResponse | None]:
     resolved = payload.model_dump()
-    if not tts_model_requires_prompt(payload.model):
+    if not tts_model_requires_reference_text(payload.model):
         _clear_clone_annotation_fields(resolved)
         return resolved, None
 
@@ -915,6 +917,16 @@ def resolve_clone_annotation(task_id: str, payload: CloneVoiceRequest, req_id: s
     resolved["annotationSource"] = annotation_source
     if annotation_source == "manual":
         manual_text = str(payload.speakerPrompt or "").strip() or None
+        if manual_text is None:
+            return None, structured_error(
+                code="REFERENCE_TEXT_REQUIRED",
+                message="所选克隆模型需要参考音频对应文本，请填写人工标注或选择已有 ASR 标注。",
+                status_code=400,
+                request_id_value=req_id,
+                task_id=task_id,
+                stage="downstream_tts_eval",
+                details={"model": payload.model, "annotationSource": annotation_source},
+            )
         resolved["speakerPrompt"] = manual_text
         resolved["originalSpeakerPrompt"] = manual_text
         resolved["protectedSpeakerPrompt"] = manual_text
@@ -1380,6 +1392,72 @@ def protect_queue_snapshot() -> dict[str, int]:
         }
 
 
+def runtime_concurrency_snapshot() -> dict[str, Any]:
+    clone_capacity = clone_worker_capacity_snapshot()
+    clone_max_concurrency = int(clone_capacity["maxConcurrency"])
+    total = PROTECT_MAX_CONCURRENCY + ASR_WORKER_MAX_CONCURRENCY + clone_max_concurrency
+    return {
+        "protect": PROTECT_MAX_CONCURRENCY,
+        "asr": ASR_WORKER_MAX_CONCURRENCY,
+        "clone": clone_max_concurrency,
+        "total": total,
+        "unit": "worker",
+        "definition": "保护、ASR 与克隆在共享 GPU 槽约束下可同时运行的训练/推理工作线程上限之和，不包含 HTTP 请求线程。",
+        "cloneBackends": clone_capacity["backendLimits"],
+        "cloneGpuSlots": {
+            "limitPerGpu": clone_capacity["gpuSlotLimit"],
+            "keys": clone_capacity["gpuKeys"],
+        },
+    }
+
+
+def latest_runtime_performance_snapshot() -> dict[str, Any]:
+    task_dirs = sorted(
+        (path for path in TASK_DIR.iterdir() if path.is_dir()),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    for task_dir in task_dirs:
+        result_path = task_dir / "result.json"
+        if not result_path.exists():
+            continue
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if result.get("status") not in {"completed", "success"}:
+            continue
+        details = result.get("details") if isinstance(result.get("details"), dict) else {}
+        generation = details.get("generation") if isinstance(details.get("generation"), dict) else {}
+        average_step_sec = _number(
+            _coalesce(
+                result.get("averageStepSec"),
+                generation.get("averageStepSec"),
+                generation.get("average_step_sec"),
+            )
+        )
+        if average_step_sec is None:
+            trace = generation.get("optimizationTrace")
+            step_times = [
+                value
+                for item in (trace if isinstance(trace, list) else []) if isinstance(item, dict)
+                for value in [_number(_coalesce(item.get("stepElapsedSec"), item.get("step_elapsed_sec")))]
+                if value is not None and value > 0
+            ]
+            average_step_sec = sum(step_times) / len(step_times) if step_times else None
+        if average_step_sec is not None and average_step_sec > 0:
+            return {
+                "averageStepSec": average_step_sec,
+                "sourceTaskId": result.get("taskId") or task_dir.name,
+                "source": "latest_completed_protection_result",
+            }
+    return {
+        "averageStepSec": None,
+        "sourceTaskId": None,
+        "source": "no_completed_protection_timing",
+    }
+
+
 def cached_capabilities() -> dict[str, Any]:
     payload = get_capabilities_snapshot(TASK_DIR.parent, diagnose_capabilities, logger=logger)
     chains = payload.setdefault("chains", {})
@@ -1432,6 +1510,8 @@ def capabilities() -> dict[str, Any]:
     config_payload = runtime_config()
     payload["config"] = config_payload
     payload["modelTypes"] = config_payload.get("modelTypes", payload.get("modelTypes", {}))
+    payload["runtimeConcurrency"] = runtime_concurrency_snapshot()
+    payload["runtimePerformance"] = latest_runtime_performance_snapshot()
     payload["time"] = utc_now_iso()
     payload["version"] = "sem-e2e-api-0.1"
     return payload
@@ -1446,6 +1526,8 @@ def config() -> dict[str, Any]:
         "modelTypes": config_payload.get("modelTypes", {}),
         "config": config_payload,
         "protectQueue": protect_queue_snapshot(),
+        "runtimeConcurrency": runtime_concurrency_snapshot(),
+        "runtimePerformance": latest_runtime_performance_snapshot(),
         "capabilitiesCache": {
             "strategy": "disk-snapshot-stale-while-revalidate",
             "refreshFlag": "seme2e-runtime/capabilities-refresh.flag",
@@ -2552,7 +2634,7 @@ def create_evaluation_batch(task_id: str, payload: EvaluationBatchRequest) -> JS
             )
         seen_item_ids.add(batch_item_id)
         item = dict(raw_item)
-        if batch_type == "clone" and not tts_model_requires_prompt(str(item.get("model") or "")):
+        if batch_type == "clone" and not tts_model_requires_reference_text(str(item.get("model") or "")):
             _clear_clone_annotation_fields(item)
         item.update(
             {

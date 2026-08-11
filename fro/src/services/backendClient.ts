@@ -347,6 +347,10 @@ function normalizeProtectionEvaluation(value: unknown): ProtectionEvaluation | n
   }
 }
 
+function canonicalTaskScore(payloadScore: unknown, evaluation: ProtectionEvaluation | null) {
+  return numberOrNull(evaluation?.overallScore) ?? numberOrNull(payloadScore)
+}
+
 function normalizePsychoacoustic(value: unknown): TaskResult['psychoacoustic'] {
   const record = asRecord(value)
   return {
@@ -684,14 +688,16 @@ function normalizeTaskResult(payload: unknown): TaskResult {
     const asrResults = Array.isArray(data.asrResults) ? data.asrResults.map(normalizeAsrResult) : undefined
     const asrEval = normalizeAsrEval(data.asrEval ?? asrResults?.at(-1)?.asr ?? data.asr)
     const latestCloneEval = normalizeCloneEval(data.cloneEval) ?? cloneResults?.at(-1)?.cloneEval ?? null
+    const protectionEvaluation = normalizeProtectionEvaluation(data.protectionEvaluation ?? details.protectionEvaluation)
     return {
       ...(data as unknown as TaskResult),
+      score: canonicalTaskScore(numberOrNull(data.score) ?? numberOrNull(asRecord(data.summary).score), protectionEvaluation),
       originalAudio: normalizeAudio(originalAudio, stringOr(originalAudio.filename, 'original.wav')),
       protectedAudio: normalizeAudio(protectedAudio, stringOr(protectedAudio.filename, 'protected.wav')),
       elapsedSec: normalizeElapsedSec(data),
       perturbation: normalizePerturbation(data.perturbation ?? asRecord(details.perception)),
       protectionQuality: normalizeProtectionQuality(data.protectionQuality ?? data.quality ?? asRecord(details.perception)),
-      protectionEvaluation: normalizeProtectionEvaluation(data.protectionEvaluation ?? details.protectionEvaluation),
+      protectionEvaluation,
       psychoacoustic: normalizePsychoacoustic(data.psychoacoustic ?? asRecord(details.perception)),
       lossFinal: normalizeLossFinal(data.lossFinal ?? generation.lossFinal),
       lossWeights: normalizeLossWeights(data.lossWeights ?? generation.lossWeights),
@@ -749,7 +755,7 @@ function normalizeTaskResult(payload: unknown): TaskResult {
   const originalRaw = asRecord(audio.original)
   const protectedRaw = asRecord(audio.protected)
   const metricSources = asRecord(summary.metricSources)
-  const score = numberOrNull(summary.score)
+  const rawScore = numberOrNull(summary.score)
   const snr = numberOrNull(primary.snr)
   const pesq = numberOrNull(primary.pesq)
   const simAfter = numberOrNull(primary.speakerSimilarity) ?? firstNumber(detailSpeaker, ['simAfter', 'simOriginalProtected'])
@@ -766,6 +772,7 @@ function normalizeTaskResult(payload: unknown): TaskResult {
   const asrHasResult = asrEval !== null
   const cloneEval = normalizeCloneEval(data.cloneEval) ?? cloneResults?.at(-1)?.cloneEval ?? null
   const protectionEvaluation = normalizeProtectionEvaluation(data.protectionEvaluation ?? details.protectionEvaluation)
+  const score = canonicalTaskScore(rawScore, protectionEvaluation)
   const perturbation = normalizePerturbation({
     ...asRecord(details.perception),
     ...asRecord(details.perturbation),
@@ -931,6 +938,9 @@ export const backendClient: ApiClient = {
       ...capabilities,
       modelTypes: configEnvelope.modelTypes ?? capabilities.modelTypes,
       config: configEnvelope.config ?? capabilities.config,
+      protectQueue: configEnvelope.protectQueue ?? capabilities.protectQueue,
+      runtimeConcurrency: configEnvelope.runtimeConcurrency ?? capabilities.runtimeConcurrency,
+      runtimePerformance: configEnvelope.runtimePerformance ?? capabilities.runtimePerformance,
     } as unknown as CapabilitiesResponse
   },
   async uploadFile(file: File): Promise<AudioFileMeta> {

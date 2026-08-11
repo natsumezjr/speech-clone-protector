@@ -884,6 +884,73 @@ def _acquire_clone_worker_slots(
         raise
 
 
+def maximum_clone_worker_concurrency(
+    *,
+    coqui_limit: int,
+    cosyvoice_limit: int,
+    gpt_sovits_limit: int,
+    clone_gpu_limit: int,
+    coqui_gpu_keys: tuple[str, ...],
+    cosyvoice_gpu_keys: tuple[str, ...],
+    gpt_sovits_gpu_keys: tuple[str, ...],
+) -> int:
+    """Return the largest clone workload that can run under shared GPU slots."""
+    slot_limit = max(1, int(clone_gpu_limit))
+    coqui_keys = tuple(dict.fromkeys(coqui_gpu_keys))
+    cosyvoice_keys = tuple(dict.fromkeys(cosyvoice_gpu_keys))
+    gpt_keys = tuple(dict.fromkeys(gpt_sovits_gpu_keys))
+    best = 0
+    for coqui_count in range(max(0, int(coqui_limit)) + 1):
+        for cosyvoice_count in range(max(0, int(cosyvoice_limit)) + 1):
+            gpu_usage: dict[str, int] = {}
+            for key in coqui_keys:
+                gpu_usage[key] = gpu_usage.get(key, 0) + coqui_count
+            for key in cosyvoice_keys:
+                gpu_usage[key] = gpu_usage.get(key, 0) + cosyvoice_count
+            if any(usage > slot_limit for usage in gpu_usage.values()):
+                continue
+            # GPT-SoVITS leases at most one worker per candidate GPU, then also
+            # consumes the same per-GPU clone slot used by the other backends.
+            available_gpt_gpus = sum(1 for key in gpt_keys if gpu_usage.get(key, 0) < slot_limit)
+            gpt_count = min(max(0, int(gpt_sovits_limit)), available_gpt_gpus)
+            best = max(best, coqui_count + cosyvoice_count + gpt_count)
+    return best
+
+
+def clone_worker_capacity_snapshot() -> dict[str, Any]:
+    requested_device = os.getenv("SEME2E_TTS_DEVICE") or os.getenv("SEME2E_API_DEVICE", "cpu")
+    coqui_gpu_keys = _clone_gpu_slot_keys(requested_device, "SEME2E_COQUI_TTS_CUDA_VISIBLE_DEVICES")
+    cosyvoice_gpu_keys = _clone_gpu_slot_keys(requested_device, "SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES")
+    try:
+        gpt_sovits_gpu_keys = _gpt_sovits_gpu_candidates(requested_device)
+    except RuntimeError:
+        gpt_sovits_gpu_keys = ()
+    backend_limits = {
+        "coquiTts": COQUI_TTS_WORKER_MAX_CONCURRENCY,
+        "cosyVoice": COSYVOICE_WORKER_MAX_CONCURRENCY,
+        "gptSoVits": GPT_SOVITS_WORKER_MAX_CONCURRENCY,
+    }
+    maximum = maximum_clone_worker_concurrency(
+        coqui_limit=COQUI_TTS_WORKER_MAX_CONCURRENCY,
+        cosyvoice_limit=COSYVOICE_WORKER_MAX_CONCURRENCY,
+        gpt_sovits_limit=GPT_SOVITS_WORKER_MAX_CONCURRENCY,
+        clone_gpu_limit=CLONE_GPU_MAX_CONCURRENCY,
+        coqui_gpu_keys=coqui_gpu_keys,
+        cosyvoice_gpu_keys=cosyvoice_gpu_keys,
+        gpt_sovits_gpu_keys=gpt_sovits_gpu_keys,
+    )
+    return {
+        "maxConcurrency": maximum,
+        "backendLimits": backend_limits,
+        "gpuSlotLimit": CLONE_GPU_MAX_CONCURRENCY,
+        "gpuKeys": {
+            "coquiTts": list(coqui_gpu_keys),
+            "cosyVoice": list(cosyvoice_gpu_keys),
+            "gptSoVits": list(gpt_sovits_gpu_keys),
+        },
+    }
+
+
 FORMAL_EPSILON = 4 / 255
 FORMAL_STEPS = 200
 FORMAL_WEIGHT_FEATURE = 150.0
@@ -981,6 +1048,7 @@ SUPPORTED_TTS_MODELS = [
         "languages": ["en", "zh-cn"],
         "description": "Coqui XTTS-v2 voice cloning backend.",
         "backend": "CoquiTTS",
+        "requiresReferenceText": False,
     },
     {
         "label": "XTTS-v1.1",
@@ -994,6 +1062,7 @@ SUPPORTED_TTS_MODELS = [
         "languages": ["en", "zh-cn"],
         "description": "Coqui XTTS-v1.1 cross-language voice cloning backend.",
         "backend": "CoquiTTS",
+        "requiresReferenceText": False,
         "frontendVisible": False,
     },
     {
@@ -1008,6 +1077,7 @@ SUPPORTED_TTS_MODELS = [
         "languages": ["en"],
         "description": "Coqui YourTTS voice cloning backend.",
         "backend": "CoquiTTS",
+        "requiresReferenceText": False,
     },
     {
         "label": "CosyVoice2-0.5B",
@@ -1020,6 +1090,7 @@ SUPPORTED_TTS_MODELS = [
         "languages": ["en", "zh-cn"],
         "description": "Official FunAudioLLM CosyVoice2 0.5B zero-shot voice cloning backend.",
         "backend": "CosyVoice2",
+        "requiresReferenceText": True,
         "promptRequired": True,
     },
     {
@@ -1034,6 +1105,7 @@ SUPPORTED_TTS_MODELS = [
         "description": "GPT-SoVITS live per-upload fine-tuning evaluation chain.",
         "backend": "GPT-SoVITS",
         "online": True,
+        "requiresReferenceText": True,
         "promptRequired": True,
         "fineTuneMode": "live_fine_tune",
     },
@@ -1227,12 +1299,19 @@ def supported_tts_languages(model: str | None) -> list[str]:
     return []
 
 
-def tts_model_requires_prompt(model: str | None) -> bool:
+def tts_model_requires_reference_text(model: str | None) -> bool:
     backend_value = normalize_tts_model(model)
     for item in SUPPORTED_TTS_MODELS:
         if str(item["backendValue"]).lower() == backend_value.lower():
+            if "requiresReferenceText" in item:
+                return bool(item.get("requiresReferenceText"))
             return bool(item.get("promptRequired"))
     return False
+
+
+def tts_model_requires_prompt(model: str | None) -> bool:
+    """Compatibility alias for older API consumers."""
+    return tts_model_requires_reference_text(model)
 
 
 def _checkpoint_status() -> dict[str, Any]:
@@ -1415,7 +1494,9 @@ def runtime_config() -> dict[str, Any]:
                 localPath=cache_path,
                 languages=item.get("languages", []),
                 description=item.get("description"),
-                promptRequired=bool(item.get("promptRequired")),
+                requiresReferenceText=tts_model_requires_reference_text(str(item["backendValue"])),
+                promptRequired=tts_model_requires_reference_text(str(item["backendValue"])),
+                annotationSources=["manual", "asr"] if tts_model_requires_reference_text(str(item["backendValue"])) else [],
                 fineTuneMode=item.get("fineTuneMode"),
             )
         )
@@ -3381,6 +3462,7 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
     device = os.getenv("SEME2E_TTS_DEVICE") or os.getenv("SEME2E_API_DEVICE", "cpu")
     cosyvoice_model = _is_cosyvoice_model(model)
     gpt_sovits_model = _is_gpt_sovits_model(model)
+    requires_reference_text = tts_model_requires_reference_text(model)
     prompt_text = str(payload.get("speakerPrompt") or "").strip()
     original_prompt_text = str(payload.get("originalSpeakerPrompt") or prompt_text).strip()
     protected_prompt_text = str(payload.get("protectedSpeakerPrompt") or prompt_text).strip()
@@ -3406,6 +3488,7 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
         "model": model,
         "language": language,
         "speed": speed,
+        "requiresReferenceText": requires_reference_text,
         "device": device,
         "originalReferencePath": str(original_path),
         "protectedReferencePath": str(protected_path),
@@ -3414,7 +3497,7 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
         progress_callback(progress=0.18, message="正在加载真实 TTS 克隆后端")
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeError("TASK_CANCELLED")
-    if (cosyvoice_model or gpt_sovits_model) and (not original_prompt_text or not protected_prompt_text):
+    if requires_reference_text and (not original_prompt_text or not protected_prompt_text):
         raise CloneBackendUnavailableError(
             "当前克隆模型需要原始参考音频和保护参考音频各自对应的标注文本。",
             task_id=task_id,

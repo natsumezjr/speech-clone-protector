@@ -513,7 +513,9 @@ export interface RuntimeModelOption {
   status?: 'available' | 'unavailable' | 'download_required' | string
   reason?: string | null
   languages?: string[]
+  requiresReferenceText?: boolean
   promptRequired?: boolean
+  annotationSources?: Array<'manual' | 'asr'>
   fineTuneMode?: 'live_fine_tune' | string
 }
 
@@ -598,6 +600,26 @@ export interface RuntimeFormSchema {
   }
 }
 
+export interface RuntimeConcurrency {
+  protect: number
+  asr: number
+  clone: number
+  total: number
+  unit?: string
+  definition?: string
+  cloneBackends?: Record<string, number>
+  cloneGpuSlots?: {
+    limitPerGpu?: number
+    keys?: Record<string, string[]>
+  }
+}
+
+export interface RuntimePerformance {
+  averageStepSec?: number | null
+  sourceTaskId?: string | null
+  source?: string
+}
+
 export interface CapabilitiesResponse {
   ok: boolean
   modelTypes?: Record<string, RuntimeModelType[]>
@@ -608,6 +630,13 @@ export interface CapabilitiesResponse {
   ranges?: ProtectionRuntimeConfig['ranges']
   models?: ProtectionRuntimeConfig['models']
   constraints?: ProtectionRuntimeConfig['constraints']
+  runtimeConcurrency?: RuntimeConcurrency
+  runtimePerformance?: RuntimePerformance
+  protectQueue?: {
+    maxConcurrency?: number
+    activeCount?: number
+    queuedCount?: number
+  }
   cache?: {
     hit: boolean
     revision: number

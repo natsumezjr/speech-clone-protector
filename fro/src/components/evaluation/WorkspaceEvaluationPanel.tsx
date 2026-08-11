@@ -8,6 +8,7 @@ import { useAppStore } from '@/store/appStore'
 import { useTaskStore } from '@/store/taskStore'
 import type { AsrEvalResponse, CapabilitiesResponse, CloneVoiceRequest, HistoryTask, ProtectionRuntimeConfig, RuntimeModelOption } from '@/types/task'
 import { cn } from '@/lib/utils'
+import { cloneModelRequiresReferenceText, normalizeCloneReferenceTextRequest } from '@/utils/cloneModelCapabilities'
 
 type ModelOption = RuntimeModelOption & { label: string }
 type CloneDialogMode = 'single' | 'all'
@@ -224,6 +225,9 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
   const effectiveAsr = availableAsr.find((item) => item.value === selectedAsr) ?? defaultAsrModel(asrModels, asrLanguage)
   const availableClone = compatibleCloneModels(cloneModels, cloneLanguage)
   const effectiveClone = availableClone.find((item) => item.value === selectedClone) ?? availableClone.find((item) => /cosyvoice/i.test(item.value)) ?? availableClone[0]
+  const dialogCloneModels = cloneDialogMode === 'single' ? (effectiveClone ? [effectiveClone] : []) : availableClone
+  const dialogReferenceTextModels = dialogCloneModels.filter(cloneModelRequiresReferenceText)
+  const dialogNeedsReferenceText = dialogReferenceTextModels.length > 0
 
   const requireTask = (taskId: string) => {
     if (taskId) return true
@@ -279,9 +283,9 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
       return
     }
     const models = dialogMode === 'single' && effectiveClone ? [effectiveClone] : availableClone
-    const needsPromptAnnotation = models.some((model) => model.promptRequired)
-    if (cloneDialogMode === 'all' && needsPromptAnnotation && !manualAnnotation.trim()) {
-      pushToast({ kind: 'error', title: '请填写人工标注', description: '全模型克隆会同时比较人工标注与自动标注。' })
+    const referenceTextModels = models.filter(cloneModelRequiresReferenceText)
+    if (dialogMode === 'single' && referenceTextModels.length && !manualAnnotation.trim()) {
+      pushToast({ kind: 'error', title: '请填写人工标注', description: `${shortModelName(referenceTextModels[0].value)} 需要参考音频对应文本。` })
       return
     }
 
@@ -289,32 +293,49 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
       setCloneRunning(true)
       setCloneDialogMode(null)
       let annotation: AsrEvalResponse | null = null
-      if (needsPromptAnnotation) {
-        const annotationModel = defaultAsrModel(asrModels, cloneLanguage)
-        if (!annotationModel) throw new Error(`${cloneLanguage === 'zh-cn' ? '中文' : '英文'}自动标注模型当前不可用。`)
-        const asrQueued = await runAsrEval(cloneTaskId, { model: annotationModel.value, language: cloneLanguage })
-        if (!asrQueued.asrSubId) throw new Error('自动标注任务未返回有效编号。')
-        annotation = await waitForAsr(cloneTaskId, asrQueued.asrSubId)
-        const evaluatedAsr = annotation.asr
-        const originalText = evaluatedAsr?.originalText?.trim() ?? ''
-        const protectedText = evaluatedAsr?.protectedText?.trim() ?? ''
-        if (!evaluatedAsr || !originalText || !protectedText) throw new Error('自动标注未同时生成原始音频和保护音频文本。')
+      let annotationError: string | null = null
+      if (dialogMode === 'all' && referenceTextModels.length) {
+        try {
+          const annotationModel = defaultAsrModel(asrModels, cloneLanguage)
+          if (!annotationModel) throw new Error(`${cloneLanguage === 'zh-cn' ? '中文' : '英文'}自动标注模型当前不可用。`)
+          const asrQueued = await runAsrEval(cloneTaskId, { model: annotationModel.value, language: cloneLanguage })
+          if (!asrQueued.asrSubId) throw new Error('自动标注任务未返回有效编号。')
+          annotation = await waitForAsr(cloneTaskId, asrQueued.asrSubId)
+          const evaluatedAsr = annotation.asr
+          const originalText = evaluatedAsr?.originalText?.trim() ?? ''
+          const protectedText = evaluatedAsr?.protectedText?.trim() ?? ''
+          if (!evaluatedAsr || !originalText || !protectedText) throw new Error('自动标注未同时生成原始音频和保护音频文本。')
+        } catch (error) {
+          annotationError = error instanceof Error ? error.message : '自动标注未完成。'
+        }
       }
 
       const requests: CloneVoiceRequest[] = []
+      const skippedReferenceModels: ModelOption[] = []
       models.forEach((model) => {
         const base = { text: cloneText.trim(), model: model.value, language: cloneLanguage, speed: 1 }
-        if (model.promptRequired) {
+        if (cloneModelRequiresReferenceText(model)) {
+          let requestCount = 0
+          if (manualAnnotation.trim()) {
+            requests.push(normalizeCloneReferenceTextRequest({ ...base, annotationSource: 'manual', speakerPrompt: manualAnnotation.trim() }, model))
+            requestCount += 1
+          }
           const evaluatedAsr = annotation?.asr
           const originalText = evaluatedAsr?.originalText?.trim() ?? ''
           const protectedText = evaluatedAsr?.protectedText?.trim() ?? ''
-          if (!annotation?.asrSubId || !evaluatedAsr || !originalText || !protectedText) throw new Error('提示词模型缺少可用的自动标注。')
-          if (manualAnnotation.trim()) requests.push({ ...base, annotationSource: 'manual', speakerPrompt: manualAnnotation.trim() })
-          requests.push({ ...base, annotationSource: 'asr', annotationAsrSubId: annotation.asrSubId, annotationAsrModel: evaluatedAsr.model, annotationCreatedAt: annotation.createdAt ?? undefined, speakerPrompt: originalText, originalSpeakerPrompt: originalText, protectedSpeakerPrompt: protectedText })
+          if (dialogMode === 'all' && annotation?.asrSubId && evaluatedAsr && originalText && protectedText) {
+            requests.push(normalizeCloneReferenceTextRequest({ ...base, annotationSource: 'asr', annotationAsrSubId: annotation.asrSubId, annotationAsrModel: evaluatedAsr.model, annotationCreatedAt: annotation.createdAt ?? undefined, speakerPrompt: originalText, originalSpeakerPrompt: originalText, protectedSpeakerPrompt: protectedText }, model))
+            requestCount += 1
+          }
+          if (!requestCount) skippedReferenceModels.push(model)
         } else {
-          requests.push(base)
+          requests.push(normalizeCloneReferenceTextRequest(base, model))
         }
       })
+      if (!requests.length) {
+        const names = skippedReferenceModels.map((model) => shortModelName(model.value)).join('、')
+        throw new Error(`${names || '所选模型'}需要参考音频对应文本，请填写人工标注后重试。`)
+      }
       const batchId = dialogMode === 'all' ? evaluationBatchId('clone') : undefined
       const batchItems = requests.map((request, index) => ({
         batchItemId: `${batchId ?? 'single'}_${index + 1}`,
@@ -334,7 +355,12 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
       const queuedCount = settled.filter((item) => item.status === 'fulfilled').length
       const failedCount = settled.length - queuedCount
       if (!queuedCount) throw settled.find((item): item is PromiseRejectedResult => item.status === 'rejected')?.reason ?? new Error('所有克隆任务均提交失败。')
-      pushToast({ kind: failedCount ? 'error' : 'success', title: dialogMode === 'all' ? '全模型克隆已开始' : '克隆测试已开始', description: failedCount ? `已提交 ${queuedCount} 个，${failedCount} 个提交失败。` : `已并行提交 ${queuedCount} 个克隆任务。` })
+      const skippedText = skippedReferenceModels.length ? ` ${skippedReferenceModels.map((model) => shortModelName(model.value)).join('、')} 缺少参考文本，已跳过。` : ''
+      const annotationText = annotationError && !skippedReferenceModels.length ? ` 自动标注未加入：${annotationError}` : ''
+      const description = failedCount
+        ? `已提交 ${queuedCount} 个，${failedCount} 个提交失败。${skippedText}${annotationText}`
+        : `已并行提交 ${queuedCount} 个克隆任务。${skippedText}${annotationText}`
+      pushToast({ kind: failedCount || skippedReferenceModels.length || Boolean(annotationError) ? 'error' : 'success', title: dialogMode === 'all' ? '全模型克隆已开始' : '克隆测试已开始', description })
     } catch (error) {
       pushToast({ kind: 'error', title: '克隆测试提交失败', description: error instanceof Error ? error.message : '请稍后重试。' })
     } finally {
@@ -384,12 +410,12 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
             <div className="flex items-start justify-between gap-4">
               <div>
                 <h3 className="text-[20px] font-black text-white">{cloneDialogMode === 'all' ? '全模型克隆设置' : shortModelName(effectiveClone?.value)}</h3>
-                <p className="mt-1 text-xs leading-5 text-slate-500">使用{cloneLanguage === 'zh-cn' ? '中文' : '英文'}；系统会先生成同语言的成对标注，再提交克隆任务。</p>
+                <p className="mt-1 text-xs leading-5 text-slate-500">使用{cloneLanguage === 'zh-cn' ? '中文' : '英文'}；{dialogNeedsReferenceText ? '仅需要参考文本的模型会使用标注。' : '所选模型无需人工标注。'}</p>
               </div>
               <button type="button" onClick={() => setCloneDialogMode(null)} className="grid h-9 w-9 place-items-center rounded-full border border-cyan-300/14 text-slate-300 hover:text-white" aria-label="关闭"><X className="h-4 w-4" /></button>
             </div>
             <label className="mt-5 block text-sm font-black text-slate-200">测试文本<textarea value={cloneText} onChange={(event) => setCloneText(event.target.value)} className="mt-2 min-h-24 w-full resize-none rounded-[7px] border border-cyan-300/14 bg-slate-950/70 p-3 text-sm leading-6 text-slate-100 outline-none focus:border-cyan-300" /></label>
-            <label className="mt-4 block text-sm font-black text-slate-200">人工标注{cloneDialogMode === 'all' ? '（必填）' : ''}<textarea value={manualAnnotation} onChange={(event) => setManualAnnotation(event.target.value)} placeholder="输入人工核对后的原始音频文本" className="mt-2 min-h-20 w-full resize-none rounded-[7px] border border-violet-300/16 bg-slate-950/70 p-3 text-sm leading-6 text-slate-100 outline-none focus:border-violet-300" /></label>
+            {dialogNeedsReferenceText ? <label className="mt-4 block text-sm font-black text-slate-200">人工标注{cloneDialogMode === 'single' ? '（必填）' : '（仅需要参考文本的模型使用）'}<textarea value={manualAnnotation} onChange={(event) => setManualAnnotation(event.target.value)} placeholder="输入人工核对后的原始音频文本" className="mt-2 min-h-20 w-full resize-none rounded-[7px] border border-violet-300/16 bg-slate-950/70 p-3 text-sm leading-6 text-slate-100 outline-none focus:border-violet-300" /></label> : null}
             <div className="mt-5 flex justify-end gap-3">
               <button type="button" onClick={() => setCloneDialogMode(null)} className="h-10 rounded-[7px] border border-cyan-300/14 px-4 text-sm font-bold text-slate-300">取消</button>
               <button type="button" onClick={() => void queueCloneRequests()} className="cyan-button inline-flex h-10 items-center gap-2 rounded-[7px] px-4 text-sm font-black"><TestTube2 className="h-4 w-4" />开始测试</button>

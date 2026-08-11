@@ -17,8 +17,8 @@ import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import heroShieldScene from '@/assets/reference-hero-shield-scene.png'
 import { cn } from '@/lib/utils'
-import { getTaskResult, getTaskStatus, listTasks } from '@/services/apiClient'
-import type { TaskResult, TaskStatusResponse } from '@/types/task'
+import { getCapabilities, getTaskResult, listTasks } from '@/services/apiClient'
+import type { CloneEval, HistoryTask, TaskResult } from '@/types/task'
 
 const heroChecks = ['端到端可验证', '多模型自适应', '听感友好', '高效易用']
 
@@ -48,17 +48,28 @@ const strategies = [
 ] as const
 
 const metricTemplates = [
-  { title: 'ASR 干扰（平均）', sub: '识别准确率下降', tone: 'red' },
+  { title: 'ASR 干扰', sub: '识别准确率下降', tone: 'red' },
   { title: '声纹相似度下降', sub: '克隆相似度降低', tone: 'red' },
   { title: 'SNR 信噪比', sub: '高保真听感', tone: 'green' },
-  { title: '对抗评估（攻击成功率）', sub: '多攻击平均下降', tone: 'red' },
-  { title: '任务通过率', sub: '通过率（内部基准）', tone: 'cyan' },
+  { title: '攻击成功率', sub: '多攻击平均下降', tone: 'red' },
+  { title: '最高训练推理线程并发数', sub: '高效率高并发', tone: 'cyan' },
   { title: '单步平均时长', sub: '平均耗时', tone: 'blue' },
 ] as const
 
+const metricSparklineData = [
+  [94, 72, 24, 31, 28, 27, 26],
+  [22, 68, 18, 73, 34, 58],
+  [82, 30, 22, 18, 16, 15, 14, 15],
+  [48, 72, 24, 75, 31, 69],
+  [58, 64, 72, 68, 79, 76, 88],
+  [76, 24, 20, 18, 17, 16, 15],
+] as const
+
 type HomeMetricSnapshot = {
-  result: TaskResult
-  status: TaskStatusResponse
+  result?: TaskResult
+  cloneResult?: TaskResult
+  maxConcurrency: number | null
+  averageStepSec: number | null
 }
 
 type HomeMetric = (typeof metricTemplates)[number] & {
@@ -68,19 +79,6 @@ type HomeMetric = (typeof metricTemplates)[number] & {
 
 function optionalNumber(value: unknown) {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
-}
-
-function series(values: unknown[]) {
-  const available = values.map(optionalNumber).filter((value): value is number => value !== null)
-  if (available.length >= 2) return available
-  if (available.length === 1) return [available[0], available[0]]
-  return [0, 0]
-}
-
-function sampled(values: unknown[], maxPoints = 8) {
-  const available = series(values)
-  if (available.length <= maxPoints) return available
-  return Array.from({ length: maxPoints }, (_, index) => available[Math.round((index / (maxPoints - 1)) * (available.length - 1))])
 }
 
 function average(values: Array<number | null>) {
@@ -96,15 +94,48 @@ function decimal(value: number | null, prefix = '', suffix = '') {
   return value === null ? '—' : `${prefix}${value.toFixed(2)}${suffix}`
 }
 
+function integerPercent(value: number | null, prefix = '') {
+  return value === null ? '—' : `${prefix}${(value * 100).toFixed(0)}%`
+}
+
+function integerDecimal(value: number | null, prefix = '', suffix = '') {
+  return value === null ? '—' : `${prefix}${value.toFixed(0)}${suffix}`
+}
+
+function cloneEvaluationsFrom(result?: TaskResult): CloneEval[] {
+  const evaluations = (result?.cloneResults ?? []).flatMap((item) => item.cloneEval ? [item.cloneEval] : [])
+  return evaluations.length ? evaluations : result?.cloneEval ? [result.cloneEval] : []
+}
+
+function hasUsableCloneMetrics(result?: TaskResult) {
+  return cloneEvaluationsFrom(result).some((evaluation) => [
+    evaluation.originalSimilarity,
+    evaluation.protectedSimilarity,
+    evaluation.similarityDropRate,
+  ].some((value) => optionalNumber(value) !== null))
+}
+
+async function getLatestCloneMetricResult(tasks: HistoryTask[], cachedResult?: TaskResult) {
+  for (const task of tasks) {
+    if (!task.hasCloneResult) continue
+    try {
+      const result = cachedResult?.taskId === task.taskId ? cachedResult : await getTaskResult(task.taskId)
+      if (hasUsableCloneMetrics(result)) return result
+    } catch {
+      // A stale history row must not hide an older result that still has real clone metrics.
+    }
+  }
+  return undefined
+}
+
 function buildHomeMetrics(snapshot?: HomeMetricSnapshot): { metrics: HomeMetric[]; impactValues: string[] } {
   const result = snapshot?.result
-  const status = snapshot?.status
   const tokenErrorRate = optionalNumber(result?.semanticEval?.tokenErrorRate)
   const tokenChangeRate = optionalNumber(result?.semanticEval?.tokenChangeRate)
   const semanticDrift = optionalNumber(result?.semanticEval?.semanticDrift)
   const snr = optionalNumber(result?.protectionQuality?.snr)
-  const averageStepSec = optionalNumber(result?.averageStepSec)
-  const cloneEvaluations = (result?.cloneResults ?? []).flatMap((item) => item.cloneEval ? [item.cloneEval] : [])
+  const averageStepSec = optionalNumber(result?.averageStepSec) ?? optionalNumber(snapshot?.averageStepSec)
+  const cloneEvaluations = cloneEvaluationsFrom(snapshot?.cloneResult ?? result)
   const similarityDrops = cloneEvaluations.map((item) => {
     const before = optionalNumber(item.originalSimilarity)
     const after = optionalNumber(item.protectedSimilarity)
@@ -113,26 +144,17 @@ function buildHomeMetrics(snapshot?: HomeMetricSnapshot): { metrics: HomeMetric[
   const relativeSimilarityDrops = cloneEvaluations.map((item) => optionalNumber(item.similarityDropRate))
   const averageSimilarityDrop = average(similarityDrops)
   const averageRelativeSimilarityDrop = average(relativeSimilarityDrops)
-  const subtasks = [...(status?.asrTasks ?? []), ...(status?.cloneTasks ?? [])]
-  const completedSubtasks = subtasks.filter((item) => item.status === 'completed' || item.status === 'success').length
-  const taskPassRate = subtasks.length ? completedSubtasks / subtasks.length : null
-  const asrSeries = series((result?.asrResults ?? []).map((item) => optionalNumber(item.asr?.wer)).map((value) => value === null ? null : value * 100))
-  const similaritySeries = series(similarityDrops.map((value) => value === null ? null : value * 100))
-  const snrSeries = sampled((result?.optimizationTrace ?? []).map((item) => item.snr))
-  const attackSeries = series(relativeSimilarityDrops.map((value) => value === null ? null : value * 100))
-  const passSeries = series(subtasks.map((item) => item.status === 'completed' || item.status === 'success' ? 100 : item.status === 'failed' || item.status === 'error' || item.status === 'cancelled' ? 0 : null))
-  const timingSeries = sampled((result?.optimizationTrace ?? []).map((item) => optionalNumber(item.stepElapsedSec)).map((value) => value === null ? null : value * 1000))
+  const maxConcurrency = optionalNumber(snapshot?.maxConcurrency)
   const values = [
-    percent(tokenErrorRate, '↓ '),
+    integerPercent(tokenErrorRate, '↓ '),
     decimal(averageSimilarityDrop, '↓ '),
     decimal(snr),
-    percent(averageRelativeSimilarityDrop, '↓ '),
-    percent(taskPassRate),
+    integerPercent(averageRelativeSimilarityDrop, '↓ '),
+    integerDecimal(maxConcurrency),
     decimal(averageStepSec, '', 's'),
   ]
-  const data = [asrSeries, similaritySeries, snrSeries, attackSeries, passSeries, timingSeries]
   return {
-    metrics: metricTemplates.map((template, index) => ({ ...template, value: values[index], data: data[index] })),
+    metrics: metricTemplates.map((template, index) => ({ ...template, value: values[index], data: [...metricSparklineData[index]] })),
     impactValues: [percent(tokenErrorRate, '↓ '), percent(tokenChangeRate, '↑ '), percent(semanticDrift, '↓ '), decimal(averageSimilarityDrop, '↓ ')],
   }
 }
@@ -148,11 +170,16 @@ export function HomePage() {
   const { data: snapshot } = useQuery({
     queryKey: ['home-real-metrics'],
     queryFn: async (): Promise<HomeMetricSnapshot | undefined> => {
-      const tasks = await listTasks()
+      const [tasks, capabilities] = await Promise.all([listTasks(), getCapabilities().catch(() => undefined)])
       const latest = tasks.find((task) => (task.protectionStatus ?? task.status) === 'completed' || (task.protectionStatus ?? task.status) === 'success')
-      if (!latest) return undefined
-      const [result, status] = await Promise.all([getTaskResult(latest.taskId), getTaskStatus(latest.taskId)])
-      return { result, status }
+      const result = latest ? await getTaskResult(latest.taskId).catch(() => undefined) : undefined
+      const cloneResult = await getLatestCloneMetricResult(tasks, result)
+      return {
+        result,
+        cloneResult,
+        maxConcurrency: optionalNumber(capabilities?.runtimeConcurrency?.total),
+        averageStepSec: optionalNumber(capabilities?.runtimePerformance?.averageStepSec),
+      }
     },
     refetchInterval: 30_000,
   })
