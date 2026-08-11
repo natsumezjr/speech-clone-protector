@@ -297,7 +297,10 @@ class IsolatedWorkerRuntimeTest(unittest.TestCase):
         self.assertEqual(payload["device"], "cuda:0")
         self.assertEqual(worker.call_args.kwargs["timeout_seconds"], 33)
         self.assertIs(worker.call_args.kwargs["cancel_event"], cancel_event)
-        self.assertEqual(worker.call_args.kwargs["env_overrides"], {"CUDA_VISIBLE_DEVICES": "4"})
+        self.assertEqual(
+            worker.call_args.kwargs["env_overrides"],
+            {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "4"},
+        )
 
     def test_asr_and_clone_asr_visible_devices_use_logical_cuda_zero(self) -> None:
         worker_response = {
@@ -330,7 +333,10 @@ class IsolatedWorkerRuntimeTest(unittest.TestCase):
 
         asr_payload = worker.call_args.args[1]
         self.assertEqual(asr_payload["device"], "cuda:0")
-        self.assertEqual(worker.call_args.kwargs["env_overrides"], {"CUDA_VISIBLE_DEVICES": "2"})
+        self.assertEqual(
+            worker.call_args.kwargs["env_overrides"],
+            {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "2"},
+        )
 
         with (
             mock.patch.object(result_adapter, "_run_isolated_json_worker", return_value=worker_response) as worker,
@@ -351,7 +357,10 @@ class IsolatedWorkerRuntimeTest(unittest.TestCase):
 
         clone_payload = worker.call_args.args[1]
         self.assertEqual(clone_payload["device"], "cuda:0")
-        self.assertEqual(worker.call_args.kwargs["env_overrides"], {"CUDA_VISIBLE_DEVICES": "3"})
+        self.assertEqual(
+            worker.call_args.kwargs["env_overrides"],
+            {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "3"},
+        )
         self.assertEqual(response["status"], "available")
 
     def test_cosyvoice_visible_device_uses_logical_cuda_zero(self) -> None:
@@ -399,6 +408,13 @@ class IsolatedWorkerRuntimeTest(unittest.TestCase):
             mock.patch.object(result_adapter, "_gpt_sovits_model_status", return_value=("available", None, None)),
             mock.patch.object(result_adapter, "_run_cancellable_subprocess", return_value=completed) as runner,
             mock.patch.object(result_adapter, "GPT_SOVITS_WORKER_MAX_CONCURRENCY", 2),
+            mock.patch.object(result_adapter, "GPT_SOVITS_WORKER_SLOTS", threading.BoundedSemaphore(2)),
+            mock.patch.object(result_adapter, "CLONE_GPU_SLOTS", {}),
+            mock.patch.object(
+                result_adapter,
+                "_nvidia_gpu_inventory",
+                return_value=(("5", "2"), {"5": 48000, "2": 47000}),
+            ),
             mock.patch.object(result_adapter, "GPT_SOVITS_GPU_LEASE_CONDITION", lease_condition),
             mock.patch.object(result_adapter, "GPT_SOVITS_GPU_LEASES", leases),
             mock.patch.dict(
@@ -440,6 +456,22 @@ class IsolatedWorkerRuntimeTest(unittest.TestCase):
         if "SEME2E_CLONE_GPU_MAX_CONCURRENCY" not in result_adapter.os.environ:
             self.assertEqual(result_adapter.CLONE_GPU_MAX_CONCURRENCY, 1)
 
+    def test_gpt_sovits_dynamic_candidates_are_not_truncated_to_worker_limit(self) -> None:
+        with (
+            mock.patch.object(result_adapter, "GPT_SOVITS_WORKER_MAX_CONCURRENCY", 2),
+            mock.patch.dict(
+                result_adapter.os.environ,
+                {
+                    "SEME2E_GPT_SOVITS_GPU_POOL": "5,2,7",
+                    "SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES": "",
+                },
+            ),
+        ):
+            self.assertEqual(
+                result_adapter._gpt_sovits_gpu_candidates("cuda:0"),
+                ("5", "2", "7"),
+            )
+
     def test_gpt_sovits_gpu_pool_runs_two_distinct_leases_and_queues_the_third(self) -> None:
         lease_condition = threading.Condition()
         leases: set[str] = set()
@@ -450,7 +482,7 @@ class IsolatedWorkerRuntimeTest(unittest.TestCase):
 
         def occupy(name: str) -> None:
             try:
-                with result_adapter._gpt_sovits_gpu_lease("cuda:0", None) as leased_gpu:
+                with result_adapter._gpt_sovits_gpu_resource_lease("cuda:0", None) as leased_gpu:
                     assignments[name] = leased_gpu
                     entered[name].set()
                     releases[name].wait(timeout=3)
@@ -460,12 +492,14 @@ class IsolatedWorkerRuntimeTest(unittest.TestCase):
         threads: list[threading.Thread] = []
         with (
             mock.patch.object(result_adapter, "GPT_SOVITS_WORKER_MAX_CONCURRENCY", 2),
+            mock.patch.object(result_adapter, "CLONE_GPU_MAX_CONCURRENCY", 1),
+            mock.patch.object(result_adapter, "CLONE_GPU_SLOTS", {}),
             mock.patch.object(result_adapter, "GPT_SOVITS_GPU_LEASE_CONDITION", lease_condition),
             mock.patch.object(result_adapter, "GPT_SOVITS_GPU_LEASES", leases),
             mock.patch.dict(
                 result_adapter.os.environ,
                 {
-                    "SEME2E_GPT_SOVITS_GPU_POOL": "5,2,7",
+                    "SEME2E_GPT_SOVITS_GPU_POOL": "5,2",
                     "SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES": "",
                 },
             ),
@@ -505,6 +539,8 @@ class IsolatedWorkerRuntimeTest(unittest.TestCase):
         timer = threading.Timer(0.05, cancel_event.set)
         with (
             mock.patch.object(result_adapter, "GPT_SOVITS_WORKER_MAX_CONCURRENCY", 2),
+            mock.patch.object(result_adapter, "CLONE_GPU_MAX_CONCURRENCY", 1),
+            mock.patch.object(result_adapter, "CLONE_GPU_SLOTS", {}),
             mock.patch.object(result_adapter, "GPT_SOVITS_GPU_LEASE_CONDITION", lease_condition),
             mock.patch.object(result_adapter, "GPT_SOVITS_GPU_LEASES", leases),
             mock.patch.dict(
@@ -515,15 +551,17 @@ class IsolatedWorkerRuntimeTest(unittest.TestCase):
                 },
             ),
         ):
-            first = result_adapter._acquire_gpt_sovits_gpu_lease(("5", "2"), None)
-            second = result_adapter._acquire_gpt_sovits_gpu_lease(("5", "2"), None)
+            first, first_slot = result_adapter._acquire_gpt_sovits_gpu_resources(("5", "2"), None)
+            second, second_slot = result_adapter._acquire_gpt_sovits_gpu_resources(("5", "2"), None)
             timer.start()
             try:
                 with self.assertRaisesRegex(RuntimeError, "TASK_CANCELLED"):
-                    result_adapter._acquire_gpt_sovits_gpu_lease(("5", "2"), cancel_event)
+                    result_adapter._acquire_gpt_sovits_gpu_resources(("5", "2"), cancel_event)
             finally:
                 timer.cancel()
+                second_slot.release()
                 result_adapter._release_gpt_sovits_gpu_lease(second)
+                first_slot.release()
                 result_adapter._release_gpt_sovits_gpu_lease(first)
 
         self.assertTrue(cancel_event.is_set())
@@ -670,6 +708,423 @@ class IsolatedWorkerRuntimeTest(unittest.TestCase):
                 ),
                 (),
             )
+
+    def test_dynamic_worker_pool_prefers_more_free_gpu_without_pinning_post_stage(self) -> None:
+        inventory = (("0", "1"), {"0": 4096, "1": 24576})
+        with (
+            mock.patch.object(result_adapter, "CLONE_GPU_SLOTS", {}),
+            mock.patch.object(result_adapter, "_nvidia_gpu_inventory", return_value=inventory),
+            mock.patch.dict(
+                result_adapter.os.environ,
+                {
+                    "SEME2E_GPU_POOL": "0,1",
+                    "SEME2E_ASR_CUDA_VISIBLE_DEVICES": "",
+                },
+            ),
+        ):
+            with result_adapter._isolated_worker_gpu_lease(
+                threading.BoundedSemaphore(1),
+                "cuda:0",
+                "SEME2E_ASR_CUDA_VISIBLE_DEVICES",
+                None,
+                preferred_gpu="0",
+            ) as (worker_device, worker_env, selected_gpu):
+                self.assertEqual(worker_device, "cuda:0")
+                self.assertEqual(selected_gpu, "1")
+                self.assertEqual(
+                    worker_env,
+                    {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "1"},
+                )
+
+    def test_dynamic_worker_wait_below_memory_threshold_can_cancel_without_slot_leak(self) -> None:
+        model_slot = threading.BoundedSemaphore(1)
+        cancel_event = threading.Event()
+        timer = threading.Timer(0.05, cancel_event.set)
+        inventory = (("0",), {"0": 1024})
+        with (
+            mock.patch.object(result_adapter, "CLONE_GPU_MAX_CONCURRENCY", 1),
+            mock.patch.object(result_adapter, "CLONE_GPU_SLOTS", {}),
+            mock.patch.object(result_adapter, "_nvidia_gpu_inventory", return_value=inventory),
+            mock.patch.dict(
+                result_adapter.os.environ,
+                {
+                    "SEME2E_GPU_POOL": "0",
+                    "SEME2E_ASR_CUDA_VISIBLE_DEVICES": "",
+                },
+            ),
+        ):
+            timer.start()
+            try:
+                with self.assertRaisesRegex(RuntimeError, "TASK_CANCELLED"):
+                    with result_adapter._isolated_worker_gpu_lease(
+                        model_slot,
+                        "cuda:0",
+                        "SEME2E_ASR_CUDA_VISIBLE_DEVICES",
+                        cancel_event,
+                        minimum_free_mib=12000,
+                    ):
+                        self.fail("worker must not enter below the free-memory threshold")
+            finally:
+                timer.cancel()
+
+            self.assertTrue(model_slot.acquire(blocking=False))
+            model_slot.release()
+            gpu_slot = result_adapter._clone_gpu_slot("0")
+            self.assertTrue(gpu_slot.acquire(blocking=False))
+            gpu_slot.release()
+
+    def test_explicit_single_gpu_route_is_honored_even_below_dynamic_threshold(self) -> None:
+        inventory = (("4", "5"), {"4": 512, "5": 46000})
+        with (
+            mock.patch.object(result_adapter, "CLONE_GPU_SLOTS", {}),
+            mock.patch.object(result_adapter, "_nvidia_gpu_inventory", return_value=inventory),
+            mock.patch.dict(
+                result_adapter.os.environ,
+                {
+                    "SEME2E_GPU_POOL": "5",
+                    "SEME2E_ASR_CUDA_VISIBLE_DEVICES": "4",
+                },
+            ),
+        ):
+            with result_adapter._isolated_worker_gpu_lease(
+                threading.BoundedSemaphore(1),
+                "cuda:0",
+                "SEME2E_ASR_CUDA_VISIBLE_DEVICES",
+                None,
+                minimum_free_mib=12000,
+            ) as (_, worker_env, selected_gpu):
+                self.assertEqual(selected_gpu, "4")
+                self.assertEqual(worker_env["CUDA_VISIBLE_DEVICES"], "4")
+
+    def test_clone_post_asr_waits_for_the_same_shared_physical_gpu_slot(self) -> None:
+        worker_response = {
+            "ok": True,
+            "model": "openai-whisper:base",
+            "language": "en",
+            "originalText": "original transcript",
+            "protectedText": "protected transcript",
+        }
+        worker_called = threading.Event()
+        response_holder: list[dict[str, object]] = []
+
+        def fake_worker(*args: object, **kwargs: object) -> dict[str, object]:
+            worker_called.set()
+            return worker_response
+
+        with (
+            mock.patch.object(result_adapter, "CLONE_GPU_MAX_CONCURRENCY", 1),
+            mock.patch.object(result_adapter, "CLONE_GPU_SLOTS", {}),
+            mock.patch.object(result_adapter, "ASR_WORKER_SLOTS", threading.BoundedSemaphore(1)),
+            mock.patch.object(result_adapter, "_run_isolated_json_worker", side_effect=fake_worker),
+            mock.patch.dict(
+                result_adapter.os.environ,
+                {
+                    "SEME2E_API_DEVICE": "cuda:0",
+                    "SEME2E_CLONE_ASR_CUDA_VISIBLE_DEVICES": "4",
+                },
+            ),
+        ):
+            busy_slot = result_adapter._clone_gpu_slot("4")
+            busy_slot.acquire()
+
+            def transcribe() -> None:
+                response_holder.append(
+                    result_adapter._transcribe_clone_pair_isolated(
+                        Path("original_clone.wav"),
+                        Path("protected_clone.wav"),
+                        {"asrModel": "openai-whisper:base", "language": "en", "text": "target"},
+                    )
+                )
+
+            thread = threading.Thread(target=transcribe)
+            thread.start()
+            try:
+                self.assertFalse(worker_called.wait(timeout=0.15))
+            finally:
+                busy_slot.release()
+            self.assertTrue(worker_called.wait(timeout=1))
+            thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(response_holder[0]["status"], "available")
+
+    def test_gpt_resource_selection_skips_busy_highest_free_gpu(self) -> None:
+        lease_condition = threading.Condition()
+        leases: set[str] = set()
+        inventory = (("5", "2"), {"5": 46000, "2": 42000})
+        with (
+            mock.patch.object(result_adapter, "CLONE_GPU_MAX_CONCURRENCY", 1),
+            mock.patch.object(result_adapter, "CLONE_GPU_SLOTS", {}),
+            mock.patch.object(result_adapter, "GPT_SOVITS_GPU_LEASE_CONDITION", lease_condition),
+            mock.patch.object(result_adapter, "GPT_SOVITS_GPU_LEASES", leases),
+            mock.patch.object(result_adapter, "_nvidia_gpu_inventory", return_value=inventory),
+            mock.patch.dict(
+                result_adapter.os.environ,
+                {
+                    "SEME2E_GPT_SOVITS_GPU_POOL": "5,2",
+                    "SEME2E_GPU_MIN_FREE_MIB": "0",
+                },
+            ),
+        ):
+            busy_slot = result_adapter._clone_gpu_slot("5")
+            busy_slot.acquire()
+            try:
+                selected_gpu, selected_slot = result_adapter._acquire_gpt_sovits_gpu_resources(("5", "2"), None)
+                self.assertEqual(selected_gpu, "2")
+                selected_slot.release()
+                result_adapter._release_gpt_sovits_gpu_lease(selected_gpu)
+            finally:
+                busy_slot.release()
+
+        self.assertEqual(leases, set())
+
+    def test_clone_semantic_worker_uses_dynamic_pool_and_logical_cuda_zero(self) -> None:
+        worker_response = {
+            "ok": True,
+            "metrics": {"status": "available", "tokenChangeRate": 0.7, "semanticDrift": 0.4},
+        }
+        with (
+            mock.patch.object(result_adapter, "CLONE_GPU_SLOTS", {}),
+            mock.patch.object(result_adapter, "SEMANTIC_WORKER_SLOTS", threading.BoundedSemaphore(1)),
+            mock.patch.object(result_adapter, "_run_isolated_json_worker", return_value=worker_response) as worker,
+            mock.patch.dict(
+                result_adapter.os.environ,
+                {
+                    "SEME2E_API_DEVICE": "cuda:0",
+                    "SEME2E_GPU_POOL": "3",
+                    "SEME2E_SEMANTIC_CUDA_VISIBLE_DEVICES": "",
+                    "SEME2E_TOKENIZER_DEVICE": "",
+                    "SEME2E_SEMANTIC_ENCODER_DEVICE": "",
+                },
+            ),
+        ):
+            response = result_adapter._compute_clone_semantic_isolated(
+                Path("original_clone.wav"),
+                Path("protected_clone.wav"),
+                {},
+            )
+
+        self.assertEqual(response["status"], "available")
+        self.assertEqual(
+            worker.call_args.kwargs["env_overrides"],
+            {
+                "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+                "CUDA_VISIBLE_DEVICES": "3",
+                "SEME2E_API_DEVICE": "cuda:0",
+                "SEME2E_SEMANTIC_DEVICE": "cuda:0",
+                "SEME2E_TOKENIZER_DEVICE": "cuda:0",
+                "SEME2E_SEMANTIC_ENCODER_DEVICE": "cuda:0",
+            },
+        )
+
+    def test_clone_semantic_worker_maps_explicit_cuda_devices_to_child_cuda_zero(self) -> None:
+        worker_response = {
+            "ok": True,
+            "metrics": {"status": "available", "tokenChangeRate": 0.7, "semanticDrift": 0.4},
+        }
+        inventory = (
+            ("0", "1", "2"),
+            {"0": 1000, "1": 2000, "2": 3000},
+            {"0": "gpu-0", "1": "gpu-1", "2": "gpu-2"},
+        )
+        with (
+            mock.patch.object(result_adapter, "CLONE_GPU_SLOTS", {}),
+            mock.patch.object(result_adapter, "SEMANTIC_WORKER_SLOTS", threading.BoundedSemaphore(1)),
+            mock.patch.object(result_adapter, "_nvidia_gpu_inventory", return_value=inventory),
+            mock.patch.object(result_adapter, "_run_isolated_json_worker", return_value=worker_response) as worker,
+            mock.patch.dict(
+                result_adapter.os.environ,
+                {
+                    "SEME2E_API_DEVICE": "cuda:0",
+                    "SEME2E_GPU_POOL": "0,1,2",
+                    "SEME2E_SEMANTIC_DEVICE": "cuda:2",
+                    "SEME2E_SEMANTIC_CUDA_VISIBLE_DEVICES": "",
+                    "SEME2E_TOKENIZER_DEVICE": "cuda:7",
+                    "SEME2E_SEMANTIC_ENCODER_DEVICE": "cuda:9",
+                },
+            ),
+        ):
+            response = result_adapter._compute_clone_semantic_isolated(
+                Path("original_clone.wav"),
+                Path("protected_clone.wav"),
+                {},
+            )
+
+        self.assertEqual(response["status"], "available")
+        child_env = worker.call_args.kwargs["env_overrides"]
+        self.assertEqual(child_env["CUDA_VISIBLE_DEVICES"], "2")
+        self.assertEqual(child_env["SEME2E_API_DEVICE"], "cuda:0")
+        self.assertEqual(child_env["SEME2E_SEMANTIC_DEVICE"], "cuda:0")
+        self.assertEqual(child_env["SEME2E_TOKENIZER_DEVICE"], "cuda:0")
+        self.assertEqual(child_env["SEME2E_SEMANTIC_ENCODER_DEVICE"], "cuda:0")
+
+    def test_clone_semantic_worker_preserves_explicit_cpu_devices(self) -> None:
+        worker_response = {
+            "ok": True,
+            "metrics": {"status": "available", "tokenChangeRate": 0.7, "semanticDrift": 0.4},
+        }
+        with (
+            mock.patch.object(result_adapter, "SEMANTIC_WORKER_SLOTS", threading.BoundedSemaphore(1)),
+            mock.patch.object(result_adapter, "_run_isolated_json_worker", return_value=worker_response) as worker,
+            mock.patch.dict(
+                result_adapter.os.environ,
+                {
+                    "SEME2E_API_DEVICE": "cuda:0",
+                    "SEME2E_SEMANTIC_DEVICE": "cpu",
+                    "SEME2E_TOKENIZER_DEVICE": "cpu",
+                    "SEME2E_SEMANTIC_ENCODER_DEVICE": "cpu",
+                },
+            ),
+        ):
+            response = result_adapter._compute_clone_semantic_isolated(
+                Path("original_clone.wav"),
+                Path("protected_clone.wav"),
+                {},
+            )
+
+        self.assertEqual(response["status"], "available")
+        child_env = worker.call_args.kwargs["env_overrides"]
+        self.assertNotIn("CUDA_VISIBLE_DEVICES", child_env)
+        self.assertEqual(child_env["SEME2E_API_DEVICE"], "cpu")
+        self.assertEqual(child_env["SEME2E_SEMANTIC_DEVICE"], "cpu")
+        self.assertEqual(child_env["SEME2E_TOKENIZER_DEVICE"], "cpu")
+        self.assertEqual(child_env["SEME2E_SEMANTIC_ENCODER_DEVICE"], "cpu")
+
+    def test_gpu_index_and_uuid_share_one_physical_slot_and_capacity_key(self) -> None:
+        inventory = (
+            ("0", "1"),
+            {"0": 32000, "GPU-AAAA": 32000, "1": 24000, "GPU-BBBB": 24000},
+            {
+                "0": "gpu-aaaa",
+                "GPU-AAAA": "gpu-aaaa",
+                "gpu-aaaa": "gpu-aaaa",
+                "1": "gpu-bbbb",
+                "GPU-BBBB": "gpu-bbbb",
+                "gpu-bbbb": "gpu-bbbb",
+            },
+        )
+        with (
+            mock.patch.object(result_adapter, "CLONE_GPU_MAX_CONCURRENCY", 1),
+            mock.patch.object(result_adapter, "CLONE_GPU_SLOTS", {}),
+            mock.patch.object(result_adapter, "_nvidia_gpu_inventory", return_value=inventory),
+        ):
+            self.assertIs(result_adapter._clone_gpu_slot("0"), result_adapter._clone_gpu_slot("GPU-AAAA"))
+            maximum = result_adapter.maximum_gpu_worker_concurrency(
+                worker_limits={"asr": 1, "clone": 1},
+                worker_gpu_keys={"asr": ("0",), "clone": ("GPU-AAAA",)},
+                gpu_slot_limit=1,
+            )
+            with result_adapter._isolated_worker_gpu_lease(
+                threading.BoundedSemaphore(1),
+                "cuda:0",
+                "SEME2E_ASR_CUDA_VISIBLE_DEVICES",
+                None,
+            ) as (_, worker_env, selected_gpu):
+                self.assertEqual(selected_gpu, "0")
+                self.assertEqual(worker_env["CUDA_VISIBLE_DEVICES"], "0")
+
+        self.assertEqual(maximum, 1)
+
+    def test_nvidia_inventory_slow_query_is_single_flight(self) -> None:
+        query_started = threading.Event()
+        release_query = threading.Event()
+        query_calls = 0
+        query_guard = threading.Lock()
+        results: list[tuple[tuple[str, ...], dict[str, int], dict[str, str]]] = []
+
+        def slow_query() -> tuple[tuple[str, ...], dict[str, int], dict[str, str]]:
+            nonlocal query_calls
+            with query_guard:
+                query_calls += 1
+            query_started.set()
+            release_query.wait(timeout=1)
+            return (("0",), {"0": 32000}, {"0": "gpu-0"})
+
+        with (
+            mock.patch.object(result_adapter, "GPU_INVENTORY_CACHE_AT", 0.0),
+            mock.patch.object(result_adapter, "GPU_INVENTORY_CACHE", ((), {}, {})),
+            mock.patch.object(result_adapter, "_query_nvidia_gpu_inventory", side_effect=slow_query),
+            mock.patch.dict(result_adapter.os.environ, {"SEME2E_GPU_INVENTORY_CACHE_SECONDS": "2"}),
+        ):
+            threads = [
+                threading.Thread(target=lambda: results.append(result_adapter._nvidia_gpu_inventory()))
+                for _ in range(4)
+            ]
+            for thread in threads:
+                thread.start()
+            self.assertTrue(query_started.wait(timeout=1))
+            time.sleep(0.03)
+            release_query.set()
+            for thread in threads:
+                thread.join(timeout=1)
+
+        self.assertEqual(query_calls, 1)
+        self.assertEqual(len(results), 4)
+
+    def test_nvidia_inventory_maps_index_and_uuid_to_one_canonical_key(self) -> None:
+        completed = mock.Mock(
+            returncode=0,
+            stdout="0, GPU-AAAA, 32768\n1, GPU-BBBB, 24576\n",
+            stderr="",
+        )
+        with mock.patch.object(result_adapter.subprocess, "run", return_value=completed):
+            indices, free_memory, canonical_keys = result_adapter._query_nvidia_gpu_inventory()
+
+        self.assertEqual(indices, ("0", "1"))
+        self.assertEqual(free_memory["0"], 32768)
+        self.assertEqual(free_memory["GPU-AAAA"], 32768)
+        self.assertEqual(canonical_keys["0"], "gpu-aaaa")
+        self.assertEqual(canonical_keys["GPU-AAAA"], "gpu-aaaa")
+
+    def test_gpu_acquire_timeout_is_plain_and_inventory_queries_are_ttl_throttled(self) -> None:
+        query_calls = 0
+
+        def query() -> tuple[tuple[str, ...], dict[str, int], dict[str, str]]:
+            nonlocal query_calls
+            query_calls += 1
+            return (("0",), {"0": 32000}, {"0": "gpu-0"})
+
+        with (
+            mock.patch.object(result_adapter, "CLONE_GPU_MAX_CONCURRENCY", 1),
+            mock.patch.object(result_adapter, "CLONE_GPU_SLOTS", {}),
+            mock.patch.object(result_adapter, "GPU_INVENTORY_CACHE_AT", 0.0),
+            mock.patch.object(result_adapter, "GPU_INVENTORY_CACHE", ((), {}, {})),
+            mock.patch.object(result_adapter, "_query_nvidia_gpu_inventory", side_effect=query),
+            mock.patch.dict(
+                result_adapter.os.environ,
+                {
+                    "SEME2E_GPU_ACQUIRE_TIMEOUT_SECONDS": "0.08",
+                    "SEME2E_GPU_INVENTORY_CACHE_SECONDS": "1",
+                },
+            ),
+        ):
+            busy_slot = result_adapter._clone_gpu_slot("0")
+            busy_slot.acquire()
+            try:
+                with self.assertRaisesRegex(RuntimeError, "等待可用 GPU 超时"):
+                    result_adapter._acquire_best_gpu_slot(("0",), None)
+            finally:
+                busy_slot.release()
+
+        self.assertEqual(query_calls, 1)
+
+    def test_capacity_snapshot_uses_tts_device_for_both_coqui_and_cosyvoice(self) -> None:
+        with mock.patch.dict(
+            result_adapter.os.environ,
+            {
+                "SEME2E_API_DEVICE": "cuda:0",
+                "SEME2E_TTS_DEVICE": "cuda:1",
+                "SEME2E_GPU_POOL": "5,2",
+                "SEME2E_COQUI_TTS_CUDA_VISIBLE_DEVICES": "",
+                "SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES": "",
+                "SEME2E_GPT_SOVITS_GPU_POOL": "",
+                "SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES": "",
+            },
+        ):
+            snapshot = result_adapter.clone_worker_capacity_snapshot()
+
+        self.assertEqual(snapshot["gpuKeys"]["coquiTts"], ["2"])
+        self.assertEqual(snapshot["gpuKeys"]["cosyVoice"], ["2"])
 
     def test_different_clone_models_share_one_physical_gpu_slot(self) -> None:
         first_entered = threading.Event()

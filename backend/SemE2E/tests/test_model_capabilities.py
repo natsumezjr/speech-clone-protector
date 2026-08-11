@@ -219,6 +219,8 @@ class ModelCapabilitiesTest(unittest.TestCase):
             ASR_WORKER_MAX_CONCURRENCY=2,
             clone_worker_capacity_snapshot=lambda: {
                 "maxConcurrency": 3,
+                "asrCloneMaxConcurrency": 4,
+                "protectSharesWorkerGpu": False,
                 "backendLimits": {"coquiTts": 1, "cosyVoice": 1, "gptSoVits": 2},
                 "gpuSlotLimit": 1,
                 "gpuKeys": {"coquiTts": ["4"], "cosyVoice": ["4"], "gptSoVits": ["0", "1"]},
@@ -229,9 +231,35 @@ class ModelCapabilitiesTest(unittest.TestCase):
         self.assertEqual(payload["protect"], 3)
         self.assertEqual(payload["asr"], 2)
         self.assertEqual(payload["clone"], 3)
-        self.assertEqual(payload["total"], 8)
+        self.assertEqual(payload["asrCloneShared"], 4)
+        self.assertFalse(payload["protectSharesWorkerGpu"])
+        self.assertEqual(payload["total"], 7)
         self.assertEqual(payload["unit"], "worker")
         self.assertIn("HTTP", payload["definition"])
+
+    def test_runtime_concurrency_does_not_add_protect_when_single_gpu_is_shared(self) -> None:
+        namespace = dict(api_server.runtime_concurrency_snapshot.__globals__)
+        namespace.update(
+            PROTECT_MAX_CONCURRENCY=1,
+            ASR_WORKER_MAX_CONCURRENCY=1,
+            clone_worker_capacity_snapshot=lambda: {
+                "maxConcurrency": 1,
+                "asrCloneMaxConcurrency": 1,
+                "protectSharesWorkerGpu": True,
+                "backendLimits": {"coquiTts": 1, "cosyVoice": 1, "gptSoVits": 1},
+                "gpuSlotLimit": 1,
+                "gpuKeys": {"coquiTts": ["0"], "cosyVoice": ["0"], "gptSoVits": ["0"]},
+                "asrGpuKeys": ["0"],
+            },
+        )
+        snapshot = type(api_server.runtime_concurrency_snapshot)(
+            api_server.runtime_concurrency_snapshot.__code__,
+            namespace,
+        )()
+
+        self.assertEqual(snapshot["total"], 1)
+        self.assertTrue(snapshot["protectSharesWorkerGpu"])
+        self.assertIn("共享同一 GPU", snapshot["definition"])
 
     def test_clone_concurrency_respects_shared_gpu_slots(self) -> None:
         maximum = result_adapter.maximum_clone_worker_concurrency(
@@ -268,6 +296,64 @@ class ModelCapabilitiesTest(unittest.TestCase):
             gpt_sovits_gpu_keys=("0", "1"),
         )
         self.assertEqual(maximum, 2)
+
+    def test_asr_and_clone_dynamic_pool_capacity_is_bounded_by_physical_slots(self) -> None:
+        maximum = result_adapter.maximum_gpu_worker_concurrency(
+            worker_limits={"asr": 2, "coqui": 1, "cosy": 1, "gpt": 2},
+            worker_gpu_keys={
+                "asr": ("0", "1", "2"),
+                "coqui": ("0", "1", "2"),
+                "cosy": ("0", "1", "2"),
+                "gpt": ("0", "1", "2"),
+            },
+            gpu_slot_limit=1,
+        )
+
+        self.assertEqual(maximum, 3)
+
+    def test_capacity_snapshot_detects_index_uuid_alias_as_shared_protect_gpu(self) -> None:
+        inventory = (
+            ("0",),
+            {"0": 32000, "GPU-AAAA": 32000},
+            {"0": "gpu-aaaa", "GPU-AAAA": "gpu-aaaa", "gpu-aaaa": "gpu-aaaa"},
+        )
+        with (
+            patch.object(result_adapter, "_nvidia_gpu_inventory", return_value=inventory),
+            patch.dict(
+                result_adapter.os.environ,
+                {
+                    "SEME2E_API_DEVICE": "cuda:0",
+                    "CUDA_VISIBLE_DEVICES": "GPU-AAAA",
+                    "SEME2E_GPU_POOL": "0",
+                    "SEME2E_PROTECT_GPU_SHARED_WITH_WORKERS": "",
+                    "SEME2E_TTS_DEVICE": "",
+                    "SEME2E_ASR_DEVICE": "",
+                    "SEME2E_COQUI_TTS_CUDA_VISIBLE_DEVICES": "",
+                    "SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES": "",
+                    "SEME2E_GPT_SOVITS_GPU_POOL": "",
+                    "SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES": "",
+                    "SEME2E_ASR_CUDA_VISIBLE_DEVICES": "",
+                },
+            ),
+        ):
+            snapshot = result_adapter.clone_worker_capacity_snapshot()
+
+        self.assertTrue(snapshot["protectSharesWorkerGpu"])
+        self.assertEqual(snapshot["protectGpuKeys"], ["GPU-AAAA"])
+
+    def test_remote_setup_uses_shared_dynamic_worker_pool_instead_of_role_pins(self) -> None:
+        script = (ROOT.parents[1] / "remote-setup.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('export SEME2E_GPU_POOL="$worker_gpu_pool"', script)
+        self.assertIn("unset SEME2E_ASR_CUDA_VISIBLE_DEVICES", script)
+        self.assertIn("unset SEME2E_CLONE_ASR_CUDA_VISIBLE_DEVICES", script)
+        self.assertIn("unset SEME2E_COQUI_TTS_CUDA_VISIBLE_DEVICES", script)
+        self.assertIn("unset SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES", script)
+        self.assertIn("export SEME2E_PROTECT_GPU_SHARED_WITH_WORKERS=1", script)
+        self.assertIn("export SEME2E_PROTECT_GPU_SHARED_WITH_WORKERS=0", script)
+        self.assertIn("export SEME2E_PROTECT_CUDA_VISIBLE_DEVICES=\"$protect_gpu\"", script)
+        self.assertIn("export SEME2E_TOKENIZER_DEVICE='cuda:0'", script)
+        self.assertIn("export SEME2E_SEMANTIC_ENCODER_DEVICE='cuda:0'", script)
 
     def test_latest_runtime_performance_uses_latest_completed_real_average(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

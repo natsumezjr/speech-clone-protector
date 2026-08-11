@@ -64,6 +64,7 @@ class AsrBackendConcurrencyTest(unittest.TestCase):
                 os.environ,
                 {
                     "SEME2E_API_DEVICE": "cuda:7",
+                    "SEME2E_GPU_POOL": "4",
                     "SEME2E_ASR_WORKER_TIMEOUT_SECONDS": "17",
                 },
             ),
@@ -88,13 +89,14 @@ class AsrBackendConcurrencyTest(unittest.TestCase):
             result_adapter.ROOT / "asr_worker.py",
             {
                 "model": "openai-whisper:base",
-                "device": "cuda:7",
+                "device": "cuda:0",
                 "language": "en",
                 "originalPath": str(clean_path.resolve()),
                 "protectedPath": str(protected_path.resolve()),
             },
             timeout_seconds=17,
             cancel_event=None,
+            env_overrides={"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "4"},
         )
 
     def test_concurrent_asr_requests_use_independent_workers(self) -> None:

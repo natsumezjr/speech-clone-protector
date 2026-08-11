@@ -604,6 +604,8 @@ export interface RuntimeConcurrency {
   protect: number
   asr: number
   clone: number
+  asrCloneShared?: number
+  protectSharesWorkerGpu?: boolean
   total: number
   unit?: string
   definition?: string
@@ -611,6 +613,7 @@ export interface RuntimeConcurrency {
   cloneGpuSlots?: {
     limitPerGpu?: number
     keys?: Record<string, string[]>
+    asr?: string[]
   }
 }
 

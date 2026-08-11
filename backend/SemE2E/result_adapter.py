@@ -603,6 +603,7 @@ def _transcribe_clone_pair_isolated(
     payload: dict[str, Any],
     *,
     cancel_event: Any | None = None,
+    preferred_gpu: str | None = None,
 ) -> dict[str, Any]:
     model = str(
         payload.get("asrModel")
@@ -614,25 +615,36 @@ def _transcribe_clone_pair_isolated(
     if language.lower() in {"auto", "default", ""}:
         target_text = str(payload.get("text") or "")
         language = "zh" if any("\u4e00" <= char <= "\u9fff" for char in target_text) else "en"
-    worker_device, worker_env = _cuda_worker_runtime(
-        os.getenv("SEME2E_CLONE_ASR_DEVICE") or os.getenv("SEME2E_API_DEVICE", "cpu"),
-        "SEME2E_CLONE_ASR_CUDA_VISIBLE_DEVICES",
-    )
-    _acquire_worker_slot(ASR_WORKER_SLOTS, cancel_event)
+    requested_device = os.getenv("SEME2E_CLONE_ASR_DEVICE") or os.getenv("SEME2E_API_DEVICE", "cpu")
     try:
-        response = _run_isolated_json_worker(
-            ROOT / "asr_worker.py",
-            {
-                "model": model,
-                "device": worker_device,
-                "language": language,
-                "originalPath": str(clean_clone_path.resolve()),
-                "protectedPath": str(protected_clone_path.resolve()),
-            },
-            timeout_seconds=_env_int("SEME2E_CLONE_ASR_WORKER_TIMEOUT_SECONDS", 600),
-            cancel_event=cancel_event,
-            **({"env_overrides": worker_env} if worker_env else {}),
-        )
+        with _isolated_worker_gpu_lease(
+            ASR_WORKER_SLOTS,
+            requested_device,
+            "SEME2E_CLONE_ASR_CUDA_VISIBLE_DEVICES",
+            cancel_event,
+            explicit_device=bool(os.getenv("SEME2E_CLONE_ASR_DEVICE", "").strip()),
+            preferred_gpu=preferred_gpu,
+            minimum_free_mib=max(
+                0,
+                _env_int(
+                    "SEME2E_ASR_GPU_MIN_FREE_MIB",
+                    _env_int("SEME2E_GPU_MIN_FREE_MIB", 0),
+                ),
+            ),
+        ) as (worker_device, worker_env, _):
+            response = _run_isolated_json_worker(
+                ROOT / "asr_worker.py",
+                {
+                    "model": model,
+                    "device": worker_device,
+                    "language": language,
+                    "originalPath": str(clean_clone_path.resolve()),
+                    "protectedPath": str(protected_clone_path.resolve()),
+                },
+                timeout_seconds=_env_int("SEME2E_CLONE_ASR_WORKER_TIMEOUT_SECONDS", 600),
+                cancel_event=cancel_event,
+                **({"env_overrides": worker_env} if worker_env else {}),
+            )
     except RuntimeError as exc:
         if str(exc) == "TASK_CANCELLED":
             raise
@@ -651,8 +663,6 @@ def _transcribe_clone_pair_isolated(
             "protectedText": None,
             "reason": f"克隆语音文本尚未生成：{exc}",
         }
-    finally:
-        ASR_WORKER_SLOTS.release()
     return {
         "status": "available",
         "model": response.get("model") or model,
@@ -664,25 +674,68 @@ def _transcribe_clone_pair_isolated(
     }
 
 
+def _semantic_child_device(parent_value: str | None, worker_device: str) -> str:
+    raw_value = str(parent_value or "").strip()
+    if not raw_value:
+        return worker_device
+    normalized = raw_value.lower()
+    if normalized.startswith("cpu"):
+        return raw_value
+    if normalized.startswith("cuda"):
+        return "cuda:0" if worker_device.lower().startswith("cuda") else worker_device
+    return raw_value
+
+
 def _compute_clone_semantic_isolated(
     clean_clone_path: Path,
     protected_clone_path: Path,
     config: dict[str, Any],
     *,
     cancel_event: Any | None = None,
+    preferred_gpu: str | None = None,
 ) -> dict[str, Any]:
-    _acquire_worker_slot(SEMANTIC_WORKER_SLOTS, cancel_event)
+    requested_device = os.getenv("SEME2E_SEMANTIC_DEVICE") or os.getenv("SEME2E_API_DEVICE", "cpu")
     try:
-        response = _run_isolated_json_worker(
-            ROOT / "semantic_metrics_worker.py",
-            {
-                "originalPath": str(clean_clone_path.resolve()),
-                "protectedPath": str(protected_clone_path.resolve()),
-                "config": config,
-            },
-            timeout_seconds=_env_int("SEME2E_SEMANTIC_WORKER_TIMEOUT_SECONDS", 900),
-            cancel_event=cancel_event,
-        )
+        with _isolated_worker_gpu_lease(
+            SEMANTIC_WORKER_SLOTS,
+            requested_device,
+            "SEME2E_SEMANTIC_CUDA_VISIBLE_DEVICES",
+            cancel_event,
+            explicit_device=bool(os.getenv("SEME2E_SEMANTIC_DEVICE", "").strip()),
+            preferred_gpu=preferred_gpu,
+            minimum_free_mib=max(
+                0,
+                _env_int(
+                    "SEME2E_SEMANTIC_GPU_MIN_FREE_MIB",
+                    _env_int("SEME2E_GPU_MIN_FREE_MIB", 0),
+                ),
+            ),
+        ) as (worker_device, worker_env, _):
+            semantic_env = dict(worker_env or {})
+            semantic_env["SEME2E_API_DEVICE"] = worker_device
+            semantic_env["SEME2E_SEMANTIC_DEVICE"] = _semantic_child_device(
+                os.getenv("SEME2E_SEMANTIC_DEVICE"),
+                worker_device,
+            )
+            semantic_env["SEME2E_TOKENIZER_DEVICE"] = _semantic_child_device(
+                os.getenv("SEME2E_TOKENIZER_DEVICE"),
+                worker_device,
+            )
+            semantic_env["SEME2E_SEMANTIC_ENCODER_DEVICE"] = _semantic_child_device(
+                os.getenv("SEME2E_SEMANTIC_ENCODER_DEVICE"),
+                worker_device,
+            )
+            response = _run_isolated_json_worker(
+                ROOT / "semantic_metrics_worker.py",
+                {
+                    "originalPath": str(clean_clone_path.resolve()),
+                    "protectedPath": str(protected_clone_path.resolve()),
+                    "config": config,
+                },
+                timeout_seconds=_env_int("SEME2E_SEMANTIC_WORKER_TIMEOUT_SECONDS", 900),
+                cancel_event=cancel_event,
+                **({"env_overrides": semantic_env} if semantic_env else {}),
+            )
         metrics = response.get("metrics")
         if not isinstance(metrics, dict):
             raise ValueError("semantic worker did not return metrics")
@@ -705,8 +758,6 @@ def _compute_clone_semantic_isolated(
             "semanticDrift": None,
             "reason": f"克隆语义指标尚未生成：{exc}",
         }
-    finally:
-        SEMANTIC_WORKER_SLOTS.release()
 
 
 def _env_list(name: str, default: list[str]) -> list[str]:
@@ -732,10 +783,15 @@ SEMANTIC_WORKER_SLOTS = threading.BoundedSemaphore(SEMANTIC_WORKER_MAX_CONCURREN
 COQUI_TTS_WORKER_SLOTS = threading.BoundedSemaphore(COQUI_TTS_WORKER_MAX_CONCURRENCY)
 COSYVOICE_WORKER_SLOTS = threading.BoundedSemaphore(COSYVOICE_WORKER_MAX_CONCURRENCY)
 DNSMOS_WORKER_SLOTS = threading.BoundedSemaphore(DNSMOS_WORKER_MAX_CONCURRENCY)
+GPT_SOVITS_WORKER_SLOTS = threading.BoundedSemaphore(GPT_SOVITS_WORKER_MAX_CONCURRENCY)
 CLONE_GPU_SLOTS_GUARD = threading.Lock()
 CLONE_GPU_SLOTS: dict[str, threading.BoundedSemaphore] = {}
 GPT_SOVITS_GPU_LEASE_CONDITION = threading.Condition()
 GPT_SOVITS_GPU_LEASES: set[str] = set()
+GPU_INVENTORY_CACHE_GUARD = threading.Lock()
+GPU_INVENTORY_CACHE_AT = 0.0
+GPU_INVENTORY_CACHE: tuple[tuple[str, ...], dict[str, int], dict[str, str]] = ((), {}, {})
+GPU_ACQUIRE_TIMEOUT_MESSAGE = "等待可用 GPU 超时，请稍后重试，或释放显存后重新运行。"
 
 
 def _acquire_worker_slot(semaphore: threading.BoundedSemaphore, cancel_event: Any | None) -> None:
@@ -769,6 +825,302 @@ def _visible_gpu_tokens(raw_value: str) -> tuple[str, ...]:
     return tuple(values)
 
 
+def _query_nvidia_gpu_inventory() -> tuple[tuple[str, ...], dict[str, int], dict[str, str]]:
+    """Return GPU launch indices, free memory aliases, and canonical physical keys."""
+    command = [
+        "nvidia-smi",
+        "--query-gpu=index,uuid,memory.free",
+        "--format=csv,noheader,nounits",
+    ]
+    process_options: dict[str, Any] = {}
+    if os.name == "nt":
+        process_options["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=max(1, _env_int("SEME2E_NVIDIA_SMI_TIMEOUT_SECONDS", 3)),
+            **process_options,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return (), {}, {}
+    if completed.returncode != 0:
+        return (), {}, {}
+
+    indices: list[str] = []
+    free_memory: dict[str, int] = {}
+    canonical_keys: dict[str, str] = {}
+    for raw_line in completed.stdout.splitlines():
+        parts = [part.strip() for part in raw_line.split(",")]
+        if len(parts) < 3:
+            continue
+        index, gpu_uuid, free_raw = parts[0], parts[1], parts[2]
+        try:
+            free_mib = int(float(free_raw))
+        except ValueError:
+            continue
+        if index and index not in indices:
+            indices.append(index)
+        canonical_key = (gpu_uuid or index).lower()
+        if index:
+            free_memory[index] = free_mib
+            canonical_keys[index] = canonical_key
+        if gpu_uuid:
+            free_memory[gpu_uuid] = free_mib
+            free_memory[gpu_uuid.lower()] = free_mib
+            canonical_keys[gpu_uuid] = canonical_key
+            canonical_keys[gpu_uuid.lower()] = canonical_key
+        if canonical_key:
+            free_memory[canonical_key] = free_mib
+            canonical_keys[canonical_key] = canonical_key
+    return tuple(indices), free_memory, canonical_keys
+
+
+def _nvidia_gpu_inventory(
+    *,
+    force: bool = False,
+) -> tuple[tuple[str, ...], dict[str, int], dict[str, str]]:
+    global GPU_INVENTORY_CACHE_AT, GPU_INVENTORY_CACHE
+    ttl_seconds = max(0.1, _env_float("SEME2E_GPU_INVENTORY_CACHE_SECONDS", 1.0))
+    now = time.monotonic()
+    with GPU_INVENTORY_CACHE_GUARD:
+        # TTL is enforced even for refresh requests so concurrent/polling callers
+        # collapse into one nvidia-smi process instead of launching one per loop.
+        if GPU_INVENTORY_CACHE_AT > 0 and now - GPU_INVENTORY_CACHE_AT < ttl_seconds:
+            indices, free_memory, canonical_keys = GPU_INVENTORY_CACHE
+            return indices, dict(free_memory), dict(canonical_keys)
+        GPU_INVENTORY_CACHE = _query_nvidia_gpu_inventory()
+        GPU_INVENTORY_CACHE_AT = time.monotonic()
+        indices, free_memory, canonical_keys = GPU_INVENTORY_CACHE
+        return indices, dict(free_memory), dict(canonical_keys)
+
+
+def _unpack_gpu_inventory(
+    inventory: tuple[Any, ...],
+) -> tuple[tuple[str, ...], dict[str, int], dict[str, str]]:
+    """Accept the current inventory shape and older two-field test fixtures."""
+    indices = tuple(str(item) for item in (inventory[0] if inventory else ()))
+    free_memory = dict(inventory[1]) if len(inventory) > 1 else {}
+    if len(inventory) > 2:
+        canonical_keys = {str(key): str(value) for key, value in dict(inventory[2]).items()}
+    else:
+        canonical_keys = {str(key): str(key) for key in free_memory}
+    return indices, free_memory, canonical_keys
+
+
+def _canonical_gpu_slot_key(token: str, canonical_keys: Mapping[str, str] | None = None) -> str:
+    raw_token = str(token).strip()
+    if not raw_token:
+        return raw_token
+    if canonical_keys is None:
+        _, _, canonical_keys = _unpack_gpu_inventory(_nvidia_gpu_inventory())
+    exact = canonical_keys.get(raw_token) or canonical_keys.get(raw_token.lower())
+    if exact:
+        return exact
+    lowered = raw_token.lower()
+    if lowered.startswith(("gpu-", "mig-")):
+        prefix_matches = {
+            canonical
+            for alias, canonical in canonical_keys.items()
+            if str(alias).lower().startswith(lowered)
+        }
+        if len(prefix_matches) == 1:
+            return next(iter(prefix_matches))
+        return lowered
+    return raw_token
+
+
+def _unique_gpu_tokens(
+    candidates: tuple[str, ...],
+    canonical_keys: Mapping[str, str],
+) -> tuple[str, ...]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        slot_key = _canonical_gpu_slot_key(candidate, canonical_keys)
+        if not candidate or slot_key in seen:
+            continue
+        seen.add(slot_key)
+        values.append(candidate)
+    return tuple(values)
+
+
+def _gpu_free_memory_mib(
+    token: str,
+    free_memory: Mapping[str, int],
+    canonical_keys: Mapping[str, str],
+) -> int | None:
+    if token in free_memory:
+        return free_memory[token]
+    lowered = token.lower()
+    if lowered in free_memory:
+        return free_memory[lowered]
+    return free_memory.get(_canonical_gpu_slot_key(token, canonical_keys))
+
+
+def _cuda_device_index(requested_device: str) -> int:
+    normalized = (requested_device or "").strip().lower()
+    if ":" not in normalized:
+        return 0
+    try:
+        return max(0, int(normalized.split(":", 1)[1]))
+    except ValueError:
+        return 0
+
+
+def _worker_gpu_candidates(
+    requested_device: str,
+    visible_devices_env: str,
+    *,
+    explicit_device: bool = False,
+) -> tuple[str, ...]:
+    """Resolve physical GPU candidates without changing the API process device."""
+    explicit_visible_devices = _visible_gpu_tokens(os.getenv(visible_devices_env, ""))
+    if explicit_visible_devices:
+        return explicit_visible_devices
+
+    normalized_device = (requested_device or "").strip().lower()
+    if not normalized_device.startswith("cuda"):
+        return ()
+
+    shared_pool = _visible_gpu_tokens(os.getenv("SEME2E_GPU_POOL", ""))
+    parent_visible_devices = _visible_gpu_tokens(os.getenv("CUDA_VISIBLE_DEVICES", ""))
+    logical_index = _cuda_device_index(normalized_device)
+    if explicit_device:
+        if 0 <= logical_index < len(shared_pool):
+            return (shared_pool[logical_index],)
+        if 0 <= logical_index < len(parent_visible_devices):
+            return (parent_visible_devices[logical_index],)
+        return (str(logical_index),)
+
+    if shared_pool:
+        return shared_pool
+    if parent_visible_devices:
+        return parent_visible_devices
+    physical_indices, _, _ = _unpack_gpu_inventory(_nvidia_gpu_inventory())
+    if physical_indices:
+        return physical_indices
+    return (str(logical_index),)
+
+
+def _rank_gpu_candidates_by_free_memory(
+    candidates: tuple[str, ...],
+    *,
+    force_refresh: bool = False,
+) -> tuple[tuple[str, ...], dict[str, int]]:
+    inventory = _unpack_gpu_inventory(_nvidia_gpu_inventory(force=force_refresh))
+    _, free_memory, canonical_keys = inventory
+    unique_candidates = _unique_gpu_tokens(candidates, canonical_keys)
+    if not unique_candidates:
+        return (), {}
+    original_order = {candidate: index for index, candidate in enumerate(unique_candidates)}
+    ranked = tuple(
+        sorted(
+            unique_candidates,
+            key=lambda candidate: (
+                0 if _gpu_free_memory_mib(candidate, free_memory, canonical_keys) is not None else 1,
+                -(_gpu_free_memory_mib(candidate, free_memory, canonical_keys) or 0),
+                original_order[candidate],
+            ),
+        )
+    )
+    return ranked, {
+        candidate: free_mib
+        for candidate in ranked
+        if (free_mib := _gpu_free_memory_mib(candidate, free_memory, canonical_keys)) is not None
+    }
+
+
+def _acquire_best_gpu_slot(
+    candidates: tuple[str, ...],
+    cancel_event: Any | None,
+    *,
+    minimum_free_mib: int = 0,
+    allow_low_memory: bool = False,
+) -> tuple[str, threading.BoundedSemaphore]:
+    _, _, canonical_keys = _unpack_gpu_inventory(_nvidia_gpu_inventory())
+    unique_candidates = _unique_gpu_tokens(candidates, canonical_keys)
+    if not unique_candidates:
+        raise RuntimeError("GPU worker requires at least one CUDA GPU candidate")
+    timeout_seconds = max(0.01, _env_float("SEME2E_GPU_ACQUIRE_TIMEOUT_SECONDS", 900.0))
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("TASK_CANCELLED")
+        if time.monotonic() >= deadline:
+            raise RuntimeError(GPU_ACQUIRE_TIMEOUT_MESSAGE)
+        ranked, free_memory = _rank_gpu_candidates_by_free_memory(unique_candidates)
+        for candidate in ranked:
+            known_free_mib = free_memory.get(candidate)
+            if (
+                not allow_low_memory
+                and minimum_free_mib > 0
+                and known_free_mib is not None
+                and known_free_mib < minimum_free_mib
+            ):
+                continue
+            gpu_slot = _clone_gpu_slot(candidate)
+            if not gpu_slot.acquire(blocking=False):
+                continue
+            if cancel_event is not None and cancel_event.is_set():
+                gpu_slot.release()
+                raise RuntimeError("TASK_CANCELLED")
+            return candidate, gpu_slot
+        wait_seconds = min(0.25, max(0.0, deadline - time.monotonic()))
+        if cancel_event is not None and hasattr(cancel_event, "wait"):
+            cancel_event.wait(timeout=wait_seconds)
+        else:
+            time.sleep(wait_seconds)
+
+
+@contextmanager
+def _isolated_worker_gpu_lease(
+    worker_slot: threading.BoundedSemaphore,
+    requested_device: str,
+    visible_devices_env: str,
+    cancel_event: Any | None,
+    *,
+    explicit_device: bool = False,
+    preferred_gpu: str | None = None,
+    minimum_free_mib: int = 0,
+):
+    acquired_slots: list[threading.BoundedSemaphore] = []
+    try:
+        _acquire_worker_slot(worker_slot, cancel_event)
+        acquired_slots.append(worker_slot)
+        explicit_visible_devices = _visible_gpu_tokens(os.getenv(visible_devices_env, ""))
+        candidates = _worker_gpu_candidates(
+            requested_device,
+            visible_devices_env,
+            explicit_device=explicit_device,
+        )
+        if (
+            preferred_gpu
+            and not explicit_visible_devices
+            and not explicit_device
+            and preferred_gpu in candidates
+        ):
+            candidates = (preferred_gpu, *(candidate for candidate in candidates if candidate != preferred_gpu))
+        if candidates:
+            selected_gpu, gpu_slot = _acquire_best_gpu_slot(
+                candidates,
+                cancel_event,
+                minimum_free_mib=minimum_free_mib,
+                allow_low_memory=(bool(explicit_visible_devices) and len(candidates) == 1) or explicit_device,
+            )
+            acquired_slots.append(gpu_slot)
+            yield "cuda:0", {
+                "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+                "CUDA_VISIBLE_DEVICES": selected_gpu,
+            }, selected_gpu
+        else:
+            yield requested_device, None, None
+    finally:
+        _release_worker_slots(acquired_slots)
+
+
 def _clone_gpu_slot_keys(requested_device: str, visible_devices_env: str) -> tuple[str, ...]:
     explicit_visible_devices = os.getenv(visible_devices_env, "").strip()
     if explicit_visible_devices:
@@ -793,11 +1145,12 @@ def _clone_gpu_slot_keys(requested_device: str, visible_devices_env: str) -> tup
 
 
 def _clone_gpu_slot(key: str) -> threading.BoundedSemaphore:
+    canonical_key = _canonical_gpu_slot_key(key)
     with CLONE_GPU_SLOTS_GUARD:
-        slot = CLONE_GPU_SLOTS.get(key)
+        slot = CLONE_GPU_SLOTS.get(canonical_key)
         if slot is None:
             slot = threading.BoundedSemaphore(CLONE_GPU_MAX_CONCURRENCY)
-            CLONE_GPU_SLOTS[key] = slot
+            CLONE_GPU_SLOTS[canonical_key] = slot
         return slot
 
 
@@ -807,56 +1160,89 @@ def _gpt_sovits_gpu_candidates(requested_device: str) -> tuple[str, ...]:
         configured_pool = os.getenv("SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES", "").strip()
     candidates = _visible_gpu_tokens(configured_pool)
     if not candidates:
-        candidates = _clone_gpu_slot_keys(
+        candidates = _worker_gpu_candidates(
             requested_device,
             "SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES",
+            explicit_device=bool(os.getenv("SEME2E_TTS_DEVICE", "").strip()),
         )
-    candidates = candidates[:GPT_SOVITS_WORKER_MAX_CONCURRENCY]
     if not candidates:
         raise RuntimeError("GPT-SoVITS requires at least one configured CUDA GPU")
     return candidates
 
 
-def _acquire_gpt_sovits_gpu_lease(
-    candidates: tuple[str, ...],
-    cancel_event: Any | None,
-) -> str:
-    while True:
-        if cancel_event is not None and cancel_event.is_set():
-            raise RuntimeError("TASK_CANCELLED")
-        with GPT_SOVITS_GPU_LEASE_CONDITION:
-            if cancel_event is not None and cancel_event.is_set():
-                raise RuntimeError("TASK_CANCELLED")
-            for candidate in candidates:
-                if candidate in GPT_SOVITS_GPU_LEASES:
-                    continue
-                GPT_SOVITS_GPU_LEASES.add(candidate)
-                if cancel_event is not None and cancel_event.is_set():
-                    GPT_SOVITS_GPU_LEASES.remove(candidate)
-                    GPT_SOVITS_GPU_LEASE_CONDITION.notify_all()
-                    raise RuntimeError("TASK_CANCELLED")
-                return candidate
-            GPT_SOVITS_GPU_LEASE_CONDITION.wait(timeout=0.25)
-
-
 def _release_gpt_sovits_gpu_lease(candidate: str) -> None:
+    canonical_candidate = _canonical_gpu_slot_key(candidate)
     with GPT_SOVITS_GPU_LEASE_CONDITION:
-        GPT_SOVITS_GPU_LEASES.discard(candidate)
+        GPT_SOVITS_GPU_LEASES.discard(canonical_candidate)
         GPT_SOVITS_GPU_LEASE_CONDITION.notify_all()
 
 
+def _acquire_gpt_sovits_gpu_resources(
+    candidates: tuple[str, ...],
+    cancel_event: Any | None,
+) -> tuple[str, threading.BoundedSemaphore]:
+    explicit_pool = bool(
+        os.getenv("SEME2E_GPT_SOVITS_GPU_POOL", "").strip()
+        or os.getenv("SEME2E_GPT_SOVITS_CUDA_VISIBLE_DEVICES", "").strip()
+    )
+    minimum_free_mib = max(
+        0,
+        _env_int(
+            "SEME2E_CLONE_GPU_MIN_FREE_MIB",
+            _env_int("SEME2E_GPU_MIN_FREE_MIB", 0),
+        ),
+    )
+    timeout_seconds = max(0.01, _env_float("SEME2E_GPU_ACQUIRE_TIMEOUT_SECONDS", 900.0))
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("TASK_CANCELLED")
+        if time.monotonic() >= deadline:
+            raise RuntimeError(GPU_ACQUIRE_TIMEOUT_MESSAGE)
+        ranked, free_memory = _rank_gpu_candidates_by_free_memory(candidates)
+        for candidate in ranked:
+            known_free_mib = free_memory.get(candidate)
+            if (
+                not (explicit_pool and len(ranked) == 1)
+                and minimum_free_mib > 0
+                and known_free_mib is not None
+                and known_free_mib < minimum_free_mib
+            ):
+                continue
+            shared_gpu_slot = _clone_gpu_slot(candidate)
+            if not shared_gpu_slot.acquire(blocking=False):
+                continue
+            canonical_candidate = _canonical_gpu_slot_key(candidate)
+            with GPT_SOVITS_GPU_LEASE_CONDITION:
+                if canonical_candidate in GPT_SOVITS_GPU_LEASES:
+                    shared_gpu_slot.release()
+                    continue
+                GPT_SOVITS_GPU_LEASES.add(canonical_candidate)
+            if cancel_event is not None and cancel_event.is_set():
+                shared_gpu_slot.release()
+                _release_gpt_sovits_gpu_lease(candidate)
+                raise RuntimeError("TASK_CANCELLED")
+            return candidate, shared_gpu_slot
+        wait_seconds = min(0.25, max(0.0, deadline - time.monotonic()))
+        if cancel_event is not None and hasattr(cancel_event, "wait"):
+            cancel_event.wait(timeout=wait_seconds)
+        else:
+            time.sleep(wait_seconds)
+
+
 @contextmanager
-def _gpt_sovits_gpu_lease(
+def _gpt_sovits_gpu_resource_lease(
     requested_device: str,
     cancel_event: Any | None,
 ):
-    candidate = _acquire_gpt_sovits_gpu_lease(
+    candidate, shared_gpu_slot = _acquire_gpt_sovits_gpu_resources(
         _gpt_sovits_gpu_candidates(requested_device),
         cancel_event,
     )
     try:
         yield candidate
     finally:
+        shared_gpu_slot.release()
         _release_gpt_sovits_gpu_lease(candidate)
 
 
@@ -874,9 +1260,8 @@ def _acquire_clone_worker_slots(
     try:
         _acquire_worker_slot(model_slot, cancel_event)
         acquired_slots.append(model_slot)
-        for key in sorted(set(gpu_keys), key=_gpu_slot_sort_key):
-            gpu_slot = _clone_gpu_slot(key)
-            _acquire_worker_slot(gpu_slot, cancel_event)
+        if gpu_keys:
+            _, gpu_slot = _acquire_best_gpu_slot(gpu_keys, cancel_event)
             acquired_slots.append(gpu_slot)
         return acquired_slots
     except Exception:
@@ -895,36 +1280,124 @@ def maximum_clone_worker_concurrency(
     gpt_sovits_gpu_keys: tuple[str, ...],
 ) -> int:
     """Return the largest clone workload that can run under shared GPU slots."""
-    slot_limit = max(1, int(clone_gpu_limit))
-    coqui_keys = tuple(dict.fromkeys(coqui_gpu_keys))
-    cosyvoice_keys = tuple(dict.fromkeys(cosyvoice_gpu_keys))
-    gpt_keys = tuple(dict.fromkeys(gpt_sovits_gpu_keys))
-    best = 0
-    for coqui_count in range(max(0, int(coqui_limit)) + 1):
-        for cosyvoice_count in range(max(0, int(cosyvoice_limit)) + 1):
-            gpu_usage: dict[str, int] = {}
-            for key in coqui_keys:
-                gpu_usage[key] = gpu_usage.get(key, 0) + coqui_count
-            for key in cosyvoice_keys:
-                gpu_usage[key] = gpu_usage.get(key, 0) + cosyvoice_count
-            if any(usage > slot_limit for usage in gpu_usage.values()):
+    worker_limits = {
+        "coquiTts": max(0, int(coqui_limit)),
+        "cosyVoice": max(0, int(cosyvoice_limit)),
+        "gptSoVits": max(0, int(gpt_sovits_limit)),
+    }
+    worker_gpu_keys = {
+        "coquiTts": tuple(dict.fromkeys(coqui_gpu_keys)),
+        "cosyVoice": tuple(dict.fromkeys(cosyvoice_gpu_keys)),
+        "gptSoVits": tuple(dict.fromkeys(gpt_sovits_gpu_keys)),
+    }
+    unconstrained_cpu_workers = sum(
+        worker_limits[name]
+        for name in ("coquiTts", "cosyVoice")
+        if not worker_gpu_keys[name]
+    )
+    return unconstrained_cpu_workers + maximum_gpu_worker_concurrency(
+        worker_limits=worker_limits,
+        worker_gpu_keys=worker_gpu_keys,
+        gpu_slot_limit=clone_gpu_limit,
+    )
+
+
+def maximum_gpu_worker_concurrency(
+    *,
+    worker_limits: Mapping[str, int],
+    worker_gpu_keys: Mapping[str, tuple[str, ...]],
+    gpu_slot_limit: int,
+) -> int:
+    """Maximum bipartite matching of workers to physical GPU slot tokens."""
+    slot_limit = max(1, int(gpu_slot_limit))
+    _, _, canonical_keys = _unpack_gpu_inventory(_nvidia_gpu_inventory())
+    normalized_worker_gpu_keys = {
+        worker_name: tuple(
+            dict.fromkeys(_canonical_gpu_slot_key(key, canonical_keys) for key in keys)
+        )
+        for worker_name, keys in worker_gpu_keys.items()
+    }
+    gpu_slots: list[tuple[str, int]] = []
+    all_gpu_keys = sorted(
+        {
+            key
+            for keys in normalized_worker_gpu_keys.values()
+            for key in keys
+        },
+        key=_gpu_slot_sort_key,
+    )
+    for gpu_key in all_gpu_keys:
+        gpu_slots.extend((gpu_key, slot_index) for slot_index in range(slot_limit))
+
+    jobs: list[tuple[str, int, tuple[str, ...]]] = []
+    for worker_name, raw_limit in worker_limits.items():
+        candidates = normalized_worker_gpu_keys.get(worker_name, ())
+        for worker_index in range(max(0, int(raw_limit))):
+            jobs.append((worker_name, worker_index, candidates))
+    jobs.sort(key=lambda item: (len(item[2]) if item[2] else sys.maxsize, item[0], item[1]))
+
+    matched_slots: dict[tuple[str, int], tuple[str, int, tuple[str, ...]]] = {}
+
+    def assign(job: tuple[str, int, tuple[str, ...]], visited: set[tuple[str, int]]) -> bool:
+        candidate_keys = set(job[2])
+        for gpu_slot in gpu_slots:
+            if gpu_slot in visited or gpu_slot[0] not in candidate_keys:
                 continue
-            # GPT-SoVITS leases at most one worker per candidate GPU, then also
-            # consumes the same per-GPU clone slot used by the other backends.
-            available_gpt_gpus = sum(1 for key in gpt_keys if gpu_usage.get(key, 0) < slot_limit)
-            gpt_count = min(max(0, int(gpt_sovits_limit)), available_gpt_gpus)
-            best = max(best, coqui_count + cosyvoice_count + gpt_count)
-    return best
+            visited.add(gpu_slot)
+            previous_job = matched_slots.get(gpu_slot)
+            if previous_job is None or assign(previous_job, visited):
+                matched_slots[gpu_slot] = job
+                return True
+        return False
+
+    for job in jobs:
+        if job[2]:
+            assign(job, set())
+    return len(matched_slots)
+
+
+def _optional_env_bool(name: str) -> bool | None:
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return None
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _gpu_key_set(keys: tuple[str, ...]) -> set[str]:
+    if not keys:
+        return set()
+    _, _, canonical_keys = _unpack_gpu_inventory(_nvidia_gpu_inventory())
+    return {_canonical_gpu_slot_key(key, canonical_keys) for key in keys if key}
 
 
 def clone_worker_capacity_snapshot() -> dict[str, Any]:
     requested_device = os.getenv("SEME2E_TTS_DEVICE") or os.getenv("SEME2E_API_DEVICE", "cpu")
-    coqui_gpu_keys = _clone_gpu_slot_keys(requested_device, "SEME2E_COQUI_TTS_CUDA_VISIBLE_DEVICES")
-    cosyvoice_gpu_keys = _clone_gpu_slot_keys(requested_device, "SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES")
+    explicit_tts_device = bool(os.getenv("SEME2E_TTS_DEVICE", "").strip())
+    coqui_gpu_keys = _worker_gpu_candidates(
+        requested_device,
+        "SEME2E_COQUI_TTS_CUDA_VISIBLE_DEVICES",
+        explicit_device=explicit_tts_device,
+    )
+    cosyvoice_gpu_keys = _worker_gpu_candidates(
+        requested_device,
+        "SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES",
+        explicit_device=explicit_tts_device,
+    )
     try:
         gpt_sovits_gpu_keys = _gpt_sovits_gpu_candidates(requested_device)
     except RuntimeError:
         gpt_sovits_gpu_keys = ()
+    asr_device = os.getenv("SEME2E_ASR_DEVICE") or os.getenv("SEME2E_API_DEVICE", "cpu")
+    asr_gpu_keys = _worker_gpu_candidates(
+        asr_device,
+        "SEME2E_ASR_CUDA_VISIBLE_DEVICES",
+        explicit_device=bool(os.getenv("SEME2E_ASR_DEVICE", "").strip()),
+    )
     backend_limits = {
         "coquiTts": COQUI_TTS_WORKER_MAX_CONCURRENCY,
         "cosyVoice": COSYVOICE_WORKER_MAX_CONCURRENCY,
@@ -939,10 +1412,54 @@ def clone_worker_capacity_snapshot() -> dict[str, Any]:
         cosyvoice_gpu_keys=cosyvoice_gpu_keys,
         gpt_sovits_gpu_keys=gpt_sovits_gpu_keys,
     )
+    combined_worker_limits = {
+        "asr": ASR_WORKER_MAX_CONCURRENCY,
+        "coquiTts": COQUI_TTS_WORKER_MAX_CONCURRENCY,
+        "cosyVoice": COSYVOICE_WORKER_MAX_CONCURRENCY,
+        "gptSoVits": GPT_SOVITS_WORKER_MAX_CONCURRENCY,
+    }
+    combined_gpu_keys = {
+        "asr": asr_gpu_keys,
+        "coquiTts": coqui_gpu_keys,
+        "cosyVoice": cosyvoice_gpu_keys,
+        "gptSoVits": gpt_sovits_gpu_keys,
+    }
+    unconstrained_cpu_workers = sum(
+        combined_worker_limits[name]
+        for name in ("asr", "coquiTts", "cosyVoice")
+        if not combined_gpu_keys[name]
+    )
+    asr_clone_maximum = unconstrained_cpu_workers + maximum_gpu_worker_concurrency(
+        worker_limits=combined_worker_limits,
+        worker_gpu_keys=combined_gpu_keys,
+        gpu_slot_limit=CLONE_GPU_MAX_CONCURRENCY,
+    )
+    api_device = os.getenv("SEME2E_API_DEVICE", "cpu")
+    protect_gpu_keys = _clone_gpu_slot_keys(api_device, "SEME2E_PROTECT_CUDA_VISIBLE_DEVICES")
+    configured_shared = _optional_env_bool("SEME2E_PROTECT_GPU_SHARED_WITH_WORKERS")
+    worker_gpu_keys = tuple(
+        dict.fromkeys(
+            (
+                *asr_gpu_keys,
+                *coqui_gpu_keys,
+                *cosyvoice_gpu_keys,
+                *gpt_sovits_gpu_keys,
+            )
+        )
+    )
+    protect_shares_worker_gpu = (
+        configured_shared
+        if configured_shared is not None
+        else bool(_gpu_key_set(protect_gpu_keys) & _gpu_key_set(worker_gpu_keys))
+    )
     return {
         "maxConcurrency": maximum,
+        "asrCloneMaxConcurrency": asr_clone_maximum,
+        "protectSharesWorkerGpu": protect_shares_worker_gpu,
+        "protectGpuKeys": list(protect_gpu_keys),
         "backendLimits": backend_limits,
         "gpuSlotLimit": CLONE_GPU_MAX_CONCURRENCY,
+        "asrGpuKeys": list(asr_gpu_keys),
         "gpuKeys": {
             "coquiTts": list(coqui_gpu_keys),
             "cosyVoice": list(cosyvoice_gpu_keys),
@@ -2386,15 +2903,24 @@ def maybe_asr_eval(
         asr["_metricSources"] = {"asrEval.*": metric_source("not_run", "ASRTranscriber", reason=asr["reason"], formula="独立 ASR 转写与编辑距离评估")}
         return asr
 
-    worker_device, worker_env = _cuda_worker_runtime(
-        os.getenv("SEME2E_API_DEVICE", "cpu"),
-        "SEME2E_ASR_CUDA_VISIBLE_DEVICES",
-    )
+    requested_device = os.getenv("SEME2E_ASR_DEVICE") or os.getenv("SEME2E_API_DEVICE", "cpu")
     try:
         evaluations = []
         for model in actual_models:
-            _acquire_worker_slot(ASR_WORKER_SLOTS, cancel_event)
-            try:
+            with _isolated_worker_gpu_lease(
+                ASR_WORKER_SLOTS,
+                requested_device,
+                "SEME2E_ASR_CUDA_VISIBLE_DEVICES",
+                cancel_event,
+                explicit_device=bool(os.getenv("SEME2E_ASR_DEVICE", "").strip()),
+                minimum_free_mib=max(
+                    0,
+                    _env_int(
+                        "SEME2E_ASR_GPU_MIN_FREE_MIB",
+                        _env_int("SEME2E_GPU_MIN_FREE_MIB", 0),
+                    ),
+                ),
+            ) as (worker_device, worker_env, _):
                 worker_result = _run_isolated_json_worker(
                     ROOT / "asr_worker.py",
                     {
@@ -2408,8 +2934,6 @@ def maybe_asr_eval(
                     cancel_event=cancel_event,
                     **({"env_overrides": worker_env} if worker_env else {}),
                 )
-            finally:
-                ASR_WORKER_SLOTS.release()
             if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("TASK_CANCELLED")
             clean_text = str(worker_result.get("originalText") or "")
@@ -3203,12 +3727,9 @@ def _coqui_tts_clone_pair(
     task_id: str,
     clone_sub_id: str | None,
     cancel_event: Any | None,
+    runtime_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     local_model = _local_tts_model_files(model)
-    worker_device, worker_env = _cuda_worker_runtime(
-        device,
-        "SEME2E_COQUI_TTS_CUDA_VISIBLE_DEVICES",
-    )
     request_payload: dict[str, Any] = {
         "taskId": task_id,
         "cloneSubId": clone_sub_id,
@@ -3216,7 +3737,6 @@ def _coqui_tts_clone_pair(
         "text": text,
         "language": language,
         "speed": speed,
-        "device": worker_device,
         "ttsHome": str(PROJECT_TTS_CACHE_DIR.resolve()),
         "originalReferencePath": str(original_reference.resolve()),
         "protectedReferencePath": str(protected_reference.resolve()),
@@ -3227,12 +3747,23 @@ def _coqui_tts_clone_pair(
         model_path, config_path = local_model
         request_payload["modelPath"] = str(model_path.resolve())
         request_payload["configPath"] = str(config_path.resolve())
-    acquired_slots = _acquire_clone_worker_slots(
+    with _isolated_worker_gpu_lease(
         COQUI_TTS_WORKER_SLOTS,
-        _clone_gpu_slot_keys(device, "SEME2E_COQUI_TTS_CUDA_VISIBLE_DEVICES"),
+        device,
+        "SEME2E_COQUI_TTS_CUDA_VISIBLE_DEVICES",
         cancel_event,
-    )
-    try:
+        explicit_device=bool(os.getenv("SEME2E_TTS_DEVICE", "").strip()),
+        minimum_free_mib=max(
+            0,
+            _env_int(
+                "SEME2E_CLONE_GPU_MIN_FREE_MIB",
+                _env_int("SEME2E_GPU_MIN_FREE_MIB", 0),
+            ),
+        ),
+    ) as (worker_device, worker_env, selected_gpu):
+        request_payload["device"] = worker_device
+        if runtime_context is not None and selected_gpu:
+            runtime_context["gpuKey"] = selected_gpu
         return _run_isolated_json_worker(
             ROOT / "coqui_tts_worker.py",
             request_payload,
@@ -3240,8 +3771,6 @@ def _coqui_tts_clone_pair(
             cancel_event=cancel_event,
             **({"env_overrides": worker_env} if worker_env else {}),
         )
-    finally:
-        _release_worker_slots(acquired_slots)
 
 
 def _is_cosyvoice_model(model: str) -> bool:
@@ -3264,49 +3793,56 @@ def _cosyvoice_clone_pair(
     speed: float,
     device: str,
     cancel_event: Any | None = None,
+    runtime_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     status, reason, _ = _cosyvoice_model_status()
     if status != "available":
         raise RuntimeError(reason or "CosyVoice2 runtime is unavailable")
     worker = ROOT / "cosyvoice_worker.py"
-    worker_device, worker_env = _cuda_worker_runtime(
+    with _isolated_worker_gpu_lease(
+        COSYVOICE_WORKER_SLOTS,
         device,
         "SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES",
-    )
-    command = [
-        str(COSYVOICE_PYTHON),
-        str(worker),
-        "--model-dir",
-        str(COSYVOICE_MODEL_DIR),
-        "--cosyvoice-repo",
-        str(COSYVOICE_REPO_DIR),
-        "--original-reference",
-        str(original_reference),
-        "--protected-reference",
-        str(protected_reference),
-        "--original-output",
-        str(original_output),
-        "--protected-output",
-        str(protected_output),
-        "--text",
-        text,
-        "--original-prompt-text",
-        original_prompt_text,
-        "--protected-prompt-text",
-        protected_prompt_text,
-        "--speed",
-        str(speed),
-        "--device",
-        worker_device,
-    ]
-    environment = os.environ.copy()
-    _apply_environment_overrides(environment, worker_env)
-    acquired_slots = _acquire_clone_worker_slots(
-        COSYVOICE_WORKER_SLOTS,
-        _clone_gpu_slot_keys(device, "SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES"),
         cancel_event,
-    )
-    try:
+        explicit_device=bool(os.getenv("SEME2E_TTS_DEVICE", "").strip()),
+        minimum_free_mib=max(
+            0,
+            _env_int(
+                "SEME2E_CLONE_GPU_MIN_FREE_MIB",
+                _env_int("SEME2E_GPU_MIN_FREE_MIB", 0),
+            ),
+        ),
+    ) as (worker_device, worker_env, selected_gpu):
+        command = [
+            str(COSYVOICE_PYTHON),
+            str(worker),
+            "--model-dir",
+            str(COSYVOICE_MODEL_DIR),
+            "--cosyvoice-repo",
+            str(COSYVOICE_REPO_DIR),
+            "--original-reference",
+            str(original_reference),
+            "--protected-reference",
+            str(protected_reference),
+            "--original-output",
+            str(original_output),
+            "--protected-output",
+            str(protected_output),
+            "--text",
+            text,
+            "--original-prompt-text",
+            original_prompt_text,
+            "--protected-prompt-text",
+            protected_prompt_text,
+            "--speed",
+            str(speed),
+            "--device",
+            worker_device,
+        ]
+        environment = os.environ.copy()
+        _apply_environment_overrides(environment, worker_env)
+        if runtime_context is not None and selected_gpu:
+            runtime_context["gpuKey"] = selected_gpu
         completed = _run_cancellable_subprocess(
             command,
             cwd=str(COSYVOICE_REPO_DIR),
@@ -3314,8 +3850,6 @@ def _cosyvoice_clone_pair(
             timeout_seconds=_env_int("SEME2E_COSYVOICE_TIMEOUT_SECONDS", 900),
             cancel_event=cancel_event,
         )
-    finally:
-        _release_worker_slots(acquired_slots)
     marker = "VOICE_SHIELD_COSYVOICE_RESULT="
     result_line = next((line for line in reversed(completed.stdout.splitlines()) if line.startswith(marker)), None)
     if completed.returncode != 0 or result_line is None:
@@ -3340,6 +3874,7 @@ def _gpt_sovits_clone_pair(
     speed: float,
     device: str,
     cancel_event: Any | None = None,
+    runtime_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     status, reason, _ = _gpt_sovits_model_status()
     if status != "available":
@@ -3389,10 +3924,11 @@ def _gpt_sovits_clone_pair(
         "--timeout",
         str(timeout_seconds),
     ]
-    with _gpt_sovits_gpu_lease(device, cancel_event) as leased_gpu:
-        shared_gpu_slot = _clone_gpu_slot(leased_gpu)
-        _acquire_worker_slot(shared_gpu_slot, cancel_event)
-        try:
+    _acquire_worker_slot(GPT_SOVITS_WORKER_SLOTS, cancel_event)
+    try:
+        with _gpt_sovits_gpu_resource_lease(device, cancel_event) as leased_gpu:
+            if runtime_context is not None:
+                runtime_context["gpuKey"] = leased_gpu
             # GPT-SoVITS s2_train.py rewrites CUDA_VISIBLE_DEVICES from gpu_numbers.
             # Pass the physical lease there, while the worker itself uses logical cuda:0.
             leased_command = [
@@ -3412,8 +3948,8 @@ def _gpt_sovits_clone_pair(
                 timeout_seconds=timeout_seconds * 3,
                 cancel_event=cancel_event,
             )
-        finally:
-            shared_gpu_slot.release()
+    finally:
+        GPT_SOVITS_WORKER_SLOTS.release()
     marker = "VOICE_SHIELD_GPT_SOVITS_LIVE_RESULT="
     result_line = next((line for line in reversed(completed.stdout.splitlines()) if line.startswith(marker)), None)
     if completed.returncode != 0 or result_line is None:
@@ -3532,6 +4068,7 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
     original_clone_path = clone_dir / f"{clone_id}_original_clone.wav"
     protected_clone_path = clone_dir / f"{clone_id}_protected_clone.wav"
     worker_result: dict[str, Any] | None = None
+    clone_runtime: dict[str, Any] = {}
     evaluation_reference_path = original_path
     evaluation_protected_path = protected_path
     try:
@@ -3553,6 +4090,7 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
                 speed=speed,
                 device=device,
                 cancel_event=cancel_event,
+                runtime_context=clone_runtime,
             )
             diagnostics["workerResult"] = worker_result
             source_model = model
@@ -3571,6 +4109,7 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
                 speed=speed,
                 device=device,
                 cancel_event=cancel_event,
+                runtime_context=clone_runtime,
             )
             diagnostics["workerResult"] = worker_result
             source_model = model
@@ -3590,6 +4129,7 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
                 task_id=task_id,
                 clone_sub_id=str(payload.get("cloneSubId") or "") or None,
                 cancel_event=cancel_event,
+                runtime_context=clone_runtime,
             )
             diagnostics["workerResult"] = worker_result
             source_model = str(worker_result.get("sourceModel") or model)
@@ -3640,6 +4180,9 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
             reason="output_file_missing",
         )
 
+    clone_gpu_key = str(clone_runtime.get("gpuKey") or "").strip() or None
+    if clone_gpu_key:
+        diagnostics["workerGpu"] = clone_gpu_key
     base_url = f"/api/artifacts/{task_id}/clones/{clone_id}"
     response = {
         "cloneId": clone_id,
@@ -3680,6 +4223,7 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
         protected_clone_path,
         payload,
         cancel_event=cancel_event,
+        preferred_gpu=clone_gpu_key,
     )
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeError("TASK_CANCELLED")
@@ -3691,6 +4235,7 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
         protected_clone_path,
         request_semantic if isinstance(request_semantic, dict) else {},
         cancel_event=cancel_event,
+        preferred_gpu=clone_gpu_key,
     )
     clone_quality_metrics = _evaluate_dnsmos_pair_isolated(
         original_clone_path,

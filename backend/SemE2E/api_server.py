@@ -1395,18 +1395,36 @@ def protect_queue_snapshot() -> dict[str, int]:
 def runtime_concurrency_snapshot() -> dict[str, Any]:
     clone_capacity = clone_worker_capacity_snapshot()
     clone_max_concurrency = int(clone_capacity["maxConcurrency"])
-    total = PROTECT_MAX_CONCURRENCY + ASR_WORKER_MAX_CONCURRENCY + clone_max_concurrency
+    shared_asr_clone_max = int(
+        clone_capacity.get(
+            "asrCloneMaxConcurrency",
+            ASR_WORKER_MAX_CONCURRENCY + clone_max_concurrency,
+        )
+    )
+    protect_shares_worker_gpu = bool(clone_capacity.get("protectSharesWorkerGpu", False))
+    total = (
+        max(PROTECT_MAX_CONCURRENCY, shared_asr_clone_max)
+        if protect_shares_worker_gpu
+        else PROTECT_MAX_CONCURRENCY + shared_asr_clone_max
+    )
     return {
         "protect": PROTECT_MAX_CONCURRENCY,
         "asr": ASR_WORKER_MAX_CONCURRENCY,
         "clone": clone_max_concurrency,
+        "asrCloneShared": shared_asr_clone_max,
+        "protectSharesWorkerGpu": protect_shares_worker_gpu,
         "total": total,
         "unit": "worker",
-        "definition": "保护、ASR 与克隆在共享 GPU 槽约束下可同时运行的训练/推理工作线程上限之和，不包含 HTTP 请求线程。",
+        "definition": (
+            "保护与 ASR/克隆共享同一 GPU 时按两者较大容量计算；使用独立 GPU 时容量相加，不包含 HTTP 请求线程。"
+            if protect_shares_worker_gpu
+            else "保护线程上限与独立 ASR/克隆共享 GPU 池容量相加，不包含 HTTP 请求线程。"
+        ),
         "cloneBackends": clone_capacity["backendLimits"],
         "cloneGpuSlots": {
             "limitPerGpu": clone_capacity["gpuSlotLimit"],
             "keys": clone_capacity["gpuKeys"],
+            "asr": clone_capacity.get("asrGpuKeys", []),
         },
     }
 
