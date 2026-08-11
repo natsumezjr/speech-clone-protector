@@ -1856,8 +1856,9 @@ function CloneCoreMetricCards({ cloneEval }: { cloneEval: CloneEval }) {
         tone="amber"
         info={(
           <MetricFormulaContent
-            description="该指标衡量保护导致的相对质量下降，不评价克隆音频的绝对好坏。以原音频生成的克隆音频 x⁰ 为基线，与保护音频生成的克隆音频 x¹ 比较；上传的原音频本身不进入克隆质量评分。"
+            description="该指标衡量保护导致的相对质量下降，不评价克隆音频的绝对好坏。以原音频生成的克隆音频为基线，与保护音频生成的克隆音频比较；上传的原音频本身不进入克隆质量评分。"
             formulas={[
+              'x^{0}:\\ \\text{由原音频生成的克隆音频},\\qquad x^{1}:\\ \\text{由保护音频生成的克隆音频}',
               'S_{\\mathrm{PESQ}}^{1}=100\\,\\operatorname{clip}\\!\\left(\\frac{\\mathrm{PESQ}(x^{0},x^{1})+0.5}{5},0,1\\right)',
               'S_{\\mathrm{STOI}}^{1}=100\\,\\operatorname{clip}\\!\\left(\\mathrm{STOI}(x^{0},x^{1}),0,1\\right)',
               'S_{\\mathrm{DNSMOS}}^{k}=100\\,\\operatorname{clip}\\!\\left(\\frac{\\mathrm{MOS}^{k}-1}{4},0,1\\right),\\quad k\\in\\{0,1\\}',
@@ -1866,7 +1867,7 @@ function CloneCoreMetricCards({ cloneEval }: { cloneEval: CloneEval }) {
               'd_q=\\max\\!\\left(0,\\frac{Q^{0}-Q^{1}}{Q^{0}}\\right)',
               'S_q^{\\mathrm{raw}}=\\Phi(d_q;0.75)',
             ]}
-            note="PESQ 与 STOI 比较同文本的 (x⁰,x¹)；Q⁰ 中的 100 是 x⁰ 自参考归一化基线，不是上传原音频的质量。DNSMOS 分别测量 x⁰ 与 x¹，只使用两者的下降。缺失指标会从前后两侧同时剔除并按剩余权重重新归一化，不会补零。"
+            note="PESQ 与 STOI 使用前者作为后者的同文本参考；基线项中的 100 是自参考归一化结果，不是上传原音频的质量。DNSMOS 分别测量两段克隆音频，只使用两者的下降。缺失指标会从前后两侧同时剔除并按剩余权重重新归一化，不会补零。"
           />
         )}
       />
