@@ -209,6 +209,13 @@ export function WorkspacePage() {
   )
 }
 
+function isAlignedToStep(value: number, min: number, step: number) {
+  if (!Number.isFinite(step) || step <= 0) return true
+  const quotient = (value - min) / step
+  const nearest = Math.round(quotient)
+  return Math.abs(quotient - nearest) <= 1e-7 * Math.max(1, Math.abs(quotient))
+}
+
 function AudioAccessCard({ maxAudioSizeBytes }: { maxAudioSizeBytes?: number }) {
   const inputRef = useRef<HTMLInputElement | null>(null)
   const recorderRef = useRef<MediaRecorder | null>(null)
@@ -934,54 +941,162 @@ function SliderRow({
   onChange: (value: number) => void
   compact?: boolean
 }) {
+  const parameterName = labelText ?? (typeof label === 'string' ? label : '参数')
+  const [manualInputOpen, setManualInputOpen] = useState(false)
+  const [manualInputValue, setManualInputValue] = useState('')
+  const [manualInputError, setManualInputError] = useState<string | null>(null)
+  const manualInputRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    if (!manualInputOpen) return
+    const timeoutId = window.setTimeout(() => {
+      manualInputRef.current?.focus()
+      manualInputRef.current?.select()
+    }, 0)
+    return () => window.clearTimeout(timeoutId)
+  }, [manualInputOpen])
+
+  const openManualInput = () => {
+    setManualInputValue(value)
+    setManualInputError(null)
+    setManualInputOpen(true)
+  }
+
+  const closeManualInput = () => {
+    setManualInputOpen(false)
+    setManualInputError(null)
+  }
+
+  const confirmManualInput = () => {
+    const normalized = manualInputValue.trim().replace(',', '.')
+    if (!normalized) {
+      setManualInputError('请输入参数值。')
+      return
+    }
+    const next = Number(normalized)
+    if (!Number.isFinite(next)) {
+      setManualInputError('请输入有效的数字，例如 0.03。')
+      return
+    }
+    if (next < min || next > max) {
+      setManualInputError(`请输入 ${min} 至 ${max} 范围内的数值。`)
+      return
+    }
+    if (!isAlignedToStep(next, min, step)) {
+      setManualInputError(`请输入符合步长 ${step} 的数值。`)
+      return
+    }
+    onChange(next)
+    closeManualInput()
+  }
+
   return (
-    <div className={cn('parameter-slider-row workspace-hover-row grid items-center text-sm', compact ? 'grid-cols-[minmax(96px,112px)_minmax(52px,1fr)_88px] gap-2' : 'grid-cols-[minmax(124px,164px)_minmax(68px,1fr)_112px] gap-3')}>
-      <span className="whitespace-nowrap text-slate-300">{label}</span>
-      <div className="relative h-5">
-        <input
-          type="range"
-          min={min}
-          max={max}
-          step={step}
-          value={numericValue}
-          onChange={(event) => onChange(Number(event.target.value))}
-          className="absolute inset-0 z-10 h-5 w-full cursor-pointer opacity-0"
-          aria-label={labelText ?? (typeof label === 'string' ? label : '参数滑块')}
-        />
-        <div className="config-slider-track absolute left-0 right-0 top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-slate-700">
-        <div className="config-slider-fill relative h-full rounded-full bg-cyan-400" style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}>
-          <span className="config-slider-thumb absolute right-0 top-1/2 h-4 w-4 -translate-y-1/2 translate-x-1/2 rounded-full bg-cyan-300 shadow-[0_0_14px_rgba(34,211,238,0.8)]" />
+    <>
+      <div className={cn('parameter-slider-row workspace-hover-row grid items-center text-sm', compact ? 'grid-cols-[minmax(96px,112px)_minmax(52px,1fr)_88px] gap-2' : 'grid-cols-[minmax(124px,164px)_minmax(68px,1fr)_112px] gap-3')}>
+        <span className="whitespace-nowrap text-slate-300">{label}</span>
+        <div className="relative h-5">
+          <input
+            type="range"
+            min={min}
+            max={max}
+            step={step}
+            value={numericValue}
+            onChange={(event) => onChange(Number(event.target.value))}
+            className="absolute inset-0 z-10 h-5 w-full cursor-pointer opacity-0"
+            aria-label={labelText ?? (typeof label === 'string' ? label : '参数滑块')}
+          />
+          <div className="config-slider-track absolute left-0 right-0 top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-slate-700">
+          <div className="config-slider-fill relative h-full rounded-full bg-cyan-400" style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}>
+            <span className="config-slider-thumb absolute right-0 top-1/2 h-4 w-4 -translate-y-1/2 translate-x-1/2 rounded-full bg-cyan-300 shadow-[0_0_14px_rgba(34,211,238,0.8)]" />
+          </div>
+        </div>
+        </div>
+        <div className="parameter-number-field relative h-9 min-w-0">
+          <button
+            type="button"
+            onClick={openManualInput}
+            className="parameter-number-input h-full w-full min-w-0 cursor-text rounded-[6px] border border-cyan-300/16 bg-slate-950/32 py-1.5 font-mono tabular-nums text-slate-200 outline-none transition hover:border-cyan-300/40 focus:border-cyan-300"
+            aria-label={`${parameterName} 手动输入`}
+            aria-haspopup="dialog"
+            aria-expanded={manualInputOpen}
+          >
+            {value}
+          </button>
+          <div className="parameter-number-stepper absolute inset-y-px right-px z-10 grid w-7 grid-rows-2 overflow-hidden rounded-r-[5px] border-l border-cyan-300/12 bg-slate-950/18">
+            <button type="button" onClick={() => onChange(clampToRange(numericValue + step, { min, max, step }))} className="grid place-items-center text-slate-400 hover:bg-cyan-300/10 hover:text-cyan-200" aria-label={`${parameterName} 增加`}>
+              <ChevronUp className="h-3 w-3" />
+            </button>
+            <button type="button" onClick={() => onChange(clampToRange(numericValue - step, { min, max, step }))} className="grid place-items-center border-t border-cyan-300/10 text-slate-400 hover:bg-cyan-300/10 hover:text-cyan-200" aria-label={`${parameterName} 减少`}>
+              <ChevronDown className="h-3 w-3" />
+            </button>
+          </div>
         </div>
       </div>
-      </div>
-      <div className="parameter-number-field relative h-9 min-w-0">
-        <input
-          type="number"
-          min={min}
-          max={max}
-          step={step}
-          value={value}
-          onChange={(event) => {
-            const next = Number(event.target.value)
-            if (Number.isFinite(next)) onChange(next)
+
+      {manualInputOpen ? createPortal(
+        <div
+          className="fixed inset-0 z-[120] grid place-items-center bg-slate-950/78 px-4 backdrop-blur-sm"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) closeManualInput()
           }}
-          onBlur={(event) => {
-            const next = Number(event.target.value)
-            if (Number.isFinite(next)) onChange(clampToRange(next, { min, max, step }))
-          }}
-          className="parameter-number-input h-full w-full min-w-0 rounded-[6px] border border-cyan-300/16 bg-slate-950/32 py-1.5 font-mono tabular-nums text-slate-200 outline-none transition focus:border-cyan-300"
-          aria-label={`${labelText ?? (typeof label === 'string' ? label : '参数')} 手动输入`}
-        />
-        <div className="parameter-number-stepper absolute inset-y-px right-px grid w-7 grid-rows-2 overflow-hidden rounded-r-[5px] border-l border-cyan-300/12 bg-slate-950/18">
-          <button type="button" onClick={() => onChange(clampToRange(numericValue + step, { min, max, step }))} className="grid place-items-center text-slate-400 hover:bg-cyan-300/10 hover:text-cyan-200" aria-label={`${labelText ?? (typeof label === 'string' ? label : '参数')} 增加`}>
-            <ChevronUp className="h-3 w-3" />
-          </button>
-          <button type="button" onClick={() => onChange(clampToRange(numericValue - step, { min, max, step }))} className="grid place-items-center border-t border-cyan-300/10 text-slate-400 hover:bg-cyan-300/10 hover:text-cyan-200" aria-label={`${labelText ?? (typeof label === 'string' ? label : '参数')} 减少`}>
-            <ChevronDown className="h-3 w-3" />
-          </button>
-        </div>
-      </div>
-    </div>
+        >
+          <form
+            className="ui-card w-full max-w-[430px] border border-cyan-300/20 bg-slate-950 p-5 shadow-[0_28px_90px_rgba(0,0,0,0.62)]"
+            role="dialog"
+            aria-modal="true"
+            aria-label={`${parameterName} 数值输入`}
+            onSubmit={(event) => {
+              event.preventDefault()
+              confirmManualInput()
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'Escape') closeManualInput()
+            }}
+          >
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h3 className="text-[18px] font-black text-white">输入{parameterName}</h3>
+                <p className="mt-1 text-xs text-slate-400">完整输入数值后再确认，输入过程中不会修改当前参数。</p>
+              </div>
+              <button type="button" onClick={closeManualInput} className="grid h-8 w-8 shrink-0 place-items-center rounded-full border border-cyan-300/16 text-slate-300 hover:border-cyan-300/35 hover:text-white" aria-label="关闭参数输入">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <label className="mt-5 block text-sm font-bold text-slate-200">
+              参数值
+              <input
+                ref={manualInputRef}
+                type="text"
+                inputMode={step < 1 ? 'decimal' : 'numeric'}
+                value={manualInputValue}
+                onChange={(event) => {
+                  setManualInputValue(event.target.value)
+                  if (manualInputError) setManualInputError(null)
+                }}
+                aria-invalid={Boolean(manualInputError)}
+                className="mt-2 h-11 w-full rounded-[7px] border border-cyan-300/20 bg-slate-900 px-3 font-mono text-base tabular-nums text-white outline-none focus:border-cyan-300"
+                placeholder="例如 0.03"
+              />
+            </label>
+            <div className="mt-2 min-h-5 text-xs" aria-live="polite">
+              {manualInputError
+                ? <span className="text-rose-300">{manualInputError}</span>
+                : <span className="text-slate-500">允许范围：{min} 至 {max}</span>}
+            </div>
+            <div className="mt-5 grid grid-cols-2 gap-3">
+              <button type="button" onClick={closeManualInput} className="h-10 rounded-[7px] border border-slate-600 bg-slate-900 text-sm font-black text-slate-200 hover:border-slate-400">
+                取消
+              </button>
+              <button type="submit" className="cyan-button h-10 rounded-[7px] text-sm font-black">
+                确认
+              </button>
+            </div>
+          </form>
+        </div>,
+        document.body,
+      ) : null}
+    </>
   )
 }
 
