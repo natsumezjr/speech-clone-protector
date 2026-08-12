@@ -44,6 +44,7 @@ import { resolveEpsilonUsageRate } from '@/utils/perturbationMetrics'
 import { resolveAsrErrorShares } from '@/utils/metricNormalization'
 import { seconds } from '@/utils/format'
 import { cloneModelRequiresReferenceText, normalizeCloneReferenceTextRequest } from '@/utils/cloneModelCapabilities'
+import { defaultCloneTextForLanguage, translateDefaultCloneText } from '@/utils/cloneDefaultText'
 
 const statusText: Record<TaskResult['status'], string> = {
   queued: '排队中',
@@ -111,8 +112,6 @@ function preferredAsrModel(options: BackendSelectOption[], language: string) {
     : available.find((option) => option.value === 'openai-whisper:medium')
   return preferred?.value ?? available.find((option) => option.value.includes('whisper'))?.value ?? available[0]?.value ?? ''
 }
-
-const defaultCloneText = 'This test shows how VoiceShield protects a speaker\'s voice.'
 
 const asrWeakDisruptionThreshold = 0.2
 const asrStrongDisruptionThreshold = 0.5
@@ -520,8 +519,9 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
   const [asrError, setAsrError] = useState<string>()
   const [asrModel, setAsrModel] = useState('')
   const [asrLanguage, setAsrLanguage] = useState(initialEvaluationLanguage)
+  const cloneTextUsesDefaultRef = useRef(!result.asr.originalText)
   const [cloneForm, setCloneForm] = useState<CloneVoiceRequest>({
-    text: result.asr.originalText || defaultCloneText,
+    text: result.asr.originalText || defaultCloneTextForLanguage(initialEvaluationLanguage),
     model: result.cloneResults?.at(-1)?.request?.model ?? '',
     language: initialEvaluationLanguage,
     speed: 1,
@@ -750,10 +750,14 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
         const model = currentModelOption && currentLanguageSupported && ttsOptions.includes(current.model) ? current.model : nextModelOption?.value ?? ttsOptions[0]
         const modelOption = ttsModelOptions.find((option) => option.value === model) ?? nextModelOption
         const modelLanguages = modelOption?.languages?.length ? modelOption.languages : cloneLanguages
+        const language = modelLanguages.includes(current.language ?? '') ? current.language : nextLanguage
         return {
           ...current,
           model,
-          language: modelLanguages.includes(current.language ?? '') ? current.language : nextLanguage,
+          language,
+          text: cloneTextUsesDefaultRef.current && normalizeEvaluationLanguage(language) !== normalizeEvaluationLanguage(current.language)
+            ? translateDefaultCloneText(current.text, language)
+            : current.text,
           speed: cloneSpeeds.includes(Number(current.speed)) ? current.speed : nextSpeed,
         }
       })
@@ -767,12 +771,17 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
   }
 
   const changeCloneForm = (nextForm: CloneVoiceRequest) => {
-    if (normalizeEvaluationLanguage(nextForm.language) !== normalizeEvaluationLanguage(cloneForm.language)) {
-      const language = normalizeEvaluationLanguage(nextForm.language)
+    const language = normalizeEvaluationLanguage(nextForm.language)
+    const languageChanged = language !== normalizeEvaluationLanguage(cloneForm.language)
+    const textChanged = nextForm.text !== cloneForm.text
+    if (textChanged) cloneTextUsesDefaultRef.current = false
+    if (languageChanged) {
       setAsrLanguage(language)
       setAsrModel(preferredAsrModel(asrOptions, language))
     }
-    setCloneForm(nextForm)
+    setCloneForm(languageChanged && !textChanged && cloneTextUsesDefaultRef.current
+      ? { ...nextForm, text: translateDefaultCloneText(nextForm.text, language) }
+      : nextForm)
   }
 
   const submitAsrTest = async (modelOverride = effectiveAsrModel) => {
@@ -923,9 +932,10 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
 
     const latestAnnotation = [...asrHistory].reverse().find((item) => item.asrSubId && item.asr?.originalText?.trim() && item.asr?.protectedText?.trim())
     const manualPrompt = cloneForm.speakerPrompt?.trim() || referenceText || originalText || result.asr.originalText || ''
+    const usesDefaultFallback = !cloneForm.text.trim()
     const quickRequest: CloneVoiceRequest = {
       ...cloneForm,
-      text: cloneForm.text.trim() || defaultCloneText,
+      text: usesDefaultFallback ? defaultCloneTextForLanguage(requestedLanguage) : cloneForm.text.trim(),
       model: modelOption.value,
       language: requestedLanguage,
       speed: cloneSpeeds.includes(Number(cloneForm.speed)) ? cloneForm.speed : 1,
@@ -948,6 +958,7 @@ function AudioCompare({ result, onAsrUpdated }: { result: TaskResult; onAsrUpdat
       quickRequest.annotationCreatedAt = undefined
     }
     const normalizedQuickRequest = normalizeCloneReferenceTextRequest(quickRequest, modelOption)
+    if (usesDefaultFallback) cloneTextUsesDefaultRef.current = true
     setCloneForm(normalizedQuickRequest)
     await submitCloneTest(normalizedQuickRequest)
   }

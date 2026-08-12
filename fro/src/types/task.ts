@@ -844,6 +844,7 @@ export interface HistoryTask {
   asrStartedAt?: string | null
   asrCompletedAt?: string | null
   asrError?: string | ApiErrorPayload | null
+  asrSubId?: string | null
   cloneStatus?: TaskStatus | string | null
   cloneProgress?: number | null
   cloneStage?: TaskStage | string | null
@@ -852,6 +853,7 @@ export interface HistoryTask {
   cloneStartedAt?: string | null
   cloneCompletedAt?: string | null
   cloneError?: string | ApiErrorPayload | null
+  cloneSubId?: string | null
   hasAsrResult?: boolean
   hasCloneResult?: boolean
   asrTaskCount?: number

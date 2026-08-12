@@ -774,7 +774,7 @@ def _compute_clone_semantic_isolated(
                 os.getenv("SEME2E_SEMANTIC_ENCODER_DEVICE"),
                 worker_device,
             )
-            return _run_isolated_json_worker(
+            response = _run_isolated_json_worker(
                 ROOT / "semantic_metrics_worker.py",
                 {
                     "originalPath": str(clean_clone_path.resolve()),
@@ -785,6 +785,23 @@ def _compute_clone_semantic_isolated(
                 cancel_event=cancel_event,
                 **({"env_overrides": semantic_env} if semantic_env else {}),
             )
+            metrics = response.get("metrics") if isinstance(response, dict) else None
+            if isinstance(metrics, dict) and metrics.get("semanticDrift") is None:
+                embedded_error = str(metrics.get("error") or metrics.get("reason") or "").strip()
+                if embedded_error and _gpu_resource_error_kind(RuntimeError(embedded_error)) is not None:
+                    raise IsolatedWorkerError(
+                        f"semantic metrics worker reported a retryable GPU resource error: {embedded_error}",
+                        diagnostics={
+                            "stage": "clone_semantic",
+                            "workerStatus": metrics.get("status"),
+                            "workerError": embedded_error,
+                            "partialMetrics": {
+                                key: metrics.get(key)
+                                for key in ("tokenChangeRate", "tokenErrorRate", "semanticDrift")
+                            },
+                        },
+                    )
+            return response
 
         response, selected_gpu, gpu_attempts = _run_gpu_worker_with_retry(
             operation_name="clone_semantic_metrics",
@@ -800,7 +817,7 @@ def _compute_clone_semantic_isolated(
                 0,
                 _env_int(
                     "SEME2E_SEMANTIC_GPU_MIN_FREE_MIB",
-                    _env_int("SEME2E_GPU_MIN_FREE_MIB", 0),
+                    max(4096, _env_int("SEME2E_GPU_MIN_FREE_MIB", 0)),
                 ),
             ),
         )
@@ -3584,7 +3601,13 @@ def maybe_asr_eval(
     return asr
 
 
-def create_asr_eval(task_id: str, payload: dict[str, Any], *, cancel_event: Any | None = None) -> dict[str, Any]:
+def create_asr_eval(
+    task_id: str,
+    payload: dict[str, Any],
+    *,
+    cancel_event: Any | None = None,
+    persist_allowed: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
     original_path, protected_path, result = _task_audio_paths(task_id)
     request_semantic = ((result.get("request") or {}).get("semantic") or {}) if isinstance(result.get("request"), dict) else {}
     payload_semantic = payload.get("semantic") if isinstance(payload.get("semantic"), dict) else {}
@@ -3617,11 +3640,13 @@ def create_asr_eval(task_id: str, payload: dict[str, Any], *, cancel_event: Any 
         },
         "createdAt": created_at,
     }
-    if cancel_event is not None and cancel_event.is_set():
+    if (cancel_event is not None and cancel_event.is_set()) or (persist_allowed is not None and not persist_allowed()):
         raise RuntimeError("TASK_CANCELLED")
     with RESULT_WRITE_LOCK:
         result_path = TASK_DIR / task_id / "result.json"
         latest_result = load_result(task_id) if result_path.exists() else result
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("TASK_CANCELLED")
         details = latest_result.setdefault("details", {})
         details["asr"] = asr
         primary = latest_result.setdefault("summary", {}).setdefault("primaryMetrics", {})
@@ -4938,7 +4963,13 @@ def _tts_catalog_entry(model: str) -> dict[str, Any] | None:
     return None
 
 
-def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback: ProgressCallback | None = None, cancel_event: Any | None = None) -> dict[str, Any]:
+def create_clone_voice(
+    task_id: str,
+    payload: dict[str, Any],
+    progress_callback: ProgressCallback | None = None,
+    cancel_event: Any | None = None,
+    persist_allowed: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
     text = str(payload.get("text") or "").strip()
     if not text:
         raise ValueError("text is required")
@@ -5274,11 +5305,13 @@ def create_clone_voice(task_id: str, payload: dict[str, Any], progress_callback:
         }
     )
 
-    if cancel_event is not None and cancel_event.is_set():
+    if (cancel_event is not None and cancel_event.is_set()) or (persist_allowed is not None and not persist_allowed()):
         raise RuntimeError("TASK_CANCELLED")
     with RESULT_WRITE_LOCK:
         result_path = TASK_DIR / task_id / "result.json"
         latest_result = load_result(task_id) if result_path.exists() else result
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("TASK_CANCELLED")
         clones = latest_result.setdefault("cloneResults", [])
         clone_sub_id = response.get("cloneSubId")
         if clone_sub_id:

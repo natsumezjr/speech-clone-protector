@@ -21,6 +21,17 @@ export interface ProtectionTaskCreated {
   status: TaskStatusResponse['status']
 }
 
+export interface EvaluationDeleteResult {
+  taskId: string
+  subtaskType: 'asr' | 'clone'
+  status: 'deleted'
+  deletedCount: number
+  deletedSubtaskIds: string[]
+  cancelledCount: number
+  preservedReferencedCount: number
+  preservedAsrSubIds: string[]
+}
+
 export interface ApiClient {
   getCapabilities(): Promise<CapabilitiesResponse>
   uploadFile(file: File): Promise<AudioFileMeta>
@@ -35,6 +46,8 @@ export interface ApiClient {
   cloneVoice(taskId: string, payload: CloneVoiceRequest): Promise<CloneVoiceResult>
   listTasks(): Promise<HistoryTask[]>
   deleteTask(taskId: string): Promise<void>
+  deleteAsrEvals(taskId: string): Promise<EvaluationDeleteResult>
+  deleteCloneVoices(taskId: string): Promise<EvaluationDeleteResult>
   downloadProtectedAudio(taskId: string): Promise<{ blob: Blob; filename: string }>
   exportReport(taskId: string): Promise<Blob>
   exportCsv(taskId: string): Promise<Blob>

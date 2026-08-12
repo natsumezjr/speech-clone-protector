@@ -49,6 +49,7 @@ from result_adapter import (
     refresh_result_scores,
     release_gpu_slot,
     runtime_config,
+    update_result_safely,
     supported_tts_languages,
     tts_model_requires_reference_text,
 )
@@ -76,8 +77,12 @@ TASK_THREADS: dict[str, threading.Thread] = {}
 PROTECT_PROCESS_CONTEXT = multiprocessing.get_context("spawn")
 TASK_PROCESSES: dict[str, multiprocessing.Process] = {}
 DELETED_TASK_IDS: set[str] = set()
+DELETED_SUBTASK_KEYS: set[str] = set()
 TASK_REGISTRY_LOCK = threading.Lock()
+SUBTASK_TOMBSTONE_LOCK = threading.RLock()
 TASK_STATUS_WRITE_LOCK = threading.RLock()
+EVALUATION_COORDINATION_LOCK = threading.RLock()
+EVALUATION_COLLECTION_DELETIONS: set[str] = set()
 
 
 def _positive_env_int(name: str, default: int) -> int:
@@ -161,6 +166,56 @@ def request_all_task_cancels(task_id: str) -> tuple[list[threading.Event], list[
         list({id(value): value for value in threads}.values()),
         list({id(value): value for value in processes}.values()),
     )
+
+
+def _subtask_runtime_key(task_id: str, subtask_id: str) -> str:
+    return f"{task_id}:{subtask_id}"
+
+
+def _evaluation_collection_key(task_id: str, batch_type: str) -> str:
+    return f"{task_id}:{batch_type}"
+
+
+def _begin_evaluation_submission(task_id: str, batch_type: str) -> None:
+    if _evaluation_collection_key(task_id, batch_type) in EVALUATION_COLLECTION_DELETIONS:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{batch_type} evaluation history is being deleted; retry after deletion completes",
+        )
+
+
+def _begin_evaluation_collection_deletion(task_id: str, batch_type: str) -> str:
+    key = _evaluation_collection_key(task_id, batch_type)
+    if key in EVALUATION_COLLECTION_DELETIONS:
+        raise HTTPException(status_code=409, detail=f"{batch_type} evaluation history deletion is already in progress")
+    EVALUATION_COLLECTION_DELETIONS.add(key)
+    return key
+
+
+def _finish_evaluation_collection_deletion(key: str) -> None:
+    with EVALUATION_COORDINATION_LOCK:
+        EVALUATION_COLLECTION_DELETIONS.discard(key)
+
+
+def mark_subtask_deleted(task_id: str, subtask_id: str) -> None:
+    with SUBTASK_TOMBSTONE_LOCK:
+        DELETED_SUBTASK_KEYS.add(_subtask_runtime_key(task_id, subtask_id))
+
+
+def is_subtask_deleted(task_id: str, subtask_id: str) -> bool:
+    with SUBTASK_TOMBSTONE_LOCK:
+        return _subtask_runtime_key(task_id, subtask_id) in DELETED_SUBTASK_KEYS
+
+
+def request_subtask_cancel(task_id: str, subtask_id: str) -> tuple[threading.Event | None, threading.Thread | None, multiprocessing.Process | None]:
+    key = _subtask_runtime_key(task_id, subtask_id)
+    with TASK_REGISTRY_LOCK:
+        cancel_event = TASK_CANCEL_EVENTS.get(key)
+        thread = TASK_THREADS.get(key)
+        process = TASK_PROCESSES.get(key)
+    if cancel_event is not None:
+        cancel_event.set()
+    return cancel_event, thread, process
 
 
 def cleanup_all_task_runtimes(task_id: str) -> None:
@@ -597,7 +652,12 @@ def _merge_subtask_status(current: dict[str, Any], updates: dict[str, Any], *, s
 def write_task_status(task_id: str, **updates: Any) -> dict[str, Any]:
     if is_task_deleted(task_id):
         raise TaskCancelledError(f"task deleted: {task_id}")
+    subtask_id = str(updates.get("asrSubId") or updates.get("cloneSubId") or "").strip()
+    if subtask_id and is_subtask_deleted(task_id, subtask_id):
+        return _load_task_status_document(task_status_path(task_id))
     with TASK_STATUS_WRITE_LOCK:
+        if subtask_id and is_subtask_deleted(task_id, subtask_id):
+            return _load_task_status_document(task_status_path(task_id))
         task_dir = TASK_DIR / task_id
         task_dir.mkdir(parents=True, exist_ok=True)
         path = task_status_path(task_id)
@@ -610,6 +670,491 @@ def write_task_status(task_id: str, **updates: Any) -> dict[str, Any]:
         _sync_evaluation_batch(current, updates, "clone", now)
         _save_task_status_document(task_id, current, path, now)
         return current
+
+
+def _latest_subtask_snapshot(current: dict[str, Any], history_key: str) -> dict[str, Any] | None:
+    history = [item for item in current.get(history_key, []) if isinstance(item, dict)]
+    return history[-1] if history else None
+
+
+def _restore_protection_status(current: dict[str, Any], result: dict[str, Any] | None) -> None:
+    if result is not None:
+        current["status"] = result.get("status") or "completed"
+        current["progress"] = result.get("progress") if result.get("progress") is not None else 1
+        current["stage"] = result.get("stage") or "report_generation"
+        current["message"] = result.get("message") or "任务已完成"
+        current["elapsedSec"] = result.get("elapsedSec")
+        current["error"] = result.get("error")
+        return
+    current["status"] = current.get("protectionStatus") or "queued"
+    current["progress"] = current.get("protectionProgress") or 0
+    current["stage"] = current.get("protectionStage") or "protect_generation"
+    current["message"] = current.get("protectionMessage") or "保护任务等待执行"
+    current["elapsedSec"] = current.get("protectionElapsedSec")
+    current["error"] = current.get("protectionError")
+
+
+def _remove_subtask_from_batches(current: dict[str, Any], batch_type: str, subtask_id: str, now: str) -> None:
+    storage_key = _batch_storage_key(batch_type)
+    _, _, sub_id_key, _, _ = _batch_subtask_fields(batch_type)
+    next_batches: list[dict[str, Any]] = []
+    for raw_batch in current.get(storage_key, []):
+        if not isinstance(raw_batch, dict):
+            continue
+        batch = dict(raw_batch)
+        items = [
+            dict(item)
+            for item in batch.get("items", [])
+            if isinstance(item, dict) and str(item.get(sub_id_key) or "") != subtask_id
+        ]
+        if not items:
+            continue
+        batch["items"] = items
+        batch["totalCount"] = len(items)
+        next_batches.append(_aggregate_evaluation_batch(batch, now))
+    current[storage_key] = next_batches
+
+
+def _remove_subtask_status(task_id: str, batch_type: str, subtask_id: str) -> bool:
+    history_key, latest_key, sub_id_key, request_key, result_key = _batch_subtask_fields(batch_type)
+    with TASK_STATUS_WRITE_LOCK:
+        path = task_status_path(task_id)
+        current = _load_task_status_document(path)
+        history = [dict(item) for item in current.get(history_key, []) if isinstance(item, dict)]
+        legacy = current.get(latest_key)
+        was_top_level = str(current.get(sub_id_key) or "") == subtask_id
+        existed = any(str(item.get(sub_id_key) or "") == subtask_id for item in history)
+        existed = existed or (isinstance(legacy, dict) and str(legacy.get(sub_id_key) or "") == subtask_id)
+        filtered = [item for item in history if str(item.get(sub_id_key) or "") != subtask_id]
+        current[history_key] = filtered
+        latest = filtered[-1] if filtered else None
+        if latest is None:
+            current.pop(latest_key, None)
+        else:
+            current[latest_key] = latest
+        if was_top_level:
+            for field in (sub_id_key, request_key, result_key):
+                current.pop(field, None)
+        now = utc_now_iso()
+        _remove_subtask_from_batches(current, batch_type, subtask_id, now)
+        if was_top_level and current.get("stage") in {"asr_eval", "downstream_tts_eval"}:
+            other_latest = _latest_subtask_snapshot(current, "cloneTasks" if batch_type == "asr" else "asrTasks")
+            same_latest = _latest_subtask_snapshot(current, history_key)
+            active_latest = next(
+                (
+                    item
+                    for item in (other_latest, same_latest)
+                    if isinstance(item, dict) and _normalized_status(item.get("status")) in {"queued", "running"}
+                ),
+                None,
+            )
+            if active_latest is not None:
+                for field in ("status", "progress", "stage", "message", "elapsedSec", "error"):
+                    current[field] = active_latest.get(field)
+            else:
+                result_path = TASK_DIR / task_id / "result.json"
+                result = load_result(task_id) if result_path.exists() else None
+                _restore_protection_status(current, result)
+        _save_task_status_document(task_id, current, path, now)
+        return existed
+
+
+def _remove_clone_artifacts(task_dir: Path, clone_result: dict[str, Any]) -> None:
+    clone_id = str(clone_result.get("cloneId") or "").strip()
+    if not clone_id or not clone_id.startswith("clone_") or Path(clone_id).name != clone_id:
+        return
+    clones_dir = (task_dir / "clones").resolve()
+    clone_dir = (clones_dir / clone_id).resolve()
+    if clone_dir.parent != clones_dir:
+        return
+    if clone_dir.exists():
+        shutil.rmtree(clone_dir)
+
+
+def _remove_subtask_result(task_id: str, batch_type: str, subtask_id: str) -> tuple[bool, dict[str, Any] | None]:
+    task_dir = TASK_DIR / task_id
+    collection_key = "asrResults" if batch_type == "asr" else "cloneResults"
+    sub_id_key = "asrSubId" if batch_type == "asr" else "cloneSubId"
+    removed_results: list[dict[str, Any]] = []
+
+    def update(result: dict[str, Any]) -> bool:
+        values = [item for item in result.get(collection_key, []) if isinstance(item, dict)]
+        removed_results.extend(item for item in values if str(item.get(sub_id_key) or "") == subtask_id)
+        if not removed_results:
+            return False
+        result[collection_key] = [item for item in values if str(item.get(sub_id_key) or "") != subtask_id]
+        details = result.setdefault("details", {})
+        primary = result.setdefault("summary", {}).setdefault("primaryMetrics", {})
+        if batch_type == "asr":
+            remaining = result[collection_key]
+            latest_asr = (remaining[-1].get("asr") if remaining else None) or {}
+            details["asr"] = latest_asr or {"status": "unavailable", "reason": "尚未执行独立 ASR 测试"}
+            result["asrModel"] = latest_asr.get("model") if latest_asr else None
+            for key in ("wer", "cer"):
+                if latest_asr.get(key) is None:
+                    primary.pop(key, None)
+                else:
+                    primary[key] = latest_asr.get(key)
+        else:
+            remaining = result[collection_key]
+            latest_clone = remaining[-1] if remaining else None
+            latest_eval = latest_clone.get("cloneEval") if isinstance(latest_clone, dict) else None
+            details["cloneEval"] = latest_eval or {"status": "unavailable", "reason": "尚未执行独立语音克隆测试"}
+            downstream = details.setdefault("downstreamTts", {})
+            if latest_clone is None:
+                downstream.clear()
+                downstream.update({"enabled": False, "status": "unavailable", "reason": "尚未执行独立语音克隆测试"})
+            else:
+                request = latest_clone.get("request") or {}
+                downstream.update({
+                    "enabled": True,
+                    "ttsModel": request.get("model"),
+                    "status": "computed",
+                    "source": latest_clone.get("source"),
+                    "lastCloneId": latest_clone.get("cloneId"),
+                    "cloneText": request.get("text"),
+                })
+        refresh_result_scores(result)
+        result["updatedAt"] = utc_now_iso()
+        return True
+
+    result_path = task_dir / "result.json"
+    updated_result: dict[str, Any] | None = None
+    changed = False
+    if result_path.exists():
+        updated_result, changed = update_result_safely(task_id, update)
+    if batch_type == "clone":
+        for clone_result in removed_results:
+            _remove_clone_artifacts(task_dir, clone_result)
+    history_path = task_dir / ("asr_results" if batch_type == "asr" else "clone_results") / f"{subtask_id}.json"
+    history_path.unlink(missing_ok=True)
+    latest_path = task_dir / ("asr_result.json" if batch_type == "asr" else "clone_result.json")
+    remaining = [item for item in (updated_result or {}).get(collection_key, []) if isinstance(item, dict)]
+    if remaining:
+        latest_path.write_text(json.dumps(remaining[-1], ensure_ascii=False, indent=2), encoding="utf-8")
+    else:
+        latest_path.unlink(missing_ok=True)
+    return changed, updated_result
+
+
+def _read_json_value(path: Path) -> Any:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _collect_string_field(value: Any, field: str, *, prefix: str) -> set[str]:
+    collected: set[str] = set()
+    if isinstance(value, dict):
+        candidate = value.get(field)
+        if isinstance(candidate, str) and candidate.startswith(prefix):
+            collected.add(candidate)
+        for nested in value.values():
+            collected.update(_collect_string_field(nested, field, prefix=prefix))
+    elif isinstance(value, list):
+        for nested in value:
+            collected.update(_collect_string_field(nested, field, prefix=prefix))
+    return collected
+
+
+def _evaluation_subtask_ids(
+    task_id: str,
+    batch_type: str,
+    status: dict[str, Any],
+    result: dict[str, Any] | None,
+) -> set[str]:
+    history_key, latest_key, sub_id_key, _, _ = _batch_subtask_fields(batch_type)
+    prefix = "asr_" if batch_type == "asr" else "clone_"
+    collection_key = "asrResults" if batch_type == "asr" else "cloneResults"
+    values: list[Any] = [
+        status.get(history_key),
+        status.get(latest_key),
+        status.get(_batch_storage_key(batch_type)),
+        {sub_id_key: status.get(sub_id_key)},
+        (result or {}).get(collection_key),
+    ]
+    task_dir = TASK_DIR / task_id
+    latest_value = _read_json_value(task_dir / ("asr_result.json" if batch_type == "asr" else "clone_result.json"))
+    if latest_value is not None:
+        values.append(latest_value)
+    history_dir = task_dir / ("asr_results" if batch_type == "asr" else "clone_results")
+    if history_dir.exists():
+        for path in history_dir.glob("*.json"):
+            values.append(_read_json_value(path))
+            if path.stem.startswith(prefix):
+                values.append({sub_id_key: path.stem})
+    collected: set[str] = set()
+    for value in values:
+        collected.update(_collect_string_field(value, sub_id_key, prefix=prefix))
+    runtime_prefix = f"{task_id}:{prefix}"
+    with TASK_REGISTRY_LOCK:
+        for registry in (TASK_CANCEL_EVENTS, TASK_THREADS, TASK_PROCESSES):
+            collected.update(key[len(task_id) + 1:] for key in registry if key.startswith(runtime_prefix))
+    return collected
+
+
+def _referenced_asr_subtask_ids(task_id: str, status: dict[str, Any], result: dict[str, Any] | None) -> set[str]:
+    task_dir = TASK_DIR / task_id
+    clone_values: list[Any] = [
+        status.get("cloneTasks"),
+        status.get("cloneTask"),
+        status.get("cloneBatches"),
+        status.get("cloneRequest"),
+        status.get("cloneResult"),
+        (result or {}).get("cloneResults"),
+        ((result or {}).get("details") or {}).get("downstreamTts"),
+    ]
+    latest_clone = _read_json_value(task_dir / "clone_result.json")
+    if latest_clone is not None:
+        clone_values.append(latest_clone)
+    clone_history_dir = task_dir / "clone_results"
+    if clone_history_dir.exists():
+        clone_values.extend(_read_json_value(path) for path in clone_history_dir.glob("*.json"))
+    references: set[str] = set()
+    for value in clone_values:
+        references.update(_collect_string_field(value, "annotationAsrSubId", prefix="asr_"))
+    return references
+
+
+def _evaluation_sidecar_results(task_id: str, batch_type: str) -> list[dict[str, Any]]:
+    sub_id_key = "asrSubId" if batch_type == "asr" else "cloneSubId"
+    task_dir = TASK_DIR / task_id
+    history_dir = task_dir / ("asr_results" if batch_type == "asr" else "clone_results")
+    latest_path = task_dir / ("asr_result.json" if batch_type == "asr" else "clone_result.json")
+    paths = sorted(history_dir.glob("*.json")) if history_dir.exists() else []
+    if latest_path.exists():
+        paths.append(latest_path)
+
+    results: list[dict[str, Any]] = []
+    indexes: dict[str, int] = {}
+    for path in paths:
+        payload = _read_json_value(path)
+        if not isinstance(payload, dict):
+            continue
+        subtask_id = str(payload.get(sub_id_key) or "").strip()
+        if not subtask_id:
+            continue
+        if subtask_id in indexes:
+            results[indexes[subtask_id]] = payload
+        else:
+            indexes[subtask_id] = len(results)
+            results.append(payload)
+    return results
+
+
+def _latest_active_evaluation_snapshot(current: dict[str, Any]) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+    for history_key in ("asrTasks", "cloneTasks"):
+        candidates.extend(item for item in current.get(history_key, []) if isinstance(item, dict))
+    for storage_key in ("asrBatches", "cloneBatches"):
+        for batch in current.get(storage_key, []):
+            if isinstance(batch, dict):
+                candidates.extend(item for item in batch.get("items", []) if isinstance(item, dict))
+    active = [item for item in candidates if _normalized_status(item.get("status")) in {"queued", "running"}]
+    return active[-1] if active else None
+
+
+def _retain_evaluation_status(task_id: str, batch_type: str, keep_subtask_ids: set[str]) -> tuple[set[str], set[str]]:
+    history_key, latest_key, sub_id_key, request_key, result_key = _batch_subtask_fields(batch_type)
+    storage_key = _batch_storage_key(batch_type)
+    path = task_status_path(task_id)
+    if not path.exists():
+        return set(), set()
+    with TASK_STATUS_WRITE_LOCK:
+        current = _load_task_status_document(path)
+        existing_ids = _collect_string_field(
+            [current.get(history_key), current.get(latest_key), current.get(storage_key), {sub_id_key: current.get(sub_id_key)}],
+            sub_id_key,
+            prefix="asr_" if batch_type == "asr" else "clone_",
+        )
+        history = [dict(item) for item in current.get(history_key, []) if isinstance(item, dict)]
+        legacy = current.get(latest_key)
+        if isinstance(legacy, dict):
+            legacy_subtask_id = str(legacy.get(sub_id_key) or "").strip()
+            if legacy_subtask_id:
+                matching_index = next(
+                    (index for index, item in enumerate(history) if str(item.get(sub_id_key) or "") == legacy_subtask_id),
+                    None,
+                )
+                if matching_index is None:
+                    history.append(dict(legacy))
+                else:
+                    history[matching_index] = {**history[matching_index], **legacy}
+        kept_history = [item for item in history if str(item.get(sub_id_key) or "") in keep_subtask_ids]
+        current[history_key] = kept_history
+        latest = kept_history[-1] if kept_history else None
+        if latest is None:
+            current.pop(latest_key, None)
+            for field in (sub_id_key, request_key, result_key):
+                current.pop(field, None)
+        else:
+            current[latest_key] = latest
+            current[sub_id_key] = latest.get(sub_id_key)
+            for field in (request_key, result_key):
+                if field in latest:
+                    current[field] = latest.get(field)
+                else:
+                    current.pop(field, None)
+
+        removed_batch_ids: set[str] = set()
+        kept_batches: list[dict[str, Any]] = []
+        now = utc_now_iso()
+        for raw_batch in current.get(storage_key, []):
+            if not isinstance(raw_batch, dict):
+                continue
+            batch = dict(raw_batch)
+            items = [
+                dict(item)
+                for item in batch.get("items", [])
+                if isinstance(item, dict) and str(item.get(sub_id_key) or "") in keep_subtask_ids
+            ]
+            if not items:
+                batch_id = str(batch.get("batchId") or "").strip()
+                if batch_id:
+                    removed_batch_ids.add(batch_id)
+                continue
+            batch["items"] = items
+            batch["totalCount"] = len(items)
+            kept_batches.append(_aggregate_evaluation_batch(batch, now))
+        current[storage_key] = kept_batches
+
+        relevant_stage = "asr_eval" if batch_type == "asr" else "downstream_tts_eval"
+        if current.get("stage") == relevant_stage:
+            active = _latest_active_evaluation_snapshot(current)
+            if active is not None:
+                for field in ("status", "progress", "stage", "message", "elapsedSec", "error"):
+                    current[field] = active.get(field)
+            else:
+                result_path = TASK_DIR / task_id / "result.json"
+                protection_result = load_result(task_id) if result_path.exists() else None
+                _restore_protection_status(current, protection_result)
+        _save_task_status_document(task_id, current, path, now)
+        return existing_ids, removed_batch_ids
+
+
+def _strip_metric_source_prefix(result: dict[str, Any], prefix: str) -> None:
+    for container in (result.get("metricSources"), (result.get("summary") or {}).get("metricSources")):
+        if not isinstance(container, dict):
+            continue
+        for key in [key for key in container if str(key).startswith(prefix)]:
+            container.pop(key, None)
+
+
+def _retain_evaluation_results(task_id: str, batch_type: str, keep_subtask_ids: set[str]) -> tuple[set[str], dict[str, Any] | None]:
+    task_dir = TASK_DIR / task_id
+    result_path = task_dir / "result.json"
+    if not result_path.exists():
+        return set(), None
+    collection_key = "asrResults" if batch_type == "asr" else "cloneResults"
+    sub_id_key = "asrSubId" if batch_type == "asr" else "cloneSubId"
+    removed_ids: set[str] = set()
+    removed_clone_results: list[dict[str, Any]] = []
+    sidecar_results = _evaluation_sidecar_results(task_id, batch_type)
+
+    def update(result: dict[str, Any]) -> bool:
+        values = [item for item in result.get(collection_key, []) if isinstance(item, dict)]
+        merged_values: list[dict[str, Any]] = []
+        indexes: dict[str, int] = {}
+        for item in values:
+            subtask_id = str(item.get(sub_id_key) or "").strip()
+            if not subtask_id:
+                continue
+            indexes[subtask_id] = len(merged_values)
+            merged_values.append(item)
+        for item in sidecar_results:
+            subtask_id = str(item.get(sub_id_key) or "").strip()
+            if not subtask_id or subtask_id in indexes:
+                continue
+            indexes[subtask_id] = len(merged_values)
+            merged_values.append(item)
+        retained = [item for item in merged_values if str(item.get(sub_id_key) or "") in keep_subtask_ids]
+        removed = [item for item in merged_values if str(item.get(sub_id_key) or "") not in keep_subtask_ids]
+        removed_ids.update(str(item.get(sub_id_key)) for item in removed if item.get(sub_id_key))
+        if batch_type == "clone":
+            removed_clone_results.extend(removed)
+        result[collection_key] = retained
+        details = result.setdefault("details", {})
+        primary = result.setdefault("summary", {}).setdefault("primaryMetrics", {})
+        if batch_type == "asr":
+            latest_asr = (retained[-1].get("asr") if retained else None) or {}
+            details["asr"] = latest_asr or {"status": "unavailable", "reason": "尚未执行独立 ASR 测试"}
+            result["asrModel"] = latest_asr.get("model") if latest_asr else None
+            result.pop("asrEval", None)
+            for key in ("wer", "cer"):
+                if latest_asr.get(key) is None:
+                    primary.pop(key, None)
+                else:
+                    primary[key] = latest_asr.get(key)
+            _strip_metric_source_prefix(result, "asrEval")
+        else:
+            latest_clone = retained[-1] if retained else None
+            latest_eval = latest_clone.get("cloneEval") if isinstance(latest_clone, dict) else None
+            details["cloneEval"] = latest_eval or {"status": "unavailable", "reason": "尚未执行独立语音克隆测试"}
+            result.pop("cloneEval", None)
+            downstream = details.setdefault("downstreamTts", {})
+            if latest_clone is None:
+                downstream.clear()
+                downstream.update({"enabled": False, "status": "unavailable", "reason": "尚未执行独立语音克隆测试"})
+            else:
+                request = latest_clone.get("request") or {}
+                downstream.clear()
+                downstream.update({
+                    "enabled": True,
+                    "ttsModel": request.get("model"),
+                    "status": "computed",
+                    "source": latest_clone.get("source"),
+                    "lastCloneId": latest_clone.get("cloneId"),
+                    "cloneText": request.get("text"),
+                })
+            _strip_metric_source_prefix(result, "cloneEval")
+        refresh_result_scores(result)
+        result["updatedAt"] = utc_now_iso()
+        return True
+
+    def cleanup_removed_clone_artifacts(_: dict[str, Any]) -> None:
+        for clone_result in removed_clone_results:
+            _remove_clone_artifacts(task_dir, clone_result)
+
+    updated_result, _ = update_result_safely(
+        task_id,
+        update,
+        after_write=cleanup_removed_clone_artifacts if batch_type == "clone" else None,
+    )
+    return removed_ids, updated_result
+
+
+def _cleanup_evaluation_artifacts(
+    task_id: str,
+    batch_type: str,
+    keep_subtask_ids: set[str],
+    updated_result: dict[str, Any] | None,
+) -> None:
+    task_dir = TASK_DIR / task_id
+    history_dir = task_dir / ("asr_results" if batch_type == "asr" else "clone_results")
+    if history_dir.exists():
+        for path in history_dir.glob("*.json"):
+            payload = _read_json_value(path)
+            sub_id_key = "asrSubId" if batch_type == "asr" else "cloneSubId"
+            subtask_id = str((payload or {}).get(sub_id_key) or path.stem) if isinstance(payload, dict) else path.stem
+            if subtask_id not in keep_subtask_ids:
+                path.unlink(missing_ok=True)
+        if not any(history_dir.iterdir()):
+            history_dir.rmdir()
+
+    collection_key = "asrResults" if batch_type == "asr" else "cloneResults"
+    remaining = [item for item in (updated_result or {}).get(collection_key, []) if isinstance(item, dict)]
+    latest_path = task_dir / ("asr_result.json" if batch_type == "asr" else "clone_result.json")
+    if remaining:
+        latest_path.write_text(json.dumps(remaining[-1], ensure_ascii=False, indent=2), encoding="utf-8")
+    else:
+        latest_path.unlink(missing_ok=True)
+    if batch_type == "clone":
+        clone_dir = task_dir / "clones"
+        if clone_dir.exists():
+            shutil.rmtree(clone_dir)
 
 
 def read_task_status(task_id: str) -> dict[str, Any]:
@@ -625,6 +1170,7 @@ def read_task_status(task_id: str) -> dict[str, Any]:
         if status and (
             status.get("stage") in {"asr_eval", "downstream_tts_eval"}
             or status.get("status") in {"queued", "running", "failed", "error", "cancelled"}
+            or bool(status.get("asrTasks") or status.get("cloneTasks"))
             or bool(status.get("asrBatches") or status.get("cloneBatches"))
             or not result_path.exists()
         ):
@@ -2534,6 +3080,9 @@ def list_tasks() -> list[dict[str, Any]]:
             asr_started_at = latest_asr_batch.get("createdAt")
             asr_completed_at = latest_asr_batch.get("updatedAt") if asr_task_status in batch_terminal_statuses else None
             asr_model = EVALUATION_BATCH_LABEL
+            latest_asr_batch_items = [item for item in latest_asr_batch.get("items", []) if isinstance(item, dict)]
+            if latest_asr_batch_items:
+                asr_task = latest_asr_batch_items[-1]
         if latest_clone_batch:
             clone_task_status = str(latest_clone_batch.get("status") or "queued")
             clone_progress = latest_clone_batch.get("progress")
@@ -2543,6 +3092,9 @@ def list_tasks() -> list[dict[str, Any]]:
             clone_started_at = latest_clone_batch.get("createdAt")
             clone_completed_at = latest_clone_batch.get("updatedAt") if clone_task_status in batch_terminal_statuses else None
             clone_model = EVALUATION_BATCH_LABEL
+            latest_clone_batch_items = [item for item in latest_clone_batch.get("items", []) if isinstance(item, dict)]
+            if latest_clone_batch_items:
+                clone_task = latest_clone_batch_items[-1]
 
         rows.append(
             {
@@ -2578,6 +3130,7 @@ def list_tasks() -> list[dict[str, Any]]:
                 "asrStartedAt": asr_started_at,
                 "asrCompletedAt": asr_completed_at,
                 "asrError": asr_error,
+                "asrSubId": asr_task.get("asrSubId") if asr_task else None,
                 "cloneStatus": clone_task_status,
                 "cloneProgress": clone_progress,
                 "cloneStage": "downstream_tts_eval" if has_clone_result else None,
@@ -2586,6 +3139,7 @@ def list_tasks() -> list[dict[str, Any]]:
                 "cloneStartedAt": clone_started_at,
                 "cloneCompletedAt": clone_completed_at,
                 "cloneError": clone_error,
+                "cloneSubId": clone_task.get("cloneSubId") if clone_task else None,
                 "hasAsrResult": bool(has_asr_result),
                 "hasCloneResult": bool(has_clone_result),
                 "asrTaskCount": len(asr_tasks) if asr_tasks else (1 if asr_task else 0),
@@ -2751,234 +3305,229 @@ def create_evaluation_batch(task_id: str, payload: EvaluationBatchRequest) -> JS
             stage="evaluation_batch",
         )
 
-    now = utc_now_iso()
-    seen_item_ids: set[str] = set()
-    items: list[dict[str, Any]] = []
-    for index, raw_item in enumerate(payload.items):
-        batch_item_id = str(raw_item.get("batchItemId") or "").strip()
-        if not batch_item_id:
-            return structured_error(
-                code="INVALID_EVALUATION_BATCH_ITEM",
-                message="Every evaluation batch item requires batchItemId.",
-                status_code=400,
-                request_id_value=request_id(),
-                task_id=task_id,
-                stage="evaluation_batch",
-                details={"index": index},
+    with EVALUATION_COORDINATION_LOCK:
+        _begin_evaluation_submission(task_id, batch_type)
+        now = utc_now_iso()
+        seen_item_ids: set[str] = set()
+        items: list[dict[str, Any]] = []
+        for index, raw_item in enumerate(payload.items):
+            batch_item_id = str(raw_item.get("batchItemId") or "").strip()
+            if not batch_item_id:
+                return structured_error(
+                    code="INVALID_EVALUATION_BATCH_ITEM",
+                    message="Every evaluation batch item requires batchItemId.",
+                    status_code=400,
+                    request_id_value=request_id(),
+                    task_id=task_id,
+                    stage="evaluation_batch",
+                    details={"index": index},
+                )
+            if batch_item_id in seen_item_ids:
+                return structured_error(
+                    code="DUPLICATE_EVALUATION_BATCH_ITEM",
+                    message="batchItemId values must be unique within a batch.",
+                    status_code=409,
+                    request_id_value=request_id(),
+                    task_id=task_id,
+                    stage="evaluation_batch",
+                    details={"batchItemId": batch_item_id},
+                )
+            seen_item_ids.add(batch_item_id)
+            item = dict(raw_item)
+            if batch_type == "clone" and not tts_model_requires_reference_text(str(item.get("model") or "")):
+                _clear_clone_annotation_fields(item)
+            annotation_asr_sub_id = str(item.get("annotationAsrSubId") or "").strip()
+            if batch_type == "clone" and annotation_asr_sub_id:
+                _begin_evaluation_submission(task_id, "asr")
+                if is_subtask_deleted(task_id, annotation_asr_sub_id):
+                    return structured_error(
+                        code="ASR_ANNOTATION_DELETED",
+                        message="所选 ASR 标注正在删除或已被删除，请重新执行 ASR 测试后再创建克隆测试批次。",
+                        status_code=409,
+                        request_id_value=request_id(),
+                        task_id=task_id,
+                        stage="evaluation_batch",
+                        details={"annotationAsrSubId": annotation_asr_sub_id, "batchItemId": batch_item_id},
+                    )
+            item.update(
+                {
+                    "batchId": batch_id,
+                    "batchItemId": batch_item_id,
+                    "status": "queued",
+                    "progress": 0.0,
+                    "message": None,
+                    "elapsedSec": 0.0,
+                    "error": None,
+                    "createdAt": now,
+                    "updatedAt": now,
+                }
             )
-        if batch_item_id in seen_item_ids:
-            return structured_error(
-                code="DUPLICATE_EVALUATION_BATCH_ITEM",
-                message="batchItemId values must be unique within a batch.",
-                status_code=409,
-                request_id_value=request_id(),
-                task_id=task_id,
-                stage="evaluation_batch",
-                details={"batchItemId": batch_item_id},
-            )
-        seen_item_ids.add(batch_item_id)
-        item = dict(raw_item)
-        if batch_type == "clone" and not tts_model_requires_reference_text(str(item.get("model") or "")):
-            _clear_clone_annotation_fields(item)
-        item.update(
+            items.append(item)
+
+        batch = _aggregate_evaluation_batch(
             {
+                "taskId": task_id,
                 "batchId": batch_id,
-                "batchItemId": batch_item_id,
+                "type": batch_type,
+                "label": EVALUATION_BATCH_LABEL,
                 "status": "queued",
                 "progress": 0.0,
-                "message": None,
-                "elapsedSec": 0.0,
-                "error": None,
+                "completedCount": 0,
+                "failedCount": 0,
+                "totalCount": len(items),
                 "createdAt": now,
                 "updatedAt": now,
-            }
+                "items": items,
+            },
+            now,
         )
-        items.append(item)
-
-    batch = _aggregate_evaluation_batch(
-        {
-            "taskId": task_id,
-            "batchId": batch_id,
-            "type": batch_type,
-            "label": EVALUATION_BATCH_LABEL,
-            "status": "queued",
-            "progress": 0.0,
-            "completedCount": 0,
-            "failedCount": 0,
-            "totalCount": len(items),
-            "createdAt": now,
-            "updatedAt": now,
-            "items": items,
-        },
-        now,
-    )
-    with TASK_STATUS_WRITE_LOCK:
-        path = task_status_path(task_id)
-        current = _load_task_status_document(path)
-        current.setdefault("status", "completed")
-        current.setdefault("progress", 1.0)
-        current.setdefault("stage", "report_generation")
-        current.setdefault("message", "Task completed")
-        current.setdefault("error", None)
-        storage_key = _batch_storage_key(batch_type)
-        batches = [dict(item) for item in current.get(storage_key, []) if isinstance(item, dict)]
-        active_batch = next(
-            (
-                item
-                for item in reversed(batches)
-                if _normalized_status(item.get("status")) in {"queued", "running"}
-            ),
-            None,
-        )
-        if active_batch is not None:
-            active_status = _normalized_status(active_batch.get("status"))
-            return structured_error(
-                code="EVALUATION_BATCH_ACTIVE",
-                message="An evaluation batch of this type is already queued or running.",
-                status_code=409,
-                request_id_value=request_id(),
-                task_id=task_id,
-                stage="evaluation_batch",
-                details={
-                    "batchId": active_batch.get("batchId"),
-                    "status": active_status,
-                    "type": str(active_batch.get("type") or batch_type),
-                },
+        with TASK_STATUS_WRITE_LOCK:
+            path = task_status_path(task_id)
+            current = _load_task_status_document(path)
+            current.setdefault("status", "completed")
+            current.setdefault("progress", 1.0)
+            current.setdefault("stage", "report_generation")
+            current.setdefault("message", "Task completed")
+            current.setdefault("error", None)
+            storage_key = _batch_storage_key(batch_type)
+            batches = [dict(item) for item in current.get(storage_key, []) if isinstance(item, dict)]
+            active_batch = next(
+                (
+                    item
+                    for item in reversed(batches)
+                    if _normalized_status(item.get("status")) in {"queued", "running"}
+                ),
+                None,
             )
-        if any(str(item.get("batchId") or "") == batch_id for item in batches):
-            return structured_error(
-                code="EVALUATION_BATCH_EXISTS",
-                message="An evaluation batch with this batchId already exists.",
-                status_code=409,
-                request_id_value=request_id(),
-                task_id=task_id,
-                stage="evaluation_batch",
-                details={"batchId": batch_id, "type": batch_type},
-            )
-        batches.append(batch)
-        current[storage_key] = batches
-        _save_task_status_document(task_id, current, path, now)
+            if active_batch is not None:
+                active_status = _normalized_status(active_batch.get("status"))
+                return structured_error(
+                    code="EVALUATION_BATCH_ACTIVE",
+                    message="An evaluation batch of this type is already queued or running.",
+                    status_code=409,
+                    request_id_value=request_id(),
+                    task_id=task_id,
+                    stage="evaluation_batch",
+                    details={
+                        "batchId": active_batch.get("batchId"),
+                        "status": active_status,
+                        "type": str(active_batch.get("type") or batch_type),
+                    },
+                )
+            if any(str(item.get("batchId") or "") == batch_id for item in batches):
+                return structured_error(
+                    code="EVALUATION_BATCH_EXISTS",
+                    message="An evaluation batch with this batchId already exists.",
+                    status_code=409,
+                    request_id_value=request_id(),
+                    task_id=task_id,
+                    stage="evaluation_batch",
+                    details={"batchId": batch_id, "type": batch_type},
+                )
+            batches.append(batch)
+            current[storage_key] = batches
+            _save_task_status_document(task_id, current, path, now)
     return JSONResponse(batch)
 
 
 @app.post("/api/tasks/{task_id}/asr-eval")
 def run_asr_eval(task_id: str, payload: AsrEvalRequest) -> JSONResponse:
-    task_result_path(task_id)
     req_id = request_id()
     validation_error = validate_asr_eval_config(payload, req_id, task_id)
     if validation_error is not None:
         error = _json_response_error(validation_error)
         _mark_evaluation_batch_item_failed(task_id, "asr", payload.batchId, payload.batchItemId, error, str(error.get("message") or "ASR request validation failed"))
         return validation_error
-    asr_sub_id = f"asr_{uuid.uuid4().hex[:8]}"
-    asr_runtime_id = f"{task_id}:{asr_sub_id}"
-    asr_started_at = time.time()
-    cancel_event = threading.Event()
-    write_task_status(
-        task_id,
-        status="queued",
-        progress=0.05,
-        stage="asr_eval",
-        message="后端已排入 ASR 评估队列",
-        error=None,
-        asrSubId=asr_sub_id,
-        asrRequest=payload.model_dump(),
-        asrResult=None,
-        elapsedSec=0.0,
-    )
-
-    def run_asr_background() -> None:
-        register_task_runtime(task_id, cancel_event, threading.current_thread(), runtime_id=asr_runtime_id)
+    with EVALUATION_COORDINATION_LOCK:
+        _begin_evaluation_submission(task_id, "asr")
+        task_result_path(task_id)
+        asr_sub_id = f"asr_{uuid.uuid4().hex[:8]}"
+        asr_runtime_id = f"{task_id}:{asr_sub_id}"
+        asr_started_at = time.time()
+        cancel_event = threading.Event()
 
         def write_asr_status(**updates: Any) -> None:
             write_task_status(task_id, asrSubId=asr_sub_id, **updates)
 
         def persist_asr_result(result: dict[str, Any]) -> None:
+            if is_subtask_deleted(task_id, asr_sub_id):
+                return
             serialized = json.dumps(result, ensure_ascii=False, indent=2)
-            (TASK_DIR / task_id / "asr_result.json").write_text(serialized, encoding="utf-8")
             history_dir = TASK_DIR / task_id / "asr_results"
-            history_dir.mkdir(parents=True, exist_ok=True)
-            (history_dir / f"{asr_sub_id}.json").write_text(serialized, encoding="utf-8")
+            with SUBTASK_TOMBSTONE_LOCK:
+                if is_subtask_deleted(task_id, asr_sub_id):
+                    return
+                (TASK_DIR / task_id / "asr_result.json").write_text(serialized, encoding="utf-8")
+                history_dir.mkdir(parents=True, exist_ok=True)
+                (history_dir / f"{asr_sub_id}.json").write_text(serialized, encoding="utf-8")
 
-        try:
-            ensure_task_not_cancelled(task_id, cancel_event)
-            write_asr_status(
-                status="running",
-                progress=0.15,
-                stage="asr_eval",
-                message="后端正在执行 ASR 评估",
-                error=None,
-                asrResult=None,
-                elapsedSec=round(time.time() - asr_started_at, 3),
-            )
-            result = create_asr_eval(
-                task_id,
-                {**payload.model_dump(), "asrSubId": asr_sub_id},
-                cancel_event=cancel_event,
-            )
-            ensure_task_not_cancelled(task_id, cancel_event)
-            asr_payload = result.get("asr") if isinstance(result, dict) else {}
-            asr_status = (asr_payload or {}).get("status") if isinstance(asr_payload, dict) else None
-            if asr_status not in {"available", "computed", "partial"}:
-                reason = (asr_payload or {}).get("error") or (asr_payload or {}).get("reason") or "ASR evaluator did not generate transcriptions"
-                worker_diagnostics = asr_payload.get("diagnostics") if isinstance(asr_payload, dict) else None
-                write_task_log(
-                    task_id,
-                    {
-                        "requestId": req_id,
-                        "taskId": task_id,
-                        "currentStage": "asr_eval",
-                        "reason": str(reason),
-                        **({"diagnostics": worker_diagnostics} if worker_diagnostics else {}),
-                    },
-                )
+        def run_asr_background() -> None:
+            try:
+                ensure_task_not_cancelled(task_id, cancel_event)
                 write_asr_status(
-                    status="failed",
+                    status="running",
+                    progress=0.15,
+                    stage="asr_eval",
+                    message="后端正在执行 ASR 评估",
+                    error=None,
+                    asrResult=None,
+                    elapsedSec=round(time.time() - asr_started_at, 3),
+                )
+                result = create_asr_eval(
+                    task_id,
+                    {**payload.model_dump(), "asrSubId": asr_sub_id},
+                    cancel_event=cancel_event,
+                    persist_allowed=lambda: not is_subtask_deleted(task_id, asr_sub_id),
+                )
+                ensure_task_not_cancelled(task_id, cancel_event)
+                asr_payload = result.get("asr") if isinstance(result, dict) else {}
+                asr_status = (asr_payload or {}).get("status") if isinstance(asr_payload, dict) else None
+                if asr_status not in {"available", "computed", "partial"}:
+                    reason = (asr_payload or {}).get("error") or (asr_payload or {}).get("reason") or "ASR evaluator did not generate transcriptions"
+                    worker_diagnostics = asr_payload.get("diagnostics") if isinstance(asr_payload, dict) else None
+                    write_task_log(
+                        task_id,
+                        {
+                            "requestId": req_id,
+                            "taskId": task_id,
+                            "currentStage": "asr_eval",
+                            "reason": str(reason),
+                            **({"diagnostics": worker_diagnostics} if worker_diagnostics else {}),
+                        },
+                    )
+                    write_asr_status(
+                        status="failed",
+                        progress=1,
+                        stage="asr_eval",
+                        message=str(reason),
+                        error={
+                            "code": "ASR_EVAL_FAILED",
+                            "message": str(reason),
+                            "requestId": req_id,
+                            "taskId": task_id,
+                            "stage": "asr_eval",
+                            "details": {
+                                "model": payload.model,
+                                "reason": str(reason),
+                                **({"diagnostics": worker_diagnostics} if worker_diagnostics else {}),
+                            },
+                        },
+                        asrResult=result,
+                        elapsedSec=round(time.time() - asr_started_at, 3),
+                    )
+                    persist_asr_result(result)
+                    return
+                write_asr_status(
+                    status="completed",
                     progress=1,
                     stage="asr_eval",
-                    message=str(reason),
-                    error={
-                        "code": "ASR_EVAL_FAILED",
-                        "message": str(reason),
-                        "requestId": req_id,
-                        "taskId": task_id,
-                        "stage": "asr_eval",
-                        "details": {
-                            "model": payload.model,
-                            "reason": str(reason),
-                            **(
-                                {"diagnostics": worker_diagnostics}
-                                if worker_diagnostics
-                                else {}
-                            ),
-                        },
-                    },
+                    message="ASR 评估已完成",
+                    error=None,
                     asrResult=result,
                     elapsedSec=round(time.time() - asr_started_at, 3),
                 )
                 persist_asr_result(result)
-                return
-            write_asr_status(
-                status="completed",
-                progress=1,
-                stage="asr_eval",
-                message="ASR 评估已完成",
-                error=None,
-                asrResult=result,
-                elapsedSec=round(time.time() - asr_started_at, 3),
-            )
-            persist_asr_result(result)
-        except TaskCancelledError:
-            if (TASK_DIR / task_id).exists():
-                write_asr_status(
-                    status="cancelled",
-                    stage="asr_eval",
-                    message="Task cancelled by delete request",
-                    error=None,
-                    elapsedSec=round(time.time() - asr_started_at, 3),
-                )
-        except Exception as exc:
-            if isinstance(exc, RuntimeError) and str(exc) == "TASK_CANCELLED":
+            except TaskCancelledError:
                 if (TASK_DIR / task_id).exists():
                     write_asr_status(
                         status="cancelled",
@@ -2987,39 +3536,61 @@ def run_asr_eval(task_id: str, payload: AsrEvalRequest) -> JSONResponse:
                         error=None,
                         elapsedSec=round(time.time() - asr_started_at, 3),
                     )
-                return
-            write_task_log(
-                task_id,
-                {
-                    "requestId": req_id,
-                    "taskId": task_id,
-                    "currentStage": "asr_eval",
-                    "exceptionType": type(exc).__name__,
-                    "exceptionMessage": str(exc),
-                    "stackTrace": traceback.format_exc(),
-                },
-            )
-            write_asr_status(
-                status="failed",
-                progress=1,
-                stage="asr_eval",
-                message=str(exc),
-                error={
-                    "code": "ASR_EVAL_FAILED",
-                    "message": str(exc),
-                    "requestId": req_id,
-                    "taskId": task_id,
-                    "stage": "asr_eval",
-                    "details": {"model": payload.model, "reason": str(exc)},
-                },
-                elapsedSec=round(time.time() - asr_started_at, 3),
-            )
-        finally:
-            cleanup_task_runtime(task_id, runtime_id=asr_runtime_id)
+            except Exception as exc:
+                if isinstance(exc, RuntimeError) and str(exc) == "TASK_CANCELLED":
+                    if (TASK_DIR / task_id).exists():
+                        write_asr_status(
+                            status="cancelled",
+                            stage="asr_eval",
+                            message="Task cancelled by delete request",
+                            error=None,
+                            elapsedSec=round(time.time() - asr_started_at, 3),
+                        )
+                    return
+                write_task_log(
+                    task_id,
+                    {
+                        "requestId": req_id,
+                        "taskId": task_id,
+                        "currentStage": "asr_eval",
+                        "exceptionType": type(exc).__name__,
+                        "exceptionMessage": str(exc),
+                        "stackTrace": traceback.format_exc(),
+                    },
+                )
+                write_asr_status(
+                    status="failed",
+                    progress=1,
+                    stage="asr_eval",
+                    message=str(exc),
+                    error={
+                        "code": "ASR_EVAL_FAILED",
+                        "message": str(exc),
+                        "requestId": req_id,
+                        "taskId": task_id,
+                        "stage": "asr_eval",
+                        "details": {"model": payload.model, "reason": str(exc)},
+                    },
+                    elapsedSec=round(time.time() - asr_started_at, 3),
+                )
+            finally:
+                cleanup_task_runtime(task_id, runtime_id=asr_runtime_id)
 
-    thread = threading.Thread(target=run_asr_background, daemon=True)
-    register_task_runtime(task_id, cancel_event, thread, runtime_id=asr_runtime_id)
-    thread.start()
+        write_task_status(
+            task_id,
+            status="queued",
+            progress=0.05,
+            stage="asr_eval",
+            message="后端已排入 ASR 评估队列",
+            error=None,
+            asrSubId=asr_sub_id,
+            asrRequest=payload.model_dump(),
+            asrResult=None,
+            elapsedSec=0.0,
+        )
+        thread = threading.Thread(target=run_asr_background, daemon=True)
+        register_task_runtime(task_id, cancel_event, thread, runtime_id=asr_runtime_id)
+        thread.start()
     return JSONResponse({"taskId": task_id, "asrSubId": asr_sub_id, "status": "queued"})
 
 
@@ -3074,6 +3645,134 @@ def delete_task(task_id: str) -> dict[str, Any]:
     raise HTTPException(status_code=409, detail=f"task delete pending: {last_error}")
 
 
+def _delete_evaluation_subtask(task_id: str, batch_type: str, subtask_id: str) -> dict[str, Any]:
+    if batch_type not in EVALUATION_BATCH_TYPES:
+        raise HTTPException(status_code=400, detail=f"unknown evaluation type: {batch_type}")
+    normalized_subtask_id = str(subtask_id or "").strip()
+    expected_prefix = "asr_" if batch_type == "asr" else "clone_"
+    if not normalized_subtask_id or not normalized_subtask_id.startswith(expected_prefix):
+        raise HTTPException(status_code=400, detail=f"invalid {batch_type} subtask id")
+    task_dir = TASK_DIR / task_id
+    if not task_dir.exists():
+        raise HTTPException(status_code=404, detail=f"task not found: {task_id}")
+    with EVALUATION_COORDINATION_LOCK:
+        _begin_evaluation_submission(task_id, batch_type)
+        if batch_type == "asr":
+            status = _load_task_status_document(task_status_path(task_id))
+            result_path = task_dir / "result.json"
+            result = load_result(task_id) if result_path.exists() else None
+            if normalized_subtask_id in _referenced_asr_subtask_ids(task_id, status, result):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"ASR subtask is still referenced by a clone task: {normalized_subtask_id}",
+                )
+        mark_subtask_deleted(task_id, normalized_subtask_id)
+        cancel_event, thread, process = request_subtask_cancel(task_id, normalized_subtask_id)
+    process_pid = process.pid if process is not None else None
+    if process is not None and process.is_alive():
+        process.terminate()
+        process.join(timeout=10.0)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5.0)
+    if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+        thread.join(timeout=15.0)
+
+    status_removed = _remove_subtask_status(task_id, batch_type, normalized_subtask_id)
+    result_removed, _ = _remove_subtask_result(task_id, batch_type, normalized_subtask_id)
+    cleanup_task_runtime(task_id, runtime_id=_subtask_runtime_key(task_id, normalized_subtask_id))
+    if not status_removed and not result_removed:
+        raise HTTPException(status_code=404, detail=f"{batch_type} subtask not found: {normalized_subtask_id}")
+    return {
+        "taskId": task_id,
+        "subtaskType": batch_type,
+        "subtaskId": normalized_subtask_id,
+        "status": "deleted",
+        "cancelled": cancel_event is not None or process is not None,
+        "processPid": process_pid,
+    }
+
+
+@app.delete("/api/tasks/{task_id}/asr-eval/{asr_sub_id}")
+def delete_asr_eval(task_id: str, asr_sub_id: str) -> dict[str, Any]:
+    return _delete_evaluation_subtask(task_id, "asr", asr_sub_id)
+
+
+@app.delete("/api/tasks/{task_id}/clone-voice/{clone_sub_id}")
+def delete_clone_voice(task_id: str, clone_sub_id: str) -> dict[str, Any]:
+    return _delete_evaluation_subtask(task_id, "clone", clone_sub_id)
+
+
+def _cancel_evaluation_runtimes(task_id: str, subtask_ids: set[str]) -> int:
+    runtimes: list[tuple[str, threading.Event | None, threading.Thread | None, multiprocessing.Process | None]] = []
+    for subtask_id in sorted(subtask_ids):
+        mark_subtask_deleted(task_id, subtask_id)
+        cancel_event, thread, process = request_subtask_cancel(task_id, subtask_id)
+        runtimes.append((subtask_id, cancel_event, thread, process))
+    for _, _, _, process in runtimes:
+        if process is not None and process.is_alive():
+            process.terminate()
+            process.join(timeout=10.0)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5.0)
+    for _, _, thread, _ in runtimes:
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=15.0)
+    for subtask_id, _, _, _ in runtimes:
+        cleanup_task_runtime(task_id, runtime_id=_subtask_runtime_key(task_id, subtask_id))
+    return sum(1 for _, cancel_event, _, process in runtimes if cancel_event is not None or process is not None)
+
+
+def _delete_evaluation_collection(task_id: str, batch_type: str) -> dict[str, Any]:
+    if batch_type not in EVALUATION_BATCH_TYPES:
+        raise HTTPException(status_code=400, detail=f"unknown evaluation type: {batch_type}")
+    with EVALUATION_COORDINATION_LOCK:
+        task_dir = TASK_DIR / task_id
+        if not task_dir.exists():
+            raise HTTPException(status_code=404, detail=f"task not found: {task_id}")
+        deletion_key = _begin_evaluation_collection_deletion(task_id, batch_type)
+        status = _load_task_status_document(task_status_path(task_id))
+        result_path = task_dir / "result.json"
+        result = load_result(task_id) if result_path.exists() else None
+        all_subtask_ids = _evaluation_subtask_ids(task_id, batch_type, status, result)
+        referenced_asr_ids = _referenced_asr_subtask_ids(task_id, status, result) if batch_type == "asr" else set()
+        keep_subtask_ids = all_subtask_ids & referenced_asr_ids
+        delete_subtask_ids = all_subtask_ids - keep_subtask_ids
+        for subtask_id in delete_subtask_ids:
+            mark_subtask_deleted(task_id, subtask_id)
+
+    try:
+        cancelled_count = _cancel_evaluation_runtimes(task_id, delete_subtask_ids)
+        status_ids, _ = _retain_evaluation_status(task_id, batch_type, keep_subtask_ids)
+        result_ids, updated_result = _retain_evaluation_results(task_id, batch_type, keep_subtask_ids)
+        delete_subtask_ids.update((status_ids | result_ids) - keep_subtask_ids)
+        _cleanup_evaluation_artifacts(task_id, batch_type, keep_subtask_ids, updated_result)
+
+        return {
+            "taskId": task_id,
+            "subtaskType": batch_type,
+            "status": "deleted",
+            "deletedCount": len(delete_subtask_ids),
+            "deletedSubtaskIds": sorted(delete_subtask_ids),
+            "cancelledCount": cancelled_count,
+            "preservedReferencedCount": len(keep_subtask_ids),
+            "preservedAsrSubIds": sorted(keep_subtask_ids) if batch_type == "asr" else [],
+        }
+    finally:
+        _finish_evaluation_collection_deletion(deletion_key)
+
+
+@app.delete("/api/tasks/{task_id}/asr-evals")
+def delete_asr_evals(task_id: str) -> dict[str, Any]:
+    return _delete_evaluation_collection(task_id, "asr")
+
+
+@app.delete("/api/tasks/{task_id}/clone-voices")
+def delete_clone_voices(task_id: str) -> dict[str, Any]:
+    return _delete_evaluation_collection(task_id, "clone")
+
+
 @app.get("/api/tasks/{task_id}/download/protected-audio")
 def download_protected_audio(task_id: str) -> FileResponse:
     result = load_result(task_id)
@@ -3119,7 +3818,6 @@ def download_task_file(task_id: str, type: str) -> Response:
 
 @app.post("/api/tasks/{task_id}/clone-voice")
 def clone_voice(task_id: str, payload: CloneVoiceRequest) -> JSONResponse:
-    task_result_path(task_id)
     req_id = request_id()
     if not payload.text.strip():
         error = {
@@ -3137,161 +3835,184 @@ def clone_voice(task_id: str, payload: CloneVoiceRequest) -> JSONResponse:
         error = _json_response_error(validation_error)
         _mark_evaluation_batch_item_failed(task_id, "clone", payload.batchId, payload.batchItemId, error, str(error.get("message") or "Clone request validation failed"))
         return validation_error
-    resolved_payload, annotation_error = resolve_clone_annotation(task_id, payload, req_id)
-    if annotation_error is not None:
-        error = _json_response_error(annotation_error)
-        _mark_evaluation_batch_item_failed(task_id, "clone", payload.batchId, payload.batchItemId, error, str(error.get("message") or "Clone annotation resolution failed"))
-        return annotation_error
-    assert resolved_payload is not None
-    clone_sub_id = f"clone_{uuid.uuid4().hex[:8]}"
-    resolved_payload["cloneSubId"] = clone_sub_id
-    clone_runtime_id = f"{task_id}:{clone_sub_id}"
-    cancel_event = threading.Event()
+    with EVALUATION_COORDINATION_LOCK:
+        _begin_evaluation_submission(task_id, "clone")
+        task_result_path(task_id)
+        resolved_payload, annotation_error = resolve_clone_annotation(task_id, payload, req_id)
+        if annotation_error is not None:
+            error = _json_response_error(annotation_error)
+            _mark_evaluation_batch_item_failed(task_id, "clone", payload.batchId, payload.batchItemId, error, str(error.get("message") or "Clone annotation resolution failed"))
+            return annotation_error
+        assert resolved_payload is not None
+        annotation_asr_sub_id = str(resolved_payload.get("annotationAsrSubId") or "").strip()
+        if annotation_asr_sub_id:
+            _begin_evaluation_submission(task_id, "asr")
+            if is_subtask_deleted(task_id, annotation_asr_sub_id):
+                return structured_error(
+                    code="ASR_ANNOTATION_DELETED",
+                    message="所选 ASR 标注正在删除或已被删除，请重新执行 ASR 测试后再提交克隆任务。",
+                    status_code=409,
+                    request_id_value=req_id,
+                    task_id=task_id,
+                    stage="downstream_tts_eval",
+                    details={"annotationAsrSubId": annotation_asr_sub_id},
+                )
+        clone_sub_id = f"clone_{uuid.uuid4().hex[:8]}"
+        resolved_payload["cloneSubId"] = clone_sub_id
+        clone_runtime_id = f"{task_id}:{clone_sub_id}"
+        cancel_event = threading.Event()
 
-    def write_clone_status(**updates: Any) -> None:
-        write_task_status(task_id, cloneSubId=clone_sub_id, **updates)
+        def write_clone_status(**updates: Any) -> None:
+            write_task_status(task_id, cloneSubId=clone_sub_id, **updates)
 
-    write_clone_status(
-        status="queued",
-        progress=0.05,
-        stage="downstream_tts_eval",
-        message="后端已排入下游 TTS 克隆音频生成队列",
-        error=None,
-        elapsedSec=0.0,
-        cloneResult=None,
-        cloneRequest=resolved_payload,
-    )
-
-    def run_clone_background() -> None:
-        clone_started_at = time.time()
-        register_task_runtime(task_id, cancel_event, threading.current_thread(), runtime_id=clone_runtime_id)
-        try:
-            ensure_task_not_cancelled(task_id, cancel_event)
-            write_clone_status(
-                status="running",
-                progress=0.12,
-                elapsedSec=round(time.time() - clone_started_at, 3),
-                stage="downstream_tts_eval",
-                message="后端正在生成下游 TTS 克隆音频",
-                error=None,
-            )
-
-            def on_clone_progress(**event: Any) -> None:
+        def run_clone_background() -> None:
+            clone_started_at = time.time()
+            try:
                 ensure_task_not_cancelled(task_id, cancel_event)
-                try:
-                    progress_value = float(event.get("progress"))
-                except (TypeError, ValueError):
-                    progress_value = 0.12
                 write_clone_status(
                     status="running",
-                    progress=round(min(0.95, max(0.0, progress_value)), 3),
+                    progress=0.12,
                     elapsedSec=round(time.time() - clone_started_at, 3),
                     stage="downstream_tts_eval",
-                    message=str(event.get("message") or "后端正在生成下游 TTS 克隆音频"),
+                    message="后端正在生成下游 TTS 克隆音频",
                     error=None,
                 )
 
-            result = create_clone_voice(task_id, resolved_payload, progress_callback=on_clone_progress, cancel_event=cancel_event)
-            ensure_task_not_cancelled(task_id, cancel_event)
-            write_clone_status(
-                status="completed",
-                progress=1,
-                stage="downstream_tts_eval",
-                message=result.get("message") or "克隆已完成",
-                elapsedSec=round(time.time() - clone_started_at, 3),
-                error=None,
-                cloneResult=result,
-            )
-            result_path = TASK_DIR / task_id / "clone_result.json"
-            result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-            history_dir = TASK_DIR / task_id / "clone_results"
-            history_dir.mkdir(parents=True, exist_ok=True)
-            (history_dir / f"{clone_sub_id}.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        except (ValueError, FileNotFoundError) as exc:
-            write_clone_status(
-                status="failed",
-                progress=1,
-                stage="downstream_tts_eval",
-                message=str(exc),
-                elapsedSec=round(time.time() - clone_started_at, 3),
-                error={
-                    "code": "CLONE_BACKEND_UNAVAILABLE",
-                    "message": str(exc),
-                    "requestId": req_id,
-                    "taskId": task_id,
-                    "stage": "downstream_tts_eval",
-                    "details": {"reason": "input_audio_missing"},
-                },
-            )
-        except TaskCancelledError:
-            if (TASK_DIR / task_id).exists():
-                write_clone_status(
-                    status="cancelled",
-                    elapsedSec=round(time.time() - clone_started_at, 3),
-                    stage="downstream_tts_eval",
-                    message="任务已被删除请求取消",
-                    error=None,
+                def on_clone_progress(**event: Any) -> None:
+                    ensure_task_not_cancelled(task_id, cancel_event)
+                    try:
+                        progress_value = float(event.get("progress"))
+                    except (TypeError, ValueError):
+                        progress_value = 0.12
+                    write_clone_status(
+                        status="running",
+                        progress=round(min(0.95, max(0.0, progress_value)), 3),
+                        elapsedSec=round(time.time() - clone_started_at, 3),
+                        stage="downstream_tts_eval",
+                        message=str(event.get("message") or "后端正在生成下游 TTS 克隆音频"),
+                        error=None,
+                    )
+
+                result = create_clone_voice(
+                    task_id,
+                    resolved_payload,
+                    progress_callback=on_clone_progress,
+                    cancel_event=cancel_event,
+                    persist_allowed=lambda: not is_subtask_deleted(task_id, clone_sub_id),
                 )
-        except CloneBackendUnavailableError as exc:
-            write_clone_status(
-                status="failed",
-                progress=1,
-                stage="downstream_tts_eval",
-                message=str(exc),
-                elapsedSec=round(time.time() - clone_started_at, 3),
-                error={
-                    "code": "CLONE_BACKEND_UNAVAILABLE",
-                    "message": str(exc),
-                    "requestId": req_id,
-                    "taskId": task_id,
-                    "stage": "downstream_tts_eval",
-                    "details": {"reason": exc.reason, **exc.diagnostics},
-                },
-            )
-            write_task_log(
-                task_id,
-                {
-                    "requestId": req_id,
-                    "taskId": task_id,
-                    "currentStage": "downstream_tts_eval",
-                    "reason": exc.reason,
-                    "diagnostics": exc.diagnostics,
-                    "exceptionType": type(exc).__name__,
-                    "exceptionMessage": str(exc),
-                },
-            )
-        except RuntimeError as exc:
-            if str(exc) == "TASK_CANCELLED":
+                ensure_task_not_cancelled(task_id, cancel_event)
+                write_clone_status(
+                    status="completed",
+                    progress=1,
+                    stage="downstream_tts_eval",
+                    message=result.get("message") or "克隆已完成",
+                    elapsedSec=round(time.time() - clone_started_at, 3),
+                    error=None,
+                    cloneResult=result,
+                )
+                serialized = json.dumps(result, ensure_ascii=False, indent=2)
+                history_dir = TASK_DIR / task_id / "clone_results"
+                with SUBTASK_TOMBSTONE_LOCK:
+                    if is_subtask_deleted(task_id, clone_sub_id):
+                        return
+                    (TASK_DIR / task_id / "clone_result.json").write_text(serialized, encoding="utf-8")
+                    history_dir.mkdir(parents=True, exist_ok=True)
+                    (history_dir / f"{clone_sub_id}.json").write_text(serialized, encoding="utf-8")
+            except (ValueError, FileNotFoundError) as exc:
+                write_clone_status(
+                    status="failed",
+                    progress=1,
+                    stage="downstream_tts_eval",
+                    message=str(exc),
+                    elapsedSec=round(time.time() - clone_started_at, 3),
+                    error={
+                        "code": "CLONE_BACKEND_UNAVAILABLE",
+                        "message": str(exc),
+                        "requestId": req_id,
+                        "taskId": task_id,
+                        "stage": "downstream_tts_eval",
+                        "details": {"reason": "input_audio_missing"},
+                    },
+                )
+            except TaskCancelledError:
                 if (TASK_DIR / task_id).exists():
                     write_clone_status(
                         status="cancelled",
                         elapsedSec=round(time.time() - clone_started_at, 3),
                         stage="downstream_tts_eval",
-                        message="Task cancelled by delete request",
+                        message="任务已被删除请求取消",
                         error=None,
                     )
-                return
-            write_clone_status(
-                status="failed",
-                progress=1,
-                stage="downstream_tts_eval",
-                message=str(exc),
-                elapsedSec=round(time.time() - clone_started_at, 3),
-                error={
-                    "code": "CLONE_BACKEND_UNAVAILABLE",
-                    "message": str(exc),
-                    "requestId": req_id,
-                    "taskId": task_id,
-                    "stage": "downstream_tts_eval",
-                    "details": {"reason": "runtime_error"},
-                },
-            )
-        finally:
-            cleanup_task_runtime(task_id, runtime_id=clone_runtime_id)
+            except CloneBackendUnavailableError as exc:
+                write_clone_status(
+                    status="failed",
+                    progress=1,
+                    stage="downstream_tts_eval",
+                    message=str(exc),
+                    elapsedSec=round(time.time() - clone_started_at, 3),
+                    error={
+                        "code": "CLONE_BACKEND_UNAVAILABLE",
+                        "message": str(exc),
+                        "requestId": req_id,
+                        "taskId": task_id,
+                        "stage": "downstream_tts_eval",
+                        "details": {"reason": exc.reason, **exc.diagnostics},
+                    },
+                )
+                write_task_log(
+                    task_id,
+                    {
+                        "requestId": req_id,
+                        "taskId": task_id,
+                        "currentStage": "downstream_tts_eval",
+                        "reason": exc.reason,
+                        "diagnostics": exc.diagnostics,
+                        "exceptionType": type(exc).__name__,
+                        "exceptionMessage": str(exc),
+                    },
+                )
+            except RuntimeError as exc:
+                if str(exc) == "TASK_CANCELLED":
+                    if (TASK_DIR / task_id).exists():
+                        write_clone_status(
+                            status="cancelled",
+                            elapsedSec=round(time.time() - clone_started_at, 3),
+                            stage="downstream_tts_eval",
+                            message="Task cancelled by delete request",
+                            error=None,
+                        )
+                    return
+                write_clone_status(
+                    status="failed",
+                    progress=1,
+                    stage="downstream_tts_eval",
+                    message=str(exc),
+                    elapsedSec=round(time.time() - clone_started_at, 3),
+                    error={
+                        "code": "CLONE_BACKEND_UNAVAILABLE",
+                        "message": str(exc),
+                        "requestId": req_id,
+                        "taskId": task_id,
+                        "stage": "downstream_tts_eval",
+                        "details": {"reason": "runtime_error"},
+                    },
+                )
+            finally:
+                cleanup_task_runtime(task_id, runtime_id=clone_runtime_id)
 
-    thread = threading.Thread(target=run_clone_background, daemon=True)
-    register_task_runtime(task_id, cancel_event, thread, runtime_id=clone_runtime_id)
-    thread.start()
+        write_clone_status(
+            status="queued",
+            progress=0.05,
+            stage="downstream_tts_eval",
+            message="后端已排入下游 TTS 克隆音频生成队列",
+            error=None,
+            elapsedSec=0.0,
+            cloneResult=None,
+            cloneRequest=resolved_payload,
+        )
+        thread = threading.Thread(target=run_clone_background, daemon=True)
+        register_task_runtime(task_id, cancel_event, thread, runtime_id=clone_runtime_id)
+        thread.start()
     return JSONResponse({"taskId": task_id, "cloneSubId": clone_sub_id, "status": "queued"})
 
 

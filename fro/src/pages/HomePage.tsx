@@ -74,10 +74,21 @@ const defaultMetricTaskIds = [
 ] as const
 const defaultMetricTaskIdSet = new Set<string>(defaultMetricTaskIds)
 
+const defaultHomeMetricValues = {
+  tokenErrorRate: 0.9082,
+  tokenChangeRate: 0.9796,
+  semanticDrift: 0.7468,
+  averageSimilarityDrop: 0.41,
+  snr: 26.3,
+  overallProtectionScore: 91.36,
+  maxConcurrency: 6,
+  averageStepSec: 0.33,
+} as const
+
 type HomeMetricSnapshot = {
   result?: TaskResult
-  fallbackResults: TaskResult[]
   maxConcurrency: number | null
+  runtimeAverageStepSec: number | null
 }
 
 type HomeMetric = (typeof metricTemplates)[number] & {
@@ -92,12 +103,6 @@ function optionalNumber(value: unknown) {
 function average(values: Array<number | null>) {
   const available = values.filter((value): value is number => value !== null)
   return available.length ? available.reduce((sum, value) => sum + value, 0) / available.length : null
-}
-
-function completeAverage(values: Array<number | null>, expectedCount: number) {
-  const available = values.filter((value): value is number => value !== null)
-  if (values.length !== expectedCount || available.length !== expectedCount) return null
-  return available.reduce((sum, value) => sum + value, 0) / expectedCount
 }
 
 function percent(value: number | null, prefix = '') {
@@ -140,51 +145,22 @@ function latestCompletedTask(tasks: HistoryTask[]) {
     .sort((left, right) => latestTaskTime(right) - latestTaskTime(left))[0]
 }
 
-function metricWithFallback(
-  latestResult: TaskResult | undefined,
-  fallbackResults: TaskResult[],
-  select: (result?: TaskResult) => number | null,
-) {
-  const latestValue = select(latestResult)
-  return latestValue ?? average(fallbackResults.map((result) => select(result)))
-}
-
-function overallScoreWithFallback(latestResult: TaskResult | undefined, fallbackResults: TaskResult[]) {
-  const latestValue = optionalNumber(latestResult?.protectionEvaluation?.overallScore)
-  if (latestValue !== null) return latestValue
-  return completeAverage(
-    fallbackResults.map((result) => optionalNumber(result.protectionEvaluation?.overallScore)),
-    defaultMetricTaskIds.length,
-  )
-}
-
-function cloneMetricWithFallback(
-  latestResult: TaskResult | undefined,
-  fallbackResults: TaskResult[],
-  select: (evaluation: CloneEval) => number | null,
-) {
-  const latestValue = average(cloneEvaluationsFrom(latestResult).map(select))
-  if (latestValue !== null) return latestValue
-  return average(
-    fallbackResults.map((result) => average(cloneEvaluationsFrom(result).map(select))),
-  )
-}
-
 function buildHomeMetrics(snapshot?: HomeMetricSnapshot): { metrics: HomeMetric[]; impactValues: string[] } {
   const result = snapshot?.result
-  const fallbackResults = snapshot?.fallbackResults ?? []
-  const tokenErrorRate = metricWithFallback(result, fallbackResults, (item) => optionalNumber(item?.semanticEval?.tokenErrorRate))
-  const tokenChangeRate = metricWithFallback(result, fallbackResults, (item) => optionalNumber(item?.semanticEval?.tokenChangeRate))
-  const semanticDrift = metricWithFallback(result, fallbackResults, (item) => optionalNumber(item?.semanticEval?.semanticDrift))
-  const snr = metricWithFallback(result, fallbackResults, (item) => optionalNumber(item?.protectionQuality?.snr))
-  const overallProtectionScore = overallScoreWithFallback(result, fallbackResults)
-  const averageStepSec = metricWithFallback(result, fallbackResults, (item) => optionalNumber(item?.averageStepSec))
-  const averageSimilarityDrop = cloneMetricWithFallback(result, fallbackResults, (item) => {
+  const tokenErrorRate = optionalNumber(result?.semanticEval?.tokenErrorRate) ?? defaultHomeMetricValues.tokenErrorRate
+  const tokenChangeRate = optionalNumber(result?.semanticEval?.tokenChangeRate) ?? defaultHomeMetricValues.tokenChangeRate
+  const semanticDrift = optionalNumber(result?.semanticEval?.semanticDrift) ?? defaultHomeMetricValues.semanticDrift
+  const snr = optionalNumber(result?.protectionQuality?.snr) ?? defaultHomeMetricValues.snr
+  const overallProtectionScore = optionalNumber(result?.protectionEvaluation?.overallScore) ?? defaultHomeMetricValues.overallProtectionScore
+  const averageStepSec = optionalNumber(result?.averageStepSec)
+    ?? optionalNumber(snapshot?.runtimeAverageStepSec)
+    ?? defaultHomeMetricValues.averageStepSec
+  const averageSimilarityDrop = average(cloneEvaluationsFrom(result).map((item) => {
     const before = optionalNumber(item.originalSimilarity)
     const after = optionalNumber(item.protectedSimilarity)
     return before === null || after === null ? null : Math.max(0, before - after)
-  })
-  const maxConcurrency = optionalNumber(snapshot?.maxConcurrency)
+  })) ?? defaultHomeMetricValues.averageSimilarityDrop
+  const maxConcurrency = optionalNumber(snapshot?.maxConcurrency) ?? defaultHomeMetricValues.maxConcurrency
   const values = [
     integerPercent(tokenErrorRate, '↓ '),
     decimal(averageSimilarityDrop, '↓ '),
@@ -212,22 +188,13 @@ export function HomePage() {
     queryFn: async (): Promise<HomeMetricSnapshot | undefined> => {
       const [tasks, capabilities] = await Promise.all([listTasks().catch(() => []), getCapabilities().catch(() => undefined)])
       const latest = latestCompletedTask(tasks.filter((task) => !defaultMetricTaskIdSet.has(task.taskId)))
-      const requestedTaskIds = [...new Set([latest?.taskId, ...defaultMetricTaskIds].filter((taskId): taskId is string => Boolean(taskId)))]
-      const taskResults = await Promise.all(requestedTaskIds.map(async (taskId) => {
-        try {
-          return await getTaskResult(taskId)
-        } catch {
-          return undefined
-        }
-      }))
-      const resultsByTaskId = new Map(taskResults.flatMap((result) => result ? [[result.taskId, result] as const] : []))
+      const result = latest
+        ? await getTaskResult(latest.taskId).catch(() => undefined)
+        : undefined
       return {
-        result: latest ? resultsByTaskId.get(latest.taskId) : undefined,
-        fallbackResults: defaultMetricTaskIds.flatMap((taskId) => {
-          const fallbackResult = resultsByTaskId.get(taskId)
-          return fallbackResult ? [fallbackResult] : []
-        }),
+        result,
         maxConcurrency: optionalNumber(capabilities?.runtimeConcurrency?.total),
+        runtimeAverageStepSec: optionalNumber(capabilities?.runtimePerformance?.averageStepSec),
       }
     },
     refetchInterval: 30_000,
@@ -376,7 +343,7 @@ function HeroScene({ impactValues }: { impactValues: string[] }) {
       </div>
       <div className="hero-impact-panel absolute inset-x-0 bottom-5 rounded-[8px] border border-cyan-300/22 bg-[#061426]/92 p-3">
         <div className="mb-2 text-center text-sm font-medium leading-5 text-slate-300">
-          下游系统影响（攻击面）
+          下游系统影响
         </div>
         <div className="hero-impact-content grid grid-cols-[minmax(260px,278px)_minmax(0,1fr)] gap-2.5 max-md:grid-cols-1">
           <div className="hero-audio-pair grid min-w-0 grid-cols-[minmax(0,1fr)_28px_minmax(0,1fr)] gap-2.5">

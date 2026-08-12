@@ -11,11 +11,11 @@ import type { AsrEvalResponse, CapabilitiesResponse, CloneVoiceRequest, HistoryT
 import { cn } from '@/lib/utils'
 import { cloneModelRequiresReferenceText, normalizeCloneReferenceTextRequest } from '@/utils/cloneModelCapabilities'
 import { findReusableAsrAnnotation } from '@/utils/asrAnnotationReuse'
+import { defaultCloneTextForLanguage, translateDefaultCloneText } from '@/utils/cloneDefaultText'
 
 type ModelOption = RuntimeModelOption & { label: string }
 type CloneDialogMode = 'single' | 'all'
 
-const defaultCloneText = "This test shows how VoiceShield protects a speaker's voice."
 const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))
 
 function evaluationBatchId(type: 'asr' | 'clone') {
@@ -207,7 +207,8 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
   const [asrRunning, setAsrRunning] = useState(false)
   const [cloneRunning, setCloneRunning] = useState(false)
   const [cloneDialogMode, setCloneDialogMode] = useState<CloneDialogMode | null>(null)
-  const [cloneText, setCloneText] = useState(defaultCloneText)
+  const [cloneText, setCloneText] = useState(() => defaultCloneTextForLanguage('en'))
+  const cloneTextUsesDefaultRef = useRef(true)
   const [manualAnnotation, setManualAnnotation] = useState('')
   const lastPreferredTaskRef = useRef('')
 
@@ -230,6 +231,14 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
   const dialogCloneModels = cloneDialogMode === 'single' ? (effectiveClone ? [effectiveClone] : []) : availableClone
   const dialogReferenceTextModels = dialogCloneModels.filter(cloneModelRequiresReferenceText)
   const dialogNeedsReferenceText = dialogReferenceTextModels.length > 0
+
+  const changeCloneLanguage = (language: string) => {
+    setCloneLanguage(language)
+    setSelectedClone('')
+    if (cloneTextUsesDefaultRef.current) {
+      setCloneText((current) => translateDefaultCloneText(current, language))
+    }
+  }
 
   const requireTask = (taskId: string) => {
     if (taskId) return true
@@ -281,7 +290,7 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
     if (!cloneDialogMode || !requireTask(cloneTaskId)) return
     const dialogMode = cloneDialogMode
     if (!cloneText.trim()) {
-      pushToast({ kind: 'error', title: '请填写测试文本', description: '测试文本不能为空。' })
+      pushToast({ kind: 'error', title: '请填写目标测试文本', description: '目标测试文本不能为空。' })
       return
     }
     const models = dialogMode === 'single' && effectiveClone ? [effectiveClone] : availableClone
@@ -398,7 +407,7 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
       <div className="workspace-evaluation-section workspace-hover-card flex min-h-0 flex-col rounded-[9px] border border-violet-300/14 bg-slate-950/18 p-4">
         <div className="workspace-evaluation-header mb-3 flex items-center justify-between gap-3">
           <h2 className="flex-1 text-center text-[17px] font-black text-white">语音克隆测试</h2>
-          <select value={cloneLanguage} onChange={(event) => { setCloneLanguage(event.target.value); setSelectedClone('') }} className="workspace-hover-control h-8 rounded-[6px] border border-violet-300/14 bg-slate-950/70 px-2 text-xs font-bold text-slate-200">
+          <select value={cloneLanguage} onChange={(event) => changeCloneLanguage(event.target.value)} className="workspace-hover-control h-8 rounded-[6px] border border-violet-300/14 bg-slate-950/70 px-2 text-xs font-bold text-slate-200">
             <option value="en">英文</option>
             <option value="zh-cn">中文</option>
           </select>
@@ -422,7 +431,7 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
               </div>
               <button type="button" onClick={() => setCloneDialogMode(null)} className="grid h-9 w-9 place-items-center rounded-full border border-cyan-300/14 text-slate-300 hover:text-white" aria-label="关闭"><X className="h-4 w-4" /></button>
             </div>
-            <label className="mt-5 block text-sm font-black text-slate-200">测试文本<textarea value={cloneText} onChange={(event) => setCloneText(event.target.value)} className="mt-2 min-h-24 w-full resize-none rounded-[7px] border border-cyan-300/14 bg-slate-950/70 p-3 text-sm leading-6 text-slate-100 outline-none focus:border-cyan-300" /></label>
+            <label className="mt-5 block text-sm font-black text-slate-200">目标测试文本<textarea value={cloneText} onChange={(event) => { cloneTextUsesDefaultRef.current = false; setCloneText(event.target.value) }} className="mt-2 min-h-24 w-full resize-none rounded-[7px] border border-cyan-300/14 bg-slate-950/70 p-3 text-sm leading-6 text-slate-100 outline-none focus:border-cyan-300" /></label>
             {dialogNeedsReferenceText ? <label className="mt-4 block text-sm font-black text-slate-200">人工标注{cloneDialogMode === 'single' ? '（必填）' : '（仅需要参考文本的模型使用）'}<textarea value={manualAnnotation} onChange={(event) => setManualAnnotation(event.target.value)} placeholder="输入人工核对后的原始音频文本" className="mt-2 min-h-20 w-full resize-none rounded-[7px] border border-violet-300/16 bg-slate-950/70 p-3 text-sm leading-6 text-slate-100 outline-none focus:border-violet-300" /></label> : null}
             <div className="mt-5 flex justify-end gap-3">
               <button type="button" onClick={() => setCloneDialogMode(null)} className="h-10 rounded-[7px] border border-cyan-300/14 px-4 text-sm font-bold text-slate-300">取消</button>

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -329,6 +330,39 @@ class ConcurrentSubtaskHistoryTest(unittest.TestCase):
             self.assertEqual(items["cosy"]["annotationSource"], "manual")
             self.assertEqual(items["cosy"]["speakerPrompt"], "required prompt")
 
+    def test_clone_batch_cannot_publish_reference_to_deleted_asr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp)
+            task_id = "task_clone_batch_deleted_asr"
+            task_dir = task_root / task_id
+            task_dir.mkdir(parents=True)
+            (task_dir / "result.json").write_text(json.dumps(minimal_result(task_id), ensure_ascii=False), encoding="utf-8")
+            request = api_server.EvaluationBatchRequest(
+                batchId="batch_clone_deleted_asr",
+                type="clone",
+                items=[
+                    {
+                        "batchItemId": "gpt",
+                        "model": "gpt-sovits:finetune",
+                        "annotationSource": "asr",
+                        "annotationAsrSubId": "asr_deleted",
+                    }
+                ],
+            )
+
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "DELETED_SUBTASK_KEYS", {f"{task_id}:asr_deleted"}),
+                mock.patch.object(api_server, "EVALUATION_COLLECTION_DELETIONS", set()),
+            ):
+                response = api_server.create_evaluation_batch(task_id, request)
+
+            self.assertEqual(response.status_code, 409)
+            error = json.loads(response.body.decode("utf-8"))["error"]
+            self.assertEqual(error["code"], "ASR_ANNOTATION_DELETED")
+            status_path = task_dir / "status.json"
+            self.assertFalse(status_path.exists() and json.loads(status_path.read_text(encoding="utf-8")).get("cloneBatches"))
+
     def test_batch_subtasks_merge_concurrently_and_aggregate_min_progress(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             task_root = Path(tmp)
@@ -602,6 +636,557 @@ class ConcurrentSubtaskHistoryTest(unittest.TestCase):
             self.assertEqual(status["cloneTask"]["cloneSubId"], "clone_late")
             self.assertEqual(rows[0]["asrTaskCount"], 2)
             self.assertEqual(rows[0]["cloneTaskCount"], 2)
+
+    def test_deleting_asr_collection_keeps_clone_references_and_removes_unreferenced_asr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp) / "tasks"
+            task_root.mkdir()
+            task_id = "task_delete_asr_only"
+            task_dir = task_root / task_id
+            (task_dir / "original").mkdir(parents=True)
+            (task_dir / "protected").mkdir()
+            (task_dir / "original" / "original.wav").write_bytes(b"original")
+            (task_dir / "protected" / "protected.wav").write_bytes(b"protected")
+            result = minimal_result(task_id)
+            result["asrResults"] = [
+                {"taskId": task_id, "asrSubId": "asr_delete", "asr": {"model": "tiny", "wer": 0.8, "cer": 0.7}},
+                {"taskId": task_id, "asrSubId": "asr_keep", "asr": {"model": "base", "wer": 0.4, "cer": 0.3}},
+            ]
+            result["cloneResults"] = [
+                {"taskId": task_id, "cloneSubId": "clone_keep", "cloneId": "voice_keep", "request": {"model": "gpt-sovits", "annotationSource": "asr", "annotationAsrSubId": "asr_keep"}, "cloneEval": {"cloneIdentityScore": 90, "identityBaselineWeight": 1, "cloneSemanticScore": 90, "semanticBaselineWeight": 1, "cloneQualityScore": 90, "qualityBaselineWeight": 1}}
+            ]
+            (task_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            (task_dir / "asr_results").mkdir()
+            for item in result["asrResults"]:
+                (task_dir / "asr_results" / f"{item['asrSubId']}.json").write_text(json.dumps(item), encoding="utf-8")
+            (task_dir / "asr_result.json").write_text(json.dumps(result["asrResults"][-1]), encoding="utf-8")
+
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "DELETED_SUBTASK_KEYS", set()),
+            ):
+                api_server.write_task_status(task_id, status="completed", progress=1, stage="asr_eval", asrSubId="asr_delete", asrResult=result["asrResults"][0])
+                api_server.write_task_status(task_id, status="completed", progress=1, stage="asr_eval", asrSubId="asr_keep", asrResult=result["asrResults"][1])
+                api_server.write_task_status(task_id, status="completed", progress=1, stage="downstream_tts_eval", cloneSubId="clone_keep", cloneRequest=result["cloneResults"][0]["request"], cloneResult=result["cloneResults"][0])
+                deleted = api_server._delete_evaluation_collection(task_id, "asr")
+                stored = json.loads((task_dir / "result.json").read_text(encoding="utf-8"))
+                status = json.loads(api_server.task_status_path(task_id).read_text(encoding="utf-8"))
+
+            self.assertEqual(deleted["status"], "deleted")
+            self.assertEqual(deleted["deletedSubtaskIds"], ["asr_delete"])
+            self.assertEqual(deleted["preservedAsrSubIds"], ["asr_keep"])
+            self.assertTrue((task_dir / "original" / "original.wav").exists())
+            self.assertTrue((task_dir / "protected" / "protected.wav").exists())
+            self.assertEqual([item["asrSubId"] for item in stored["asrResults"]], ["asr_keep"])
+            self.assertEqual([item["cloneSubId"] for item in stored["cloneResults"]], ["clone_keep"])
+            self.assertEqual([item["asrSubId"] for item in status["asrTasks"]], ["asr_keep"])
+            self.assertEqual(status["cloneTask"]["cloneSubId"], "clone_keep")
+            self.assertFalse((task_dir / "asr_results" / "asr_delete.json").exists())
+            self.assertTrue((task_dir / "asr_results" / "asr_keep.json").exists())
+            self.assertEqual(json.loads((task_dir / "asr_result.json").read_text(encoding="utf-8"))["asrSubId"], "asr_keep")
+
+    def test_deleting_asr_collection_preserves_referenced_legacy_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp) / "tasks"
+            task_root.mkdir()
+            task_id = "task_delete_legacy_asr"
+            task_dir = task_root / task_id
+            task_dir.mkdir()
+            result = minimal_result(task_id)
+            result["asrResults"] = [
+                {"taskId": task_id, "asrSubId": "asr_keep", "asr": {"model": "base", "wer": 0.4, "cer": 0.3}}
+            ]
+            result["cloneResults"] = [
+                {"taskId": task_id, "cloneSubId": "clone_keep", "request": {"annotationAsrSubId": "asr_keep"}, "cloneEval": {}}
+            ]
+            (task_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            legacy_asr = {
+                "asrSubId": "asr_keep",
+                "status": "completed",
+                "stage": "asr_eval",
+                "asrResult": result["asrResults"][0],
+            }
+            legacy_clone = {
+                "cloneSubId": "clone_keep",
+                "status": "completed",
+                "stage": "downstream_tts_eval",
+                "cloneResult": result["cloneResults"][0],
+            }
+            status = {
+                "taskId": task_id,
+                "status": "completed",
+                "progress": 1,
+                "stage": "downstream_tts_eval",
+                "asrSubId": "asr_keep",
+                "asrTask": legacy_asr,
+                "asrResult": result["asrResults"][0],
+                "cloneSubId": "clone_keep",
+                "cloneTask": legacy_clone,
+                "cloneResult": result["cloneResults"][0],
+            }
+            (task_dir / "status.json").write_text(json.dumps(status, ensure_ascii=False), encoding="utf-8")
+
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "DELETED_SUBTASK_KEYS", set()),
+            ):
+                deleted = api_server._delete_evaluation_collection(task_id, "asr")
+                stored_status = json.loads(api_server.task_status_path(task_id).read_text(encoding="utf-8"))
+
+            self.assertEqual(deleted["deletedSubtaskIds"], [])
+            self.assertEqual(deleted["preservedAsrSubIds"], ["asr_keep"])
+            self.assertEqual([item["asrSubId"] for item in stored_status["asrTasks"]], ["asr_keep"])
+            self.assertEqual(stored_status["asrTask"]["asrSubId"], "asr_keep")
+            self.assertEqual(stored_status["asrResult"]["asrSubId"], "asr_keep")
+
+    def test_deleting_asr_collection_restores_referenced_sidecar_only_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp) / "tasks"
+            task_root.mkdir()
+            task_id = "task_delete_sidecar_asr"
+            task_dir = task_root / task_id
+            task_dir.mkdir()
+            result = minimal_result(task_id)
+            result["cloneResults"] = [
+                {"taskId": task_id, "cloneSubId": "clone_keep", "request": {"annotationAsrSubId": "asr_keep"}, "cloneEval": {}}
+            ]
+            (task_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            sidecar = {
+                "taskId": task_id,
+                "asrSubId": "asr_keep",
+                "status": "available",
+                "asr": {"model": "base", "wer": 0.4, "cer": 0.3, "originalText": "clean", "protectedText": "protected"},
+            }
+            (task_dir / "asr_results").mkdir()
+            (task_dir / "asr_results" / "asr_keep.json").write_text(json.dumps(sidecar), encoding="utf-8")
+            (task_dir / "asr_result.json").write_text(json.dumps(sidecar), encoding="utf-8")
+            (task_dir / "clone_result.json").write_text(json.dumps(result["cloneResults"][0]), encoding="utf-8")
+
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "DELETED_SUBTASK_KEYS", set()),
+            ):
+                deleted = api_server._delete_evaluation_collection(task_id, "asr")
+                stored = json.loads((task_dir / "result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(deleted["deletedSubtaskIds"], [])
+            self.assertEqual(deleted["preservedAsrSubIds"], ["asr_keep"])
+            self.assertEqual([item["asrSubId"] for item in stored["asrResults"]], ["asr_keep"])
+            self.assertEqual(json.loads((task_dir / "asr_result.json").read_text(encoding="utf-8"))["asrSubId"], "asr_keep")
+            self.assertTrue((task_dir / "asr_results" / "asr_keep.json").exists())
+
+    def test_referenced_asr_can_be_deleted_after_clone_collection_is_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp) / "tasks"
+            task_root.mkdir()
+            task_id = "task_delete_clone_then_asr"
+            task_dir = task_root / task_id
+            (task_dir / "original").mkdir(parents=True)
+            (task_dir / "protected").mkdir()
+            (task_dir / "original" / "original.wav").write_bytes(b"original")
+            (task_dir / "protected" / "protected.wav").write_bytes(b"protected")
+            result = minimal_result(task_id)
+            asr_result = {"taskId": task_id, "asrSubId": "asr_keep", "asr": {"model": "base", "wer": 0.4, "cer": 0.3}}
+            clone_result = {
+                "taskId": task_id,
+                "cloneSubId": "clone_delete",
+                "cloneId": "voice_delete",
+                "request": {"model": "gpt-sovits", "annotationSource": "asr", "annotationAsrSubId": "asr_keep"},
+                "cloneEval": {},
+            }
+            result["asrResults"] = [asr_result]
+            result["cloneResults"] = [clone_result]
+            (task_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            (task_dir / "asr_results").mkdir()
+            (task_dir / "asr_results" / "asr_keep.json").write_text(json.dumps(asr_result), encoding="utf-8")
+            (task_dir / "asr_result.json").write_text(json.dumps(asr_result), encoding="utf-8")
+            (task_dir / "clone_results").mkdir()
+            (task_dir / "clone_results" / "clone_delete.json").write_text(json.dumps(clone_result), encoding="utf-8")
+            (task_dir / "clone_result.json").write_text(json.dumps(clone_result), encoding="utf-8")
+
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "DELETED_SUBTASK_KEYS", set()),
+            ):
+                api_server.write_task_status(task_id, status="completed", progress=1, stage="asr_eval", asrSubId="asr_keep", asrResult=asr_result)
+                api_server.write_task_status(task_id, status="completed", progress=1, stage="downstream_tts_eval", cloneSubId="clone_delete", cloneRequest=clone_result["request"], cloneResult=clone_result)
+                first_asr_delete = api_server._delete_evaluation_collection(task_id, "asr")
+                clone_delete = api_server._delete_evaluation_collection(task_id, "clone")
+                second_asr_delete = api_server._delete_evaluation_collection(task_id, "asr")
+                stored = json.loads((task_dir / "result.json").read_text(encoding="utf-8"))
+                stored_status = json.loads(api_server.task_status_path(task_id).read_text(encoding="utf-8"))
+
+            self.assertEqual(first_asr_delete["preservedAsrSubIds"], ["asr_keep"])
+            self.assertEqual(clone_delete["deletedSubtaskIds"], ["clone_delete"])
+            self.assertEqual(second_asr_delete["preservedAsrSubIds"], [])
+            self.assertEqual(second_asr_delete["deletedSubtaskIds"], ["asr_keep"])
+            self.assertEqual(stored["asrResults"], [])
+            self.assertEqual(stored["cloneResults"], [])
+            self.assertEqual(stored_status.get("asrTasks"), [])
+            self.assertNotIn("asrTask", stored_status)
+            self.assertNotIn("asrSubId", stored_status)
+            self.assertFalse((task_dir / "asr_result.json").exists())
+            self.assertFalse((task_dir / "asr_results").exists())
+            self.assertTrue((task_dir / "result.json").exists())
+            self.assertTrue((task_dir / "original" / "original.wav").exists())
+            self.assertTrue((task_dir / "protected" / "protected.wav").exists())
+
+    def test_deleting_single_referenced_asr_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp) / "tasks"
+            task_root.mkdir()
+            task_id = "task_delete_referenced_asr"
+            task_dir = task_root / task_id
+            task_dir.mkdir()
+            result = minimal_result(task_id)
+            result["asrResults"] = [{"taskId": task_id, "asrSubId": "asr_keep", "asr": {"model": "base"}}]
+            result["cloneResults"] = [{"taskId": task_id, "cloneSubId": "clone_keep", "request": {"annotationAsrSubId": "asr_keep"}}]
+            (task_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "DELETED_SUBTASK_KEYS", set()),
+            ):
+                with self.assertRaises(api_server.HTTPException) as raised:
+                    api_server._delete_evaluation_subtask(task_id, "asr", "asr_keep")
+
+            self.assertEqual(raised.exception.status_code, 409)
+            self.assertIn("still referenced", str(raised.exception.detail))
+            self.assertTrue((task_dir / "result.json").exists())
+
+    def test_deleting_asr_collection_cancels_only_unreferenced_asr_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp) / "tasks"
+            task_root.mkdir()
+            task_id = "task_delete_asr_runtime"
+            task_dir = task_root / task_id
+            task_dir.mkdir()
+            result = minimal_result(task_id)
+            result["asrResults"] = [
+                {"taskId": task_id, "asrSubId": "asr_delete", "asr": {"model": "tiny"}},
+                {"taskId": task_id, "asrSubId": "asr_keep", "asr": {"model": "base"}},
+            ]
+            result["cloneResults"] = [
+                {"taskId": task_id, "cloneSubId": "clone_keep", "request": {"annotationAsrSubId": "asr_keep"}}
+            ]
+            (task_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            protect_cancel = threading.Event()
+            delete_cancel = threading.Event()
+            keep_cancel = threading.Event()
+            clone_cancel = threading.Event()
+
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "TASK_CANCEL_EVENTS", {
+                    task_id: protect_cancel,
+                    f"{task_id}:asr_delete": delete_cancel,
+                    f"{task_id}:asr_keep": keep_cancel,
+                    f"{task_id}:clone_keep": clone_cancel,
+                }),
+                mock.patch.object(api_server, "TASK_THREADS", {}),
+                mock.patch.object(api_server, "TASK_PROCESSES", {}),
+                mock.patch.object(api_server, "DELETED_SUBTASK_KEYS", set()),
+            ):
+                api_server.write_task_status(task_id, status="running", progress=0.3, stage="asr_eval", asrSubId="asr_delete", asrResult=None)
+                api_server.write_task_status(task_id, status="running", progress=0.4, stage="asr_eval", asrSubId="asr_keep", asrResult=None)
+                api_server.write_task_status(task_id, status="running", progress=0.5, stage="downstream_tts_eval", cloneSubId="clone_keep", cloneRequest=result["cloneResults"][0]["request"], cloneResult=None)
+                deleted = api_server._delete_evaluation_collection(task_id, "asr")
+
+            self.assertEqual(deleted["deletedSubtaskIds"], ["asr_delete"])
+            self.assertEqual(deleted["preservedAsrSubIds"], ["asr_keep"])
+            self.assertEqual(deleted["cancelledCount"], 1)
+            self.assertTrue(delete_cancel.is_set())
+            self.assertFalse(keep_cancel.is_set())
+            self.assertFalse(clone_cancel.is_set())
+            self.assertFalse(protect_cancel.is_set())
+
+    def test_evaluation_submission_is_rejected_while_collection_delete_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp) / "tasks"
+            task_root.mkdir()
+            task_id = "task_delete_submission_guard"
+            task_dir = task_root / task_id
+            task_dir.mkdir()
+            (task_dir / "result.json").write_text(json.dumps(minimal_result(task_id), ensure_ascii=False), encoding="utf-8")
+
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "EVALUATION_COLLECTION_DELETIONS", {f"{task_id}:asr", f"{task_id}:clone"}),
+            ):
+                with self.assertRaises(api_server.HTTPException) as asr_error:
+                    api_server.run_asr_eval(task_id, api_server.AsrEvalRequest(model="openai-whisper:tiny", language="en"))
+                with self.assertRaises(api_server.HTTPException) as clone_error:
+                    api_server.clone_voice(task_id, api_server.CloneVoiceRequest(text="hello", model="xtts-v2", language="en"))
+
+            self.assertEqual(asr_error.exception.status_code, 409)
+            self.assertEqual(clone_error.exception.status_code, 409)
+            self.assertNotIn("asrTasks", json.loads((task_dir / "status.json").read_text(encoding="utf-8")) if (task_dir / "status.json").exists() else {})
+
+    def test_clone_submission_and_single_asr_delete_share_reference_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp) / "tasks"
+            task_root.mkdir()
+            task_id = "task_clone_reference_lock"
+            task_dir = task_root / task_id
+            task_dir.mkdir()
+            result = minimal_result(task_id)
+            result["asrResults"] = [
+                {
+                    "taskId": task_id,
+                    "asrSubId": "asr_keep",
+                    "status": "available",
+                    "asr": {"model": "base", "originalText": "clean", "protectedText": "protected"},
+                }
+            ]
+            (task_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            lock_entered = threading.Event()
+            release_clone = threading.Event()
+            original_resolver = api_server.resolve_clone_annotation
+
+            def blocking_resolver(*args: object, **kwargs: object):
+                resolved = original_resolver(*args, **kwargs)
+                lock_entered.set()
+                self.assertTrue(release_clone.wait(timeout=5))
+                return resolved
+
+            payload = api_server.CloneVoiceRequest(
+                text="hello",
+                model="gpt-sovits:finetune",
+                language="en",
+                annotationSource="asr",
+                annotationAsrSubId="asr_keep",
+            )
+            clone_response: list[object] = []
+            delete_error: list[BaseException] = []
+
+            def submit_clone() -> None:
+                clone_response.append(api_server.clone_voice(task_id, payload))
+
+            def delete_asr() -> None:
+                try:
+                    api_server._delete_evaluation_subtask(task_id, "asr", "asr_keep")
+                except BaseException as exc:
+                    delete_error.append(exc)
+
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "resolve_clone_annotation", side_effect=blocking_resolver),
+                mock.patch.object(api_server, "validate_clone_config", return_value=None),
+                mock.patch.object(api_server, "EVALUATION_COLLECTION_DELETIONS", set()),
+                mock.patch.object(api_server, "DELETED_SUBTASK_KEYS", set()),
+            ):
+                clone_thread = threading.Thread(target=submit_clone)
+                delete_thread = threading.Thread(target=delete_asr)
+                clone_thread.start()
+                self.assertTrue(lock_entered.wait(timeout=5))
+                delete_thread.start()
+                self.assertTrue(delete_thread.is_alive())
+                release_clone.set()
+                clone_thread.join(timeout=5)
+                delete_thread.join(timeout=5)
+
+            self.assertEqual(len(clone_response), 1)
+            self.assertEqual(len(delete_error), 1)
+            self.assertIsInstance(delete_error[0], api_server.HTTPException)
+            self.assertEqual(delete_error[0].status_code, 409)
+
+    def test_single_asr_delete_wins_before_clone_reference_is_published(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp) / "tasks"
+            task_root.mkdir()
+            task_id = "task_asr_delete_wins"
+            task_dir = task_root / task_id
+            task_dir.mkdir()
+            result = minimal_result(task_id)
+            result["asrResults"] = [
+                {
+                    "taskId": task_id,
+                    "asrSubId": "asr_delete",
+                    "status": "available",
+                    "asr": {"model": "base", "originalText": "clean", "protectedText": "protected"},
+                }
+            ]
+            (task_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            delete_entered = threading.Event()
+            release_delete = threading.Event()
+            original_remove_status = api_server._remove_subtask_status
+
+            def blocking_remove_status(*args: object, **kwargs: object):
+                delete_entered.set()
+                self.assertTrue(release_delete.wait(timeout=5))
+                return original_remove_status(*args, **kwargs)
+
+            payload = api_server.CloneVoiceRequest(
+                text="hello",
+                model="gpt-sovits:finetune",
+                language="en",
+                annotationSource="asr",
+                annotationAsrSubId="asr_delete",
+            )
+            delete_response: list[object] = []
+            clone_response: list[object] = []
+
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "_remove_subtask_status", side_effect=blocking_remove_status),
+                mock.patch.object(api_server, "validate_clone_config", return_value=None),
+                mock.patch.object(api_server, "EVALUATION_COLLECTION_DELETIONS", set()),
+                mock.patch.object(api_server, "DELETED_SUBTASK_KEYS", set()),
+            ):
+                delete_thread = threading.Thread(
+                    target=lambda: delete_response.append(api_server._delete_evaluation_subtask(task_id, "asr", "asr_delete"))
+                )
+                clone_thread = threading.Thread(target=lambda: clone_response.append(api_server.clone_voice(task_id, payload)))
+                delete_thread.start()
+                self.assertTrue(delete_entered.wait(timeout=5))
+                clone_thread.start()
+                clone_thread.join(timeout=5)
+                release_delete.set()
+                delete_thread.join(timeout=5)
+
+            self.assertEqual(len(delete_response), 1)
+            self.assertEqual(len(clone_response), 1)
+            self.assertEqual(clone_response[0].status_code, 409)
+            clone_payload = json.loads(clone_response[0].body)
+            self.assertEqual(clone_payload["error"]["code"], "ASR_ANNOTATION_DELETED")
+            stored_status = json.loads((task_dir / "status.json").read_text(encoding="utf-8"))
+            self.assertFalse(stored_status.get("cloneTasks"))
+
+    def test_result_adapter_persist_guard_blocks_deleted_subtask_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp) / "tasks"
+            task_root.mkdir()
+            task_id = "task_deleted_persist_guard"
+            task_dir = task_root / task_id
+            (task_dir / "original").mkdir(parents=True)
+            (task_dir / "protected").mkdir()
+            (task_dir / "original" / "original.wav").write_bytes(b"original")
+            (task_dir / "protected" / "protected.wav").write_bytes(b"protected")
+            (task_dir / "result.json").write_text(json.dumps(minimal_result(task_id), ensure_ascii=False), encoding="utf-8")
+            fake_asr = {"status": "available", "model": "base", "wer": 0.5, "cer": 0.4}
+
+            with (
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "maybe_asr_eval", return_value=fake_asr),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "TASK_CANCELLED"):
+                    result_adapter.create_asr_eval(
+                        task_id,
+                        {"model": "base", "language": "en", "asrSubId": "asr_deleted"},
+                        persist_allowed=lambda: False,
+                    )
+
+            stored = json.loads((task_dir / "result.json").read_text(encoding="utf-8"))
+            self.assertFalse(stored.get("asrResults"))
+
+    def test_clone_artifact_cleanup_rejects_path_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_dir = Path(tmp) / "task"
+            original_dir = task_dir / "original"
+            protected_dir = task_dir / "protected"
+            original_dir.mkdir(parents=True)
+            protected_dir.mkdir()
+            (original_dir / "original.wav").write_bytes(b"original")
+            (protected_dir / "protected.wav").write_bytes(b"protected")
+
+            api_server._remove_clone_artifacts(task_dir, {"cloneId": "../original"})
+            api_server._remove_clone_artifacts(task_dir, {"cloneId": "..\\protected"})
+
+            self.assertTrue((original_dir / "original.wav").exists())
+            self.assertTrue((protected_dir / "protected.wav").exists())
+
+    def test_result_json_wins_over_stale_sidecar_for_same_asr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp) / "tasks"
+            task_root.mkdir()
+            task_id = "task_result_wins_sidecar"
+            task_dir = task_root / task_id
+            task_dir.mkdir()
+            result = minimal_result(task_id)
+            result["asrResults"] = [
+                {"taskId": task_id, "asrSubId": "asr_keep", "asr": {"model": "base", "wer": 0.2, "originalText": "new"}}
+            ]
+            result["cloneResults"] = [
+                {"taskId": task_id, "cloneSubId": "clone_keep", "request": {"annotationAsrSubId": "asr_keep"}}
+            ]
+            (task_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            (task_dir / "asr_results").mkdir()
+            stale = {"taskId": task_id, "asrSubId": "asr_keep", "asr": {"model": "base", "wer": 0.8, "originalText": "stale"}}
+            (task_dir / "asr_results" / "asr_keep.json").write_text(json.dumps(stale), encoding="utf-8")
+            (task_dir / "asr_result.json").write_text(json.dumps(stale), encoding="utf-8")
+
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "EVALUATION_COLLECTION_DELETIONS", set()),
+                mock.patch.object(api_server, "DELETED_SUBTASK_KEYS", set()),
+            ):
+                api_server._delete_evaluation_collection(task_id, "asr")
+                stored = json.loads((task_dir / "result.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(stored["asrResults"][0]["asr"]["wer"], 0.2)
+            self.assertEqual(stored["asrResults"][0]["asr"]["originalText"], "new")
+
+    def test_deleting_running_clone_only_cancels_its_runtime_and_removes_its_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp) / "tasks"
+            task_root.mkdir()
+            task_id = "task_delete_clone_only"
+            task_dir = task_root / task_id
+            (task_dir / "original").mkdir(parents=True)
+            (task_dir / "protected").mkdir()
+            (task_dir / "original" / "original.wav").write_bytes(b"original")
+            (task_dir / "protected" / "protected.wav").write_bytes(b"protected")
+            clone_dir = task_dir / "clones" / "clone_voice_delete"
+            clone_dir.mkdir(parents=True)
+            (clone_dir / "audio.wav").write_bytes(b"clone")
+            result = minimal_result(task_id)
+            result["asrResults"] = [{"taskId": task_id, "asrSubId": "asr_keep", "asr": {"model": "base", "wer": 0.4, "cer": 0.3}}]
+            result["cloneResults"] = [{"taskId": task_id, "cloneSubId": "clone_delete", "cloneId": "clone_voice_delete", "request": {"model": "xtts-v2"}, "cloneEval": {}}]
+            (task_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            clone_cancel = threading.Event()
+            asr_cancel = threading.Event()
+            protect_cancel = threading.Event()
+
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "TASK_CANCEL_EVENTS", {
+                    task_id: protect_cancel,
+                    f"{task_id}:asr_keep": asr_cancel,
+                    f"{task_id}:clone_delete": clone_cancel,
+                }),
+                mock.patch.object(api_server, "TASK_THREADS", {}),
+                mock.patch.object(api_server, "TASK_PROCESSES", {}),
+                mock.patch.object(api_server, "DELETED_SUBTASK_KEYS", set()),
+            ):
+                api_server.write_task_status(task_id, status="completed", progress=1, stage="asr_eval", asrSubId="asr_keep", asrResult=result["asrResults"][0])
+                api_server.write_task_status(task_id, status="running", progress=0.4, stage="downstream_tts_eval", cloneSubId="clone_delete", cloneResult=None)
+                deleted = api_server._delete_evaluation_collection(task_id, "clone")
+                stored = json.loads((task_dir / "result.json").read_text(encoding="utf-8"))
+                status = json.loads(api_server.task_status_path(task_id).read_text(encoding="utf-8"))
+
+            self.assertEqual(deleted["cancelledCount"], 1)
+            self.assertTrue(clone_cancel.is_set())
+            self.assertFalse(asr_cancel.is_set())
+            self.assertFalse(protect_cancel.is_set())
+            self.assertTrue((task_dir / "original" / "original.wav").exists())
+            self.assertTrue((task_dir / "protected" / "protected.wav").exists())
+            self.assertFalse(clone_dir.exists())
+            self.assertEqual([item["asrSubId"] for item in stored["asrResults"]], ["asr_keep"])
+            self.assertEqual(stored["cloneResults"], [])
+            self.assertEqual(status["asrTask"]["asrSubId"], "asr_keep")
+            self.assertNotIn("cloneTask", status)
+            self.assertEqual(status["stage"], "report_generation")
 
     def test_clone_annotation_can_reuse_requested_asr_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

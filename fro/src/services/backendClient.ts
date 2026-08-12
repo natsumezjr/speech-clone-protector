@@ -1,6 +1,6 @@
 import axios from 'axios'
 import { apiBaseUrl } from '@/config/runtime'
-import type { ApiClient } from '@/types/api'
+import type { ApiClient, EvaluationDeleteResult } from '@/types/api'
 import type { AudioFileMeta } from '@/types/audio'
 import type { ApiErrorPayload, AsrEvalRequest, AsrEvalResponse, CapabilitiesResponse, CloneVoiceRequest, CloneVoiceResult, CreateEvaluationBatchRequest, EvaluationBatch, HistoryTask, MetricSource, ProtectionEvaluation, ProtectionEvaluationDimension, ProtectionEvaluationDimensionKey, ProtectionTaskRequest, PsychoacousticSliceResponse, TaskDetailsResponse, TaskResult, TaskStatusResponse } from '@/types/task'
 import { formatStructuredApiError } from '@/utils/apiError'
@@ -1041,6 +1041,14 @@ export const backendClient: ApiClient = {
   },
   async deleteTask(taskId: string): Promise<void> {
     await http.delete(`/api/tasks/${taskId}`)
+  },
+  async deleteAsrEvals(taskId: string): Promise<EvaluationDeleteResult> {
+    const response = await http.delete(`/api/tasks/${taskId}/asr-evals`)
+    return response.data
+  },
+  async deleteCloneVoices(taskId: string): Promise<EvaluationDeleteResult> {
+    const response = await http.delete(`/api/tasks/${taskId}/clone-voices`)
+    return response.data
   },
   async downloadProtectedAudio(taskId: string) {
     const response = await http.get(`/api/tasks/${taskId}/download?type=protected_audio`, {

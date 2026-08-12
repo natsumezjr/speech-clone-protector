@@ -1480,6 +1480,94 @@ class IsolatedWorkerRuntimeTest(unittest.TestCase):
             },
         )
 
+    def test_clone_semantic_worker_retries_embedded_cuda_oom_on_another_gpu(self) -> None:
+        selected_gpus: list[str] = []
+
+        def worker_response(*_args: object, **kwargs: object) -> dict[str, object]:
+            selected_gpu = str(kwargs["env_overrides"]["CUDA_VISIBLE_DEVICES"])
+            selected_gpus.append(selected_gpu)
+            if selected_gpu == "4":
+                return {
+                    "ok": True,
+                    "metrics": {
+                        "status": "error",
+                        "tokenChangeRate": 0.9462,
+                        "semanticDrift": None,
+                        "error": "OutOfMemoryError: CUDA out of memory while loading the semantic encoder",
+                    },
+                }
+            return {
+                "ok": True,
+                "metrics": {
+                    "status": "available",
+                    "tokenChangeRate": 0.9462,
+                    "semanticDrift": 0.73,
+                },
+            }
+
+        with (
+            mock.patch.object(result_adapter, "CLONE_GPU_MAX_CONCURRENCY", 1),
+            mock.patch.object(result_adapter, "CLONE_GPU_SLOTS", {}),
+            mock.patch.object(result_adapter, "SEMANTIC_WORKER_SLOTS", threading.BoundedSemaphore(1)),
+            mock.patch.object(result_adapter, "_run_isolated_json_worker", side_effect=worker_response),
+            mock.patch.object(
+                result_adapter,
+                "_nvidia_gpu_inventory",
+                return_value=(("4", "1"), {"4": 48000, "1": 47000}, {"4": "gpu-4", "1": "gpu-1"}),
+            ),
+            mock.patch.dict(
+                result_adapter.os.environ,
+                {
+                    "SEME2E_API_DEVICE": "cuda:0",
+                    "SEME2E_GPU_POOL": "4,1",
+                    "SEME2E_SEMANTIC_CUDA_VISIBLE_DEVICES": "",
+                    "SEME2E_SEMANTIC_DEVICE": "",
+                    "SEME2E_TOKENIZER_DEVICE": "",
+                    "SEME2E_SEMANTIC_ENCODER_DEVICE": "",
+                    "SEME2E_GPU_RETRY_TIMEOUT_SECONDS": "1",
+                    "SEME2E_GPU_WAIT_POLL_SECONDS": "0.01",
+                },
+            ),
+        ):
+            response = result_adapter._compute_clone_semantic_isolated(
+                Path("original_clone.wav"),
+                Path("protected_clone.wav"),
+                {},
+                preferred_gpu="4",
+            )
+
+        self.assertEqual(selected_gpus, ["4", "1"])
+        self.assertEqual(response["status"], "available")
+        self.assertEqual(response["semanticDrift"], 0.73)
+        self.assertEqual(response["gpu"], "1")
+        self.assertEqual(response["gpuAttempts"][0]["reason"], "gpu_memory_exhausted")
+
+    def test_clone_semantic_worker_default_memory_floor_waits_for_four_gib(self) -> None:
+        worker_response = {
+            "ok": True,
+            "metrics": {"status": "available", "tokenChangeRate": 0.7, "semanticDrift": 0.4},
+        }
+        with (
+            mock.patch.object(result_adapter, "SEMANTIC_WORKER_SLOTS", threading.BoundedSemaphore(1)),
+            mock.patch.object(result_adapter, "_run_gpu_worker_with_retry", return_value=(worker_response, "2", [])) as retry,
+            mock.patch.dict(
+                result_adapter.os.environ,
+                {
+                    "SEME2E_API_DEVICE": "cuda:0",
+                    "SEME2E_SEMANTIC_GPU_MIN_FREE_MIB": "",
+                    "SEME2E_GPU_MIN_FREE_MIB": "0",
+                },
+            ),
+        ):
+            response = result_adapter._compute_clone_semantic_isolated(
+                Path("original_clone.wav"),
+                Path("protected_clone.wav"),
+                {},
+            )
+
+        self.assertEqual(response["status"], "available")
+        self.assertEqual(retry.call_args.kwargs["minimum_free_mib"], 4096)
+
     def test_clone_semantic_worker_maps_explicit_cuda_devices_to_child_cuda_zero(self) -> None:
         worker_response = {
             "ok": True,

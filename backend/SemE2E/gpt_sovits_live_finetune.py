@@ -22,6 +22,80 @@ def _language(value: str) -> str:
     return "zh" if normalized in {"zh", "zh-cn", "chinese"} else "en"
 
 
+def _reference_language(transcript: str, configured: str = "auto", *, fallback: str = "en") -> str:
+    normalized = (configured or "auto").strip().lower().replace("_", "-")
+    if normalized not in {"", "auto", "default"}:
+        return _language(normalized)
+    if any("\u4e00" <= character <= "\u9fff" for character in transcript or ""):
+        return "zh"
+    if any(character.isascii() and character.isalpha() for character in transcript or ""):
+        return "en"
+    return _language(fallback)
+
+
+def _prepared_key(value: str) -> str:
+    return Path(value.strip().replace("\\", "/")).name
+
+
+def _prepared_keys(path: Path, *, semantic: bool) -> set[str]:
+    keys: set[str] = set()
+    for index, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines()):
+        if not line.strip():
+            continue
+        columns = line.split("\t")
+        if semantic and index == 0 and columns[0].strip() == "item_name":
+            continue
+        expected_columns = 2 if semantic else 4
+        if len(columns) < expected_columns:
+            continue
+        key = _prepared_key(columns[0])
+        if key:
+            keys.add(key)
+    return keys
+
+
+def _normalize_prepared_keys(path: Path, *, semantic: bool) -> None:
+    normalized_lines: list[str] = []
+    for index, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines()):
+        if not line.strip():
+            continue
+        columns = line.split("\t")
+        if semantic and index == 0 and columns[0].strip() == "item_name":
+            normalized_lines.append(line)
+            continue
+        if columns:
+            columns[0] = _prepared_key(columns[0])
+        normalized_lines.append("\t".join(columns))
+    path.write_text("\n".join(normalized_lines) + ("\n" if normalized_lines else ""), encoding="utf-8")
+
+
+def _validate_prepared_dataset(
+    phoneme_path: Path,
+    semantic_path: Path,
+    *,
+    condition: str,
+    transcript_language: str,
+) -> None:
+    phoneme_keys = _prepared_keys(phoneme_path, semantic=False)
+    semantic_keys = _prepared_keys(semantic_path, semantic=True)
+    if not phoneme_keys:
+        raise RuntimeError(
+            "GPT-SoVITS preprocessing produced no phoneme entries for "
+            f"the {condition} reference transcript (detected language={transcript_language}); "
+            "verify that the transcript language matches the reference audio"
+        )
+    if not semantic_keys:
+        raise RuntimeError(
+            f"GPT-SoVITS preprocessing produced no semantic entries for the {condition} reference audio"
+        )
+    if phoneme_keys != semantic_keys:
+        raise RuntimeError(
+            "GPT-SoVITS preprocessing key mismatch for "
+            f"{condition}: phoneme keys={sorted(phoneme_keys)[:3]}, "
+            f"semantic keys={sorted(semantic_keys)[:3]}"
+        )
+
+
 def _run(
     command: list[str],
     *,
@@ -124,6 +198,7 @@ def _prepare(
     condition: str,
     audio_path: Path,
     transcript: str,
+    transcript_language: str,
     condition_dir: Path,
     environment: dict[str, str],
 ) -> tuple[dict[str, float], Path, Path]:
@@ -131,7 +206,7 @@ def _prepare(
     prepared_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = condition_dir / "manifest.list"
     manifest_path.write_text(
-        f"{audio_path.resolve()}|voice_shield_{condition}|{_language(args.language)}|{transcript.strip()}\n",
+        f"{audio_path.resolve()}|voice_shield_{condition}|{_language(transcript_language)}|{transcript.strip()}\n",
         encoding="utf-8",
     )
     common = environment.copy()
@@ -146,6 +221,10 @@ def _prepare(
             "is_half": "True",
             "version": "v2",
             "bert_pretrained_dir": str(args.bert),
+            # GPT-SoVITS v2's chinese2/G2PW frontend reads ``bert_path``
+            # while 1-get-text.py itself reads ``bert_pretrained_dir``.
+            # Both must point at the same absolute local checkpoint.
+            "bert_path": str(args.bert),
             "cnhubert_base_dir": str(args.cnhubert),
             "pretrained_s2G": str(args.pretrained_s2g),
             "s2config_path": str(args.repo / "GPT_SoVITS" / "configs" / "s2.json"),
@@ -175,6 +254,14 @@ def _prepare(
     )
     phoneme_path = _copy_stage_output(prepared_dir, "2-name2text", "2-name2text.txt")
     semantic_path = _copy_stage_output(prepared_dir, "6-name2semantic", "6-name2semantic.tsv")
+    _normalize_prepared_keys(phoneme_path, semantic=False)
+    _normalize_prepared_keys(semantic_path, semantic=True)
+    _validate_prepared_dataset(
+        phoneme_path,
+        semantic_path,
+        condition=condition,
+        transcript_language=_language(transcript_language),
+    )
     return timings, phoneme_path, semantic_path
 
 
@@ -267,6 +354,8 @@ def _infer(
     condition: str,
     audio_path: Path,
     transcript: str,
+    prompt_language: str,
+    text_language: str,
     gpt_checkpoint: Path,
     sovits_checkpoint: Path,
     output_path: Path,
@@ -289,11 +378,11 @@ def _infer(
             "--prompt-text",
             transcript,
             "--prompt-language",
-            _language(args.language),
+            _language(prompt_language),
             "--text",
             args.text,
             "--text-language",
-            _language(args.language),
+            _language(text_language),
             "--speed",
             str(args.speed),
             "--output",
@@ -323,11 +412,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     started = time.perf_counter()
     results: dict[str, Any] = {}
+    text_language = _language(getattr(args, "language", "en"))
     conditions = (
-        ("original", args.original_audio, args.original_transcript, args.original_output),
-        ("protected", args.protected_audio, args.protected_transcript, args.protected_output),
+        (
+            "original",
+            args.original_audio,
+            args.original_transcript,
+            args.original_output,
+            _reference_language(
+                args.original_transcript,
+                getattr(args, "original_prompt_language", "auto"),
+                fallback=text_language,
+            ),
+        ),
+        (
+            "protected",
+            args.protected_audio,
+            args.protected_transcript,
+            args.protected_output,
+            _reference_language(
+                args.protected_transcript,
+                getattr(args, "protected_prompt_language", "auto"),
+                fallback=text_language,
+            ),
+        ),
     )
-    for condition, audio_path, transcript, output_path in conditions:
+    for condition, audio_path, transcript, output_path, prompt_language in conditions:
         condition_started = time.perf_counter()
         condition_dir = args.work_dir / condition
         condition_dir.mkdir(parents=True)
@@ -343,6 +453,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             condition=condition,
             audio_path=training_audio,
             transcript=transcript,
+            transcript_language=prompt_language,
             condition_dir=condition_dir,
             environment=environment,
         )
@@ -360,6 +471,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             condition=condition,
             audio_path=reference_audio,
             transcript=transcript,
+            prompt_language=prompt_language,
+            text_language=text_language,
             gpt_checkpoint=gpt_checkpoint,
             sovits_checkpoint=sovits_checkpoint,
             output_path=output_path,
@@ -379,6 +492,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "sourceDurationSec": round(source_duration, 4),
             "trainingDurationSec": round(training_duration, 4),
             "referenceDurationSec": round(reference_duration, 4),
+            "promptLanguage": prompt_language,
+            "textLanguage": text_language,
             "outputPath": str(output_path),
         }
     return {
@@ -399,6 +514,8 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--protected-audio", type=Path, required=True)
     value.add_argument("--original-transcript", required=True)
     value.add_argument("--protected-transcript", required=True)
+    value.add_argument("--original-prompt-language", default="auto")
+    value.add_argument("--protected-prompt-language", default="auto")
     value.add_argument("--text", required=True)
     value.add_argument("--language", default="en")
     value.add_argument("--speed", type=float, default=1.0)

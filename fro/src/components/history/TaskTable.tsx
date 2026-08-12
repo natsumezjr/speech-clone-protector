@@ -4,7 +4,7 @@ import { useNavigate } from 'react-router-dom'
 import { Badge } from '@/components/common/Badge'
 import { Button } from '@/components/common/Button'
 import { cn } from '@/lib/utils'
-import { deleteTask, downloadProtectedAudio, retryProtectionTask } from '@/services/apiClient'
+import { deleteAsrEvals, deleteCloneVoices, deleteTask, downloadProtectedAudio, retryProtectionTask } from '@/services/apiClient'
 import { useAppStore } from '@/store/appStore'
 import type { HistoryTask, TaskStatus } from '@/types/task'
 import { downloadBlob } from '@/utils/download'
@@ -161,10 +161,22 @@ export function TaskTable({ tasks, view, onChanged }: { tasks: HistoryTask[]; vi
     }
   }
 
-  const handleDelete = async (taskId: string) => {
+  const handleDelete = async (task: HistoryTask) => {
     try {
-      await deleteTask(taskId)
-      pushToast({ kind: 'success', title: '历史记录已删除' })
+      let preservedAsrCount = 0
+      if (view === 'asr') {
+        const deleted = await deleteAsrEvals(task.taskId)
+        preservedAsrCount = deleted.preservedReferencedCount
+      } else if (view === 'clone') {
+        await deleteCloneVoices(task.taskId)
+      } else {
+        await deleteTask(task.taskId)
+      }
+      pushToast({
+        kind: 'success',
+        title: view === 'protection' ? '保护历史记录已删除' : view === 'asr' ? '未引用的 ASR 测试记录已删除' : '克隆测试记录已删除',
+        description: preservedAsrCount > 0 ? `另有 ${preservedAsrCount} 条 ASR 结果正被克隆任务引用，已保留。` : undefined,
+      })
       onChanged?.()
     } catch (error) {
       pushToast({ kind: 'error', title: '删除失败', description: error instanceof Error ? error.message : '请稍后重试。' })
@@ -262,7 +274,7 @@ export function TaskTable({ tasks, view, onChanged }: { tasks: HistoryTask[]; vi
                       <Button variant="ghost" className="h-9 px-2" title="下载保护音频" onClick={() => void handleDownload(task.taskId)}>
                         <Download className="h-4 w-4" />
                       </Button>
-                      <Button variant="danger" className="h-9 px-2" title="删除" onClick={() => void handleDelete(task.taskId)}>
+                      <Button variant="danger" className="h-9 px-2" title="删除" onClick={() => void handleDelete(task)}>
                         <Trash2 className="h-4 w-4" />
                       </Button>
                     </div>
