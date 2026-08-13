@@ -123,16 +123,20 @@ async function waitForAsr(taskId: string, asrSubId: string) {
 function ProtectionTaskSelector({ tasks, value, onChange, view }: { tasks: HistoryTask[]; value: string; onChange: (value: string) => void; view: 'asr' | 'clone' }) {
   const navigate = useNavigate()
   const [open, setOpen] = useState(false)
+  const selectedTask = tasks.find((task) => task.taskId === value)
+  const selectedFilename = selectedTask?.filename && selectedTask.filename !== '-' ? selectedTask.filename : ''
   return (
     <div className="workspace-task-selector-wrap relative shrink-0">
       <button type="button" onClick={() => setOpen((current) => !current)} className="workspace-task-selector workspace-hover-control flex h-10 w-full items-center gap-2 rounded-[7px] border border-cyan-300/14 bg-slate-950/55 pl-3 pr-2 text-left text-xs text-slate-200 hover:border-cyan-300/28">
-        <span className={cn('min-w-0 flex-1 truncate font-mono', !value && 'font-sans text-slate-500')}>{value || '选择已完成的保护任务'}</span>
+        <span className={cn('min-w-0 flex-1 truncate', !selectedFilename && 'text-slate-500')} title={selectedFilename || undefined}>
+          {selectedFilename || (value ? '正在读取音频名称' : '选择已完成的保护任务')}
+        </span>
         <ChevronDown className={cn('h-4 w-4 shrink-0 text-slate-500 transition', open && 'rotate-180')} />
       </button>
       <button
         type="button"
-        disabled={!value}
-        onClick={() => navigate(`/history?view=${view}&search=${encodeURIComponent(value)}`)}
+        disabled={!selectedFilename}
+        onClick={() => navigate(`/history?view=${view}&search=${encodeURIComponent(selectedFilename)}`)}
         className="workspace-hover-control absolute right-9 top-1.5 grid h-7 w-7 place-items-center rounded-[5px] text-cyan-200 hover:bg-cyan-300/10 disabled:opacity-30"
         aria-label="在历史记录中查看"
       >
@@ -143,10 +147,9 @@ function ProtectionTaskSelector({ tasks, value, onChange, view }: { tasks: Histo
           {tasks.length ? tasks.map((task) => (
             <button key={task.taskId} type="button" onClick={() => { onChange(task.taskId); setOpen(false) }} className="workspace-hover-row block w-full rounded-[6px] px-3 py-2 text-left hover:bg-cyan-300/[0.08]">
               <span className="flex items-center justify-between gap-3">
-                <span className="min-w-0 truncate font-mono text-[11px] font-black text-cyan-100">{task.taskId}</span>
+                <span className="min-w-0 truncate text-[11px] font-black text-cyan-100" title={task.filename}>{task.filename || '未命名音频'}</span>
                 <span className="shrink-0 font-mono text-[10px] text-slate-500">{formatTaskTime(task.protectionCompletedAt ?? task.createdAt)}</span>
               </span>
-              <span className="mt-0.5 block truncate text-[10px] text-slate-500">{task.filename}</span>
             </button>
           )) : <p className="px-3 py-4 text-center text-xs text-slate-500">暂无可测试的保护任务</p>}
         </div>
@@ -162,7 +165,7 @@ function ModelGrid({ values, selected, onSelect }: { values: ModelOption[]; sele
         const unavailable = !isAvailable(item)
         return (
           <div key={item.value} className={cn('flex min-h-0 items-center rounded-[7px] border', !unavailable && 'workspace-hover-row', selected === item.value ? 'border-cyan-300 bg-cyan-400/12' : 'border-cyan-300/12 bg-slate-950/38', unavailable && 'opacity-50')}>
-            <button type="button" disabled={unavailable} onClick={() => onSelect(item)} className={cn('h-full min-w-0 flex-1 truncate px-3 text-center text-[11px] font-black', selected === item.value ? 'text-cyan-100' : 'text-slate-300')} title={item.reason ?? item.value}>
+            <button type="button" disabled={unavailable} onClick={() => onSelect(item)} className={cn('h-full min-w-0 flex-1 truncate px-3 text-center text-[11px] font-black', selected === item.value ? 'text-cyan-100' : 'text-slate-300')} title={unavailable ? '当前模型暂不可用' : shortModelName(item.value)}>
               {shortModelName(item.value)}
             </button>
           </div>
@@ -387,27 +390,10 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
 
   return (
     <section className="workspace-evaluation-panel workspace-hover-surface ui-card grid h-full min-h-0 grid-rows-2 gap-3 p-3">
-      <div className="workspace-evaluation-section workspace-hover-card flex min-h-0 flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/18 p-4">
-        <div className="workspace-evaluation-header mb-3 flex items-center justify-between gap-3">
-          <h2 className="flex-1 text-center text-[17px] font-black text-white">ASR 自动标注</h2>
-          <select value={asrLanguage} onChange={(event) => { setAsrLanguage(event.target.value); setSelectedAsr('') }} className="workspace-hover-control h-8 rounded-[6px] border border-cyan-300/14 bg-slate-950/70 px-2 text-xs font-bold text-slate-200">
-            <option value="en">英文</option>
-            <option value="zh-cn">中文</option>
-          </select>
-        </div>
-        <ProtectionTaskSelector tasks={completedTasks} value={asrTaskId} onChange={setAsrTaskId} view="asr" />
-        <div className="workspace-evaluation-model-grid mt-3"><ModelGrid values={availableAsr} selected={effectiveAsr?.value} onSelect={(item) => setSelectedAsr(item.value)} /></div>
-        <div className="workspace-evaluation-model-summary mt-2 min-h-0 flex-1"><ModelSummary model={effectiveAsr} modelTypes={modelTypes} /></div>
-        <div className="workspace-evaluation-actions workspace-hover-group mt-auto flex justify-end gap-2 pt-3">
-          <button type="button" disabled={asrRunning || !effectiveAsr} onClick={() => void queueAsr(effectiveAsr ? [effectiveAsr] : [], false)} className="workspace-hover-control h-9 rounded-[7px] border border-cyan-300/16 px-3 text-xs font-black text-slate-200 disabled:opacity-45">测试所选模型</button>
-          <button type="button" disabled={asrRunning || !availableAsr.length} onClick={() => void queueAsr(availableAsr, true)} className="workspace-hover-control cyan-button inline-flex h-9 items-center gap-2 rounded-[7px] px-3 text-xs font-black disabled:opacity-45">{asrRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}一键测试</button>
-        </div>
-      </div>
-
       <div className="workspace-evaluation-section workspace-hover-card flex min-h-0 flex-col rounded-[9px] border border-violet-300/14 bg-slate-950/18 p-4">
-        <div className="workspace-evaluation-header mb-3 flex items-center justify-between gap-3">
-          <h2 className="flex-1 text-center text-[17px] font-black text-white">语音克隆测试</h2>
-          <select value={cloneLanguage} onChange={(event) => changeCloneLanguage(event.target.value)} className="workspace-hover-control h-8 rounded-[6px] border border-violet-300/14 bg-slate-950/70 px-2 text-xs font-bold text-slate-200">
+        <div className="workspace-evaluation-header relative mb-3 flex min-h-8 items-center">
+          <h2 className="pointer-events-none absolute inset-x-0 text-center text-[17px] font-black text-white">VoiceShield 的语音克隆测试</h2>
+          <select value={cloneLanguage} onChange={(event) => changeCloneLanguage(event.target.value)} className="workspace-hover-control relative z-10 ml-auto h-8 rounded-[6px] border border-violet-300/14 bg-slate-950/70 px-2 text-xs font-bold text-slate-200">
             <option value="en">英文</option>
             <option value="zh-cn">中文</option>
           </select>
@@ -418,6 +404,23 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
         <div className="workspace-evaluation-actions workspace-hover-group mt-auto flex justify-end gap-2 pt-3">
           <button type="button" disabled={cloneRunning || !effectiveClone} onClick={() => openCloneDialog('single')} className="workspace-hover-control h-9 rounded-[7px] border border-violet-300/18 px-3 text-xs font-black text-slate-200 disabled:opacity-45">测试所选模型</button>
           <button type="button" disabled={cloneRunning || !availableClone.length} onClick={() => openCloneDialog('all')} className="workspace-hover-control inline-flex h-9 items-center gap-2 rounded-[7px] bg-violet-400 px-3 text-xs font-black text-slate-950 shadow-[0_0_20px_rgba(167,139,250,0.2)] disabled:opacity-45">{cloneRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}一键克隆</button>
+        </div>
+      </div>
+
+      <div className="workspace-evaluation-section workspace-hover-card flex min-h-0 flex-col rounded-[9px] border border-cyan-300/12 bg-slate-950/18 p-4">
+        <div className="workspace-evaluation-header relative mb-3 flex min-h-8 items-center">
+          <h2 className="pointer-events-none absolute inset-x-0 text-center text-[17px] font-black text-white">VoiceShield 的 ASR 自动标注测试</h2>
+          <select value={asrLanguage} onChange={(event) => { setAsrLanguage(event.target.value); setSelectedAsr('') }} className="workspace-hover-control relative z-10 ml-auto h-8 rounded-[6px] border border-cyan-300/14 bg-slate-950/70 px-2 text-xs font-bold text-slate-200">
+            <option value="en">英文</option>
+            <option value="zh-cn">中文</option>
+          </select>
+        </div>
+        <ProtectionTaskSelector tasks={completedTasks} value={asrTaskId} onChange={setAsrTaskId} view="asr" />
+        <div className="workspace-evaluation-model-grid mt-3"><ModelGrid values={availableAsr} selected={effectiveAsr?.value} onSelect={(item) => setSelectedAsr(item.value)} /></div>
+        <div className="workspace-evaluation-model-summary mt-2 min-h-0 flex-1"><ModelSummary model={effectiveAsr} modelTypes={modelTypes} /></div>
+        <div className="workspace-evaluation-actions workspace-hover-group mt-auto flex justify-end gap-2 pt-3">
+          <button type="button" disabled={asrRunning || !effectiveAsr} onClick={() => void queueAsr(effectiveAsr ? [effectiveAsr] : [], false)} className="workspace-hover-control h-9 rounded-[7px] border border-cyan-300/16 px-3 text-xs font-black text-slate-200 disabled:opacity-45">测试所选模型</button>
+          <button type="button" disabled={asrRunning || !availableAsr.length} onClick={() => void queueAsr(availableAsr, true)} className="workspace-hover-control cyan-button inline-flex h-9 items-center gap-2 rounded-[7px] px-3 text-xs font-black disabled:opacity-45">{asrRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}一键测试</button>
         </div>
       </div>
 

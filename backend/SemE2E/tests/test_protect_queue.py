@@ -190,6 +190,35 @@ class ProtectQueueTest(unittest.TestCase):
         self.assertFalse(api_server.PROTECT_ACTIVE_TASK_IDS)
         schedule_retry.assert_called_once_with()
 
+    def test_successful_protection_watcher_triggers_automatic_medium_once(self) -> None:
+        process = mock.Mock(exitcode=0)
+        cancel_event = threading.Event()
+        with (
+            mock.patch.object(api_server, "is_task_deleted", return_value=False),
+            mock.patch.object(api_server, "read_task_status", return_value={"status": "completed"}),
+            mock.patch.object(api_server, "cleanup_protect_process_runtime"),
+            mock.patch.object(api_server, "_dispatch_protect_tasks_locked"),
+            mock.patch.object(api_server, "_apply_task_display_filenames", return_value={}),
+            mock.patch.object(api_server, "_submit_automatic_filename_asr") as submit,
+        ):
+            api_server._watch_protect_process("task_success", process, cancel_event)
+        submit.assert_called_once()
+        request = submit.call_args.args[1]
+        self.assertEqual(request.model, api_server.AUTO_FILENAME_ASR_MODEL)
+
+    def test_failed_protection_watcher_does_not_trigger_automatic_asr(self) -> None:
+        process = mock.Mock(exitcode=1)
+        cancel_event = threading.Event()
+        with (
+            mock.patch.object(api_server, "is_task_deleted", return_value=False),
+            mock.patch.object(api_server, "read_task_status", return_value={"status": "failed"}),
+            mock.patch.object(api_server, "cleanup_protect_process_runtime"),
+            mock.patch.object(api_server, "_dispatch_protect_tasks_locked"),
+            mock.patch.object(api_server, "_submit_automatic_filename_asr") as submit,
+        ):
+            api_server._watch_protect_process("task_failed", process, cancel_event)
+        submit.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

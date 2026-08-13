@@ -54,7 +54,15 @@ class ASRTranscriber:
     def __init__(self, model_name: str, device: str = "cuda", language: str = "en"):
         self.model_name = model_name
         self.device = resolve_torch_device(device)
-        self.language = "zh" if str(language).lower().startswith("zh") else "en"
+        requested_language = str(language or "auto").strip().lower()
+        self.language: str | None = (
+            None
+            if requested_language in {"", "auto", "default", "detect"}
+            else "zh"
+            if requested_language.startswith("zh")
+            else "en"
+        )
+        self.detected_language: str | None = None
 
         if model_name.startswith("funasr:"):
             self.backend = "funasr"
@@ -124,12 +132,11 @@ class ASRTranscriber:
 
         if self.backend == "openai-whisper":
             audio = self._load_audio_array(audio_path)
-            result = self.model.transcribe(
-                audio,
-                language=self.language,
-                task="transcribe",
-                fp16=self.device.type == "cuda",
-            )
+            kwargs = {"task": "transcribe", "fp16": self.device.type == "cuda"}
+            if self.language is not None:
+                kwargs["language"] = self.language
+            result = self.model.transcribe(audio, **kwargs)
+            self.detected_language = str(result.get("language") or self.language or "").strip() or None
             return result["text"].strip()
 
         if self.backend == "wav2vec2-ctc":
@@ -142,7 +149,7 @@ class ASRTranscriber:
             return self.processor.batch_decode(predicted_ids)[0].strip()
 
         kwargs = {}
-        if self.is_whisper:
+        if self.is_whisper and self.language is not None:
             kwargs["generate_kwargs"] = {"language": self.language, "task": "transcribe"}
         audio = self._load_audio_array(audio_path)
         result = self.pipe({"array": audio, "sampling_rate": 16000}, **kwargs)

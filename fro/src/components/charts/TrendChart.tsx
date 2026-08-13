@@ -1,18 +1,9 @@
 import ReactECharts from 'echarts-for-react'
-import katex from 'katex'
-import 'katex/dist/katex.min.css'
 import { useAppStore } from '@/store/appStore'
 import type { LossTrendPoint } from '@/types/task'
+import { lossTrendSeries } from '@/utils/lossTrendSeries'
 
-const lossSeries = [
-  { key: 'Lid', legacyKey: 'Lfeat', formula: 'L_{\\mathrm{id}}', color: '#22d3ee' },
-  { key: 'Lsem', formula: 'L_{\\mathrm{sem}}', color: '#22c55e' },
-  { key: 'Lpsy', formula: 'L_{\\mathrm{psy}}', color: '#f59e0b' },
-  { key: 'L2', formula: 'L_2', color: '#a78bfa' },
-  { key: 'total', formula: 'L_{\\mathrm{total}}', color: '#fb7185' },
-] as const
-
-function lossValue(point: LossTrendPoint, series: (typeof lossSeries)[number]) {
+function lossValue(point: LossTrendPoint, series: (typeof lossTrendSeries)[number]) {
   return point[series.key] ?? ('legacyKey' in series ? point[series.legacyKey] : null)
 }
 
@@ -20,10 +11,6 @@ function formatLossValue(value: unknown) {
   const numberValue = typeof value === 'number' ? value : Number(value)
   if (!Number.isFinite(numberValue)) return '未生成'
   return numberValue.toFixed(2)
-}
-
-function renderFormula(formula: string) {
-  return katex.renderToString(formula, { throwOnError: false, displayMode: false })
 }
 
 export function TrendChart({ data }: { data: LossTrendPoint[] }) {
@@ -48,7 +35,7 @@ export function TrendChart({ data }: { data: LossTrendPoint[] }) {
         }
 
   const gridHeight = 12
-  const gridGap = (100 - gridHeight * lossSeries.length) / (lossSeries.length + 1)
+  const gridGap = (100 - gridHeight * lossTrendSeries.length) / (lossTrendSeries.length + 1)
 
   const option = {
     backgroundColor: 'transparent',
@@ -61,29 +48,29 @@ export function TrendChart({ data }: { data: LossTrendPoint[] }) {
       formatter: (params: Array<{ axisValue: number | string; seriesName: string; marker: string; value: unknown }>) => {
         const step = params[0]?.axisValue ?? '-'
         const rows = params
-          .map((item) => `${item.marker}${renderFormula(item.seriesName)}: ${formatLossValue(item.value)}`)
+          .map((item) => `${item.marker}${item.seriesName}: ${formatLossValue(item.value)}`)
           .join('<br/>')
         return `step: ${step}<br/>${rows}`
       },
     },
-    axisPointer: { link: [{ xAxisIndex: lossSeries.map((_, index) => index) }] },
+    axisPointer: { link: [{ xAxisIndex: lossTrendSeries.map((_, index) => index) }] },
     legend: { show: false },
-    grid: lossSeries.map((_, index) => ({
+    grid: lossTrendSeries.map((_, index) => ({
       left: 48,
       right: 16,
       top: `${gridGap + index * (gridHeight + gridGap)}%`,
       height: `${gridHeight}%`,
       containLabel: false,
     })),
-    xAxis: lossSeries.map((_, index) => ({
+    xAxis: lossTrendSeries.map((_, index) => ({
       type: 'category',
       gridIndex: index,
       data: data.map((item) => item.step),
-      axisTick: { show: index === lossSeries.length - 1 },
-      axisLabel: { show: index === lossSeries.length - 1, color: chartTheme.axisColor },
+      axisTick: { show: index === lossTrendSeries.length - 1 },
+      axisLabel: { show: index === lossTrendSeries.length - 1, color: chartTheme.axisColor },
       axisLine: { lineStyle: { color: chartTheme.axisLineColor } },
     })),
-    yAxis: lossSeries.map((_, index) => ({
+    yAxis: lossTrendSeries.map((_, index) => ({
       type: 'value',
       gridIndex: index,
       axisLabel: {
@@ -93,8 +80,8 @@ export function TrendChart({ data }: { data: LossTrendPoint[] }) {
       splitNumber: 2,
       splitLine: { lineStyle: { color: chartTheme.gridColor } },
     })),
-    series: lossSeries.map((series, index) => ({
-      name: series.formula,
+    series: lossTrendSeries.map((series, index) => ({
+      name: series.name,
       type: 'line',
       xAxisIndex: index,
       yAxisIndex: index,

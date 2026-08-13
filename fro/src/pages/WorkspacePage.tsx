@@ -511,7 +511,6 @@ function StrategyConfigCard({
   const [selectedMode, setSelectedMode] = useState<Exclude<ProtectionMode, 'joint'>>('standard')
   const [selectedTarget, setSelectedTarget] = useState<ProtectionTarget | 'joint'>('joint')
   const [lambdaModalOpen, setLambdaModalOpen] = useState(false)
-  const [architectureModalOpen, setArchitectureModalOpen] = useState(false)
   const [epsilon, setEpsilon] = useState(0)
   const [steps, setSteps] = useState(0)
   const [lambdaSem, setLambdaSem] = useState(0)
@@ -564,7 +563,7 @@ function StrategyConfigCard({
             <Info className="h-4 w-4 text-slate-500" />
           </h2>
           <span className="rounded-[6px] border border-cyan-300/14 bg-white/[0.03] px-3 py-2 text-sm text-slate-300">
-            capabilities
+            参数状态
           </span>
         </div>
         <div className="workspace-config-loading workspace-hover-card grid min-h-0 flex-1 place-items-center rounded-[7px] border border-cyan-300/14 bg-slate-950/20 p-6 text-center">
@@ -759,25 +758,23 @@ function StrategyConfigCard({
           <ModelSelectSummary label="语义编码器" values={selectedSemanticEncoders} options={semanticOptionItems} onOpen={openModelModal} />
           <ModelSelectSummary label="身份编码器" values={selectedFeatureModels} options={featureOptionItems} onOpen={openModelModal} />
         </div>
-        <div className="workspace-advanced-row workspace-hover-group mt-6 flex items-center gap-2 border-t border-cyan-300/10 pt-3">
+        <div className="workspace-advanced-row mt-6 border-t border-cyan-300/10 pt-3">
           <button type="button" onClick={() => setLambdaModalOpen(true)} className="flex min-w-0 flex-1 items-center justify-between text-left text-sm font-bold text-slate-300">
             <span className="inline-flex items-center gap-1">高级选项（<MathText formula="\lambda" className="text-cyan-100" />）</span>
             <ChevronDown className="h-4 w-4 text-cyan-300" />
-          </button>
-          <button type="button" onClick={() => setArchitectureModalOpen(true)} className="grid h-8 w-8 shrink-0 place-items-center rounded-[6px] border border-cyan-300/18 text-cyan-200 hover:bg-cyan-300/10" aria-label="查看系统架构和优化目标" title="查看系统架构和优化目标">
-            <Search className="h-4 w-4" />
           </button>
         </div>
         <div className="workspace-parameter-help workspace-hover-card mt-5 rounded-[7px] border border-cyan-300/16 bg-sky-400/10 p-3 text-[12px] leading-5 text-slate-300">
           <p className="font-bold text-cyan-200">参数说明</p>
           <p>
-            <MathTerm>ε</MathTerm> 控制保护扰动的最大幅度，Steps 控制优化迭代次数；<MathText formula="\lambda" className="mx-0.5 text-cyan-100" /> 权重在高级选项弹窗中调节。建议先保持默认权重，再根据语义扰动、身份相似度与听感质量进行微调。
+            <MathTerm>ε</MathTerm> 控制保护扰动的最大幅度，Steps 控制优化迭代次数；<MathText formula="\lambda" className="mx-0.5 text-cyan-100" /> 权重在高级选项弹窗中调节。建议先保持默认权重，再根据语义扰动、身份相似度与听感质量进行微调。<br/>
+            可以参考保护结果页的调参建议结合实际听感以及克隆效果进行定向调整。
           </p>
         </div>
       </ConfigBlock>
       </div>
 
-      {modelModalOpen ? (
+      {modelModalOpen ? createPortal((
         <ModelConfigModal
           semanticValues={selectedSemanticEncoders}
           semanticOptions={semanticOptionItems}
@@ -796,9 +793,9 @@ function StrategyConfigCard({
           }}
           onClose={() => setModelModalOpen(false)}
         />
-      ) : null}
+      ), document.body) : null}
 
-      {lambdaModalOpen ? (
+      {lambdaModalOpen ? createPortal((
         <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/68 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="lambda 高级参数">
           <div className="ui-card w-full max-w-[620px] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.46)]">
             <div className="mb-4 flex items-center justify-between">
@@ -817,9 +814,9 @@ function StrategyConfigCard({
             </div>
             <div className="space-y-4">
               <SliderRow label={<LambdaLabel name="sem" text="语义权重" />} labelText="lambda sem 语义权重" value={formatParameterValue(lambdaSem, lambdaSemRange)} pct={pctFromRange(lambdaSem, lambdaSemRange)} min={lambdaSemRange.min} max={lambdaSemRange.max} step={lambdaSemRange.step} numericValue={lambdaSem} onChange={updateNumber(setLambdaSem)} />
-              <SliderRow label={<LambdaLabel name="id" text="Identity 权重" />} labelText="lambda id Identity 权重" value={formatParameterValue(lambdaFeat, lambdaFeatRange)} pct={pctFromRange(lambdaFeat, lambdaFeatRange)} min={lambdaFeatRange.min} max={lambdaFeatRange.max} step={lambdaFeatRange.step} numericValue={lambdaFeat} onChange={updateNumber(setLambdaFeat)} />
+              <SliderRow label={<LambdaLabel name="id" text="声音身份权重" />} labelText="lambda id 声音身份权重" value={formatParameterValue(lambdaFeat, lambdaFeatRange)} pct={pctFromRange(lambdaFeat, lambdaFeatRange)} min={lambdaFeatRange.min} max={lambdaFeatRange.max} step={lambdaFeatRange.step} numericValue={lambdaFeat} onChange={updateNumber(setLambdaFeat)} />
               <SliderRow label={<LambdaLabel name="psy" text="听感约束" />} labelText="lambda psy 听感约束" value={formatScientificParameterValue(lambdaPsy)} pct={pctFromRange(lambdaPsy, lambdaPsyRange)} min={lambdaPsyRange.min} max={lambdaPsyRange.max} step={lambdaPsyRange.step} numericValue={lambdaPsy} onChange={updateNumber(setLambdaPsy)} />
-              <SliderRow label={<LambdaLabel name="2" text="L2 正则" />} labelText="lambda 2 L2 正则" value={formatParameterValue(lambdaL2, lambdaL2Range)} pct={pctFromRange(lambdaL2, lambdaL2Range)} min={lambdaL2Range.min} max={lambdaL2Range.max} step={lambdaL2Range.step} numericValue={lambdaL2} onChange={updateNumber(setLambdaL2)} />
+              <SliderRow label={<LambdaLabel name="2" text="噪声大小约束" />} labelText="lambda 2 噪声大小约束" value={formatParameterValue(lambdaL2, lambdaL2Range)} pct={pctFromRange(lambdaL2, lambdaL2Range)} min={lambdaL2Range.min} max={lambdaL2Range.max} step={lambdaL2Range.step} numericValue={lambdaL2} onChange={updateNumber(setLambdaL2)} />
             </div>
             <div className="mt-5 flex justify-end">
               <button type="button" onClick={() => setLambdaModalOpen(false)} className="cyan-button h-9 min-w-[112px] rounded-[6px] text-sm font-black">
@@ -828,9 +825,7 @@ function StrategyConfigCard({
             </div>
           </div>
         </div>
-      ) : null}
-
-      {architectureModalOpen ? <ArchitectureOverviewModal onClose={() => setArchitectureModalOpen(false)} /> : null}
+      ), document.body) : null}
 
       <div className="workspace-task-execution shrink-0 border-t border-cyan-300/10 pt-3">
         <div className="grid gap-3">
@@ -853,56 +848,6 @@ function StrategyConfigCard({
         </p>
       </div>
     </section>
-  )
-}
-
-function ArchitectureOverviewModal({ onClose }: { onClose: () => void }) {
-  return createPortal(
-    <div className="architecture-modal-backdrop fixed inset-0 z-[95] grid place-items-center px-4 backdrop-blur-md" role="dialog" aria-modal="true" aria-label="系统架构与优化目标">
-      <div className="architecture-modal-card ui-card relative isolate max-h-[90vh] w-full max-w-[660px] overflow-x-hidden overflow-y-auto p-5">
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            <h2 className="text-[21px] font-black text-white">系统架构与<span className="architecture-modal-title-accent">优化目标</span></h2>
-            <p className="mt-1 text-xs text-slate-500">保护音频由语义、声音身份和听感约束共同优化</p>
-          </div>
-          <button type="button" onClick={onClose} className="architecture-modal-close grid h-9 w-9 place-items-center rounded-full border text-slate-300" aria-label="关闭系统架构说明"><X className="h-4 w-4" /></button>
-        </div>
-        <div className="mt-5 grid grid-cols-[minmax(140px,1fr)_40px_minmax(170px,1.1fr)_40px_minmax(140px,1fr)] items-center gap-2">
-          <ArchBox title="输入音频" sub={<VariableSymbol name="x" />} icon={<Waves className="h-10 w-10 text-sky-200" />} />
-          <Arrow />
-          <ArchBox title="防护优化引擎" sub="" icon={<ShieldCheck className="h-12 w-12 text-cyan-300" />} active />
-          <Arrow />
-          <ArchBox title="保护音频" sub={<VariableSymbol name="x" prime />} icon={<Waves className="h-10 w-10 text-sky-200" />} />
-        </div>
-        <div className="mt-5 grid grid-cols-3 gap-3">
-          <Branch title="语义分支" color="green" items={['语义理解模型', '多模型语义编码', '表示空间约束']} />
-          <Branch title="身份分支" color="blue" items={['身份编码器', '声音身份约束', '说话人不可恢复']} />
-          <Branch title="听感约束" color="purple" items={['心理声学模型', '掩蔽阈值建模', '听感优化']} />
-        </div>
-        <div className="architecture-objective-card mt-5 rounded-[7px] border p-4 text-center text-sm text-slate-300">
-          <span className="mr-3 text-slate-400">联合优化目标</span><OptimizationFormula />
-        </div>
-        <div className="mt-5 grid gap-3 md:grid-cols-2">
-          <LossTerm formula="L_{\mathrm{sem}}" title="语义损失">拉开保护前后的语义表示，降低自动识别和语音理解的稳定性。</LossTerm>
-          <LossTerm formula="L_{\mathrm{id}}" title="声音身份损失">扰动说话人身份表示，使原说话人的声音身份更难恢复。</LossTerm>
-          <LossTerm formula="L_{\mathrm{psy}}" title="心理声学损失">让扰动尽量落在人耳不敏感或可被原语音掩蔽的区域。</LossTerm>
-          <LossTerm formula="\lVert \delta \rVert_{2}" title="扰动范数约束">限制整体扰动大小，避免保护音频被过度破坏。</LossTerm>
-        </div>
-      </div>
-    </div>,
-    document.body,
-  )
-}
-
-function LossTerm({ formula, title, children }: { formula: string; title: string; children: ReactNode }) {
-  return (
-    <div className="architecture-loss-card relative overflow-hidden rounded-[7px] border px-3 py-2.5">
-      <p className="flex items-center gap-2 font-black text-slate-100">
-        <MathText formula={formula} className="text-cyan-200" />
-        {title}
-      </p>
-      <p className="mt-1 text-xs leading-5 text-slate-400">{children}</p>
-    </div>
   )
 }
 
@@ -1177,12 +1122,12 @@ function ModelConfigModal({
 }) {
   const [informationModel, setInformationModel] = useState<UiModelOption | null>(null)
   return (
-    <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/68 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="代理模型和编码器配置">
+    <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/68 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="防护模型配置">
       <div className="ui-card w-full max-w-[680px] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.46)]">
         <div className="mb-4 flex items-center justify-between">
           <div>
             <h3 className="text-[20px] font-black text-white">模型配置</h3>
-            <p className="mt-1 text-xs text-slate-500">多选代理模型与编码器</p>
+            <p className="mt-1 text-xs text-slate-500">选择参与防护的模型，可同时选择多个</p>
           </div>
           <button type="button" onClick={onClose} className="grid h-9 w-9 place-items-center rounded-full border border-cyan-300/14 bg-white/[0.035] text-slate-300 hover:text-white" aria-label="关闭模型配置">
             <X className="h-4 w-4" />
@@ -1232,7 +1177,7 @@ function MultiChoiceGroup({ title, values, options, onToggle, onSelectAll, onInf
                 unavailable && 'opacity-60',
               )}
             >
-              <button type="button" disabled={unavailable} title={unavailable ? option.reason ?? '当前不可用' : option.value} onClick={() => onToggle(option.value)} className={cn('flex min-w-0 flex-1 items-center justify-between gap-3', unavailable && 'cursor-not-allowed')}>
+              <button type="button" disabled={unavailable} title={unavailable ? '当前模型暂不可用' : option.name ?? option.label ?? option.value} onClick={() => onToggle(option.value)} className={cn('flex min-w-0 flex-1 items-center justify-between gap-3', unavailable && 'cursor-not-allowed')}>
                 <span className="min-w-0 truncate">{option.label}</span>
                 <span className={cn('grid h-4 w-4 shrink-0 place-items-center rounded border', selected ? 'border-cyan-300 bg-cyan-300 text-slate-950' : 'border-slate-600')}>
                   {selected ? <CheckSquare className="h-3 w-3" /> : null}
@@ -1249,44 +1194,6 @@ function MultiChoiceGroup({ title, values, options, onToggle, onSelectAll, onInf
       </div>
     </div>
   )
-}
-
-function VariableSymbol({ name, prime }: { name: string; prime?: boolean }) {
-  return (
-    <span className="font-serif italic tracking-normal text-slate-300">
-      {name}
-      {prime ? <sup>′</sup> : null}
-    </span>
-  )
-}
-
-function ArchBox({ title, sub, icon, active }: { title: string; sub: ReactNode; icon: ReactNode; active?: boolean }) {
-  return (
-    <div className={cn('architecture-arch-box relative grid h-[118px] place-items-center overflow-hidden rounded-[7px] border text-center', active && 'architecture-arch-box-active')}>
-      {icon}
-      <p className="font-black text-slate-200">{title}</p>
-      {sub ? <p className="text-sm text-slate-400">{sub}</p> : null}
-    </div>
-  )
-}
-
-function Branch({ title, color, items }: { title: string; color: 'green' | 'blue' | 'purple'; items: string[] }) {
-  return (
-    <div className={cn('architecture-branch relative overflow-hidden rounded-[8px] border p-3 text-center', `architecture-branch-${color}`)}>
-      <h3 className={cn('mb-3 text-[18px] font-black', color === 'green' && 'text-emerald-300', color === 'blue' && 'text-sky-300', color === 'purple' && 'text-violet-300')}>{title}</h3>
-      <div className="space-y-2">
-        {items.map((item) => (
-          <div key={item} className="architecture-branch-item rounded-[6px] border px-2 py-3 text-sm text-slate-200">
-            {item}
-          </div>
-        ))}
-      </div>
-    </div>
-  )
-}
-
-function Arrow() {
-  return <div className="architecture-flow-arrow text-center text-3xl">→</div>
 }
 
 function TinyWave({ color, className }: { color: string; className?: string }) {

@@ -9,9 +9,10 @@ export interface MathTextProps {
   /** Whether to render as inline math (default true) */
   inline?: boolean
   className?: string
+  style?: React.CSSProperties
 }
 
-export function MathText({ formula, inline = true, className }: MathTextProps) {
+export function MathText({ formula, inline = true, className, style }: MathTextProps) {
   const ref = useRef<HTMLSpanElement | null>(null)
 
   useEffect(() => {
@@ -22,7 +23,7 @@ export function MathText({ formula, inline = true, className }: MathTextProps) {
     })
   }, [formula, inline])
 
-  return <span ref={ref} className={cn('inline-block', className)} />
+  return <span ref={ref} className={cn('inline-block', className)} style={style} />
 }
 
 export function MathBlock({ formula, className }: { formula: string; className?: string }) {

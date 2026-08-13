@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { createPortal } from 'react-dom'
 import { Download, Eye, RotateCcw, SlidersHorizontal, Trash2, X } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { Badge } from '@/components/common/Badge'
@@ -103,12 +104,12 @@ function modeLabel(task: HistoryTask) {
 
 function ParamModal({ task, onClose }: { task: HistoryTask; onClose: () => void }) {
   const rows = [
-    ['weightSemantic', task.parameters?.weightSemantic],
-    ['weightIdentity', task.parameters?.weightIdentity ?? task.parameters?.weightFeature],
-    ['weightPsy', task.parameters?.weightPsy],
-    ['weightL2', task.parameters?.weightL2],
+    ['语义保护权重', task.parameters?.weightSemantic],
+    ['声音身份保护权重', task.parameters?.weightIdentity ?? task.parameters?.weightFeature],
+    ['听感约束权重', task.parameters?.weightPsy],
+    ['扰动能量约束权重', task.parameters?.weightL2],
   ]
-  return (
+  return createPortal(
     <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/70 px-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="自定义参数">
       <div className="ui-card w-full max-w-md p-5">
         <div className="mb-4 flex items-center justify-between">
@@ -133,7 +134,8 @@ function ParamModal({ task, onClose }: { task: HistoryTask; onClose: () => void 
           </table>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   )
 }
 
@@ -186,8 +188,8 @@ export function TaskTable({ tasks, view, onChanged }: { tasks: HistoryTask[]; vi
   const handleRetry = async (taskId: string) => {
     setRetryingTaskId(taskId)
     try {
-      const created = await retryProtectionTask(taskId)
-      pushToast({ kind: 'success', title: '已重新提交保护任务', description: `新任务：${created.taskId}` })
+      await retryProtectionTask(taskId)
+      pushToast({ kind: 'success', title: '已重新提交保护任务', description: '新的保护任务已进入处理队列。' })
       onChanged?.()
     } catch (error) {
       pushToast({ kind: 'error', title: '重试失败', description: error instanceof Error ? error.message : '请稍后重试。' })

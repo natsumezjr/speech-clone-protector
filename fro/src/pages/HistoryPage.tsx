@@ -11,9 +11,9 @@ import { useTaskStore } from '@/store/taskStore'
 type HistoryView = 'protection' | 'asr' | 'clone'
 
 const historyViews: Array<{ key: HistoryView; label: string }> = [
-  { key: 'protection', label: '保护历史记录' },
-  { key: 'asr', label: 'ASR 历史记录' },
-  { key: 'clone', label: '语音克隆历史记录' },
+  { key: 'protection', label: 'VoiceShield 保护历史记录' },
+  { key: 'clone', label: 'VoiceShield 语音克隆测试' },
+  { key: 'asr', label: 'VoiceShield ASR 自动标注测试' },
 ]
 
 function taskStatusForView(task: { protectionStatus?: string | null; asrStatus?: string | null; cloneStatus?: string | null }, view: HistoryView) {
@@ -54,7 +54,7 @@ export function HistoryPage() {
     () =>
       data.filter((task) => {
         const query = search.toLowerCase()
-        const hitText = task.filename.toLowerCase().includes(query) || task.taskId.toLowerCase().includes(query)
+        const hitText = task.filename.toLowerCase().includes(query)
         const hitStatus = status === 'all' || taskStatusForView(task, view) === status
         const hitMode = mode === 'all' || task.mode === mode
         return hitText && hitStatus && hitMode && matchesHistoryView(task, view)

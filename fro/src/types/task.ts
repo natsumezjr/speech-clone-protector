@@ -665,6 +665,9 @@ export interface CapabilitiesResponse {
 
 export interface TaskResult {
   taskId: string
+  displayFilename?: string
+  displayProtectedFilename?: string
+  displayFilenameStatus?: 'available' | 'fallback' | string | null
   status: TaskStatus
   mode: ProtectionMode
   dataMode: DataMode
@@ -815,6 +818,9 @@ export interface HistoryTask {
   taskId: string
   filename: string
   protectedFilename: string
+  displayFilename?: string | null
+  displayProtectedFilename?: string | null
+  displayFilenameStatus?: 'available' | 'fallback' | string | null
   mode: ProtectionMode
   targetMode?: 'semantic' | 'timbre' | 'joint'
   parameters?: {

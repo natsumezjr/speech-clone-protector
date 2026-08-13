@@ -12,6 +12,15 @@ function clip(value: string, max = 180) {
   return value.length > max ? `${value.slice(0, max - 1)}…` : value
 }
 
+const stageLabels: Record<string, string> = {
+  api: '请求处理',
+  file_preprocess: '音频准备',
+  protect_generation: '生成保护音频',
+  report_generation: '整理保护结果',
+  asr_eval: '语音识别测试',
+  downstream_tts_eval: '语音克隆测试',
+}
+
 export function formatStructuredApiError(error: ApiErrorPayload | null | undefined, fallback = '请求失败。') {
   if (!error) return fallback
   const details = asRecord(error.details)
@@ -21,8 +30,8 @@ export function formatStructuredApiError(error: ApiErrorPayload | null | undefin
   const suggestion = nonEmptyString(details.suggestion)
 
   const lines = [error.message || fallback]
-  if (error.stage) lines.push(`阶段：${error.stage}`)
-  if (error.requestId) lines.push(`RequestId：${error.requestId}`)
+  if (error.stage) lines.push(`处理环节：${stageLabels[error.stage] ?? '任务处理'}`)
+  if (error.requestId) lines.push(`问题编号：${error.requestId}`)
   if (reason) lines.push(`原因：${clip(reason)}`)
   if (suggestion) lines.push(`建议：${clip(suggestion)}`)
   return lines.join('\n')

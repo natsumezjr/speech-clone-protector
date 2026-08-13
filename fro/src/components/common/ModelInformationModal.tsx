@@ -10,6 +10,15 @@ type Props = {
   onClose: () => void
 }
 
+function modelStatusText(status: string) {
+  if (status === 'unavailable') return '暂不可用'
+  if (status === 'partial') return '部分功能可用'
+  if (status === 'download_required') return '需要补充模型文件'
+  if (status === 'pending' || status === 'not_run') return '尚未完成可用性检查'
+  if (status === 'error') return '暂时无法使用'
+  return '当前不可用'
+}
+
 export function ModelInformationModal({ model, modelTypes, onClose }: Props) {
   useEffect(() => {
     if (model) window.dispatchEvent(new CustomEvent('voiceshield:overlay-open', { detail: 'model-information' }))
@@ -50,7 +59,7 @@ export function ModelInformationModal({ model, modelTypes, onClose }: Props) {
           </section>
           {model.status && model.status !== 'available' ? (
             <p className="rounded-[7px] border border-amber-300/16 bg-amber-300/8 px-3 py-2 text-xs leading-5 text-amber-100">
-              当前状态：{model.status}{model.reason ? ` · ${model.reason}` : ''}
+              当前状态：{modelStatusText(model.status)}。请稍后重试，或选择其他可用模型。
             </p>
           ) : null}
         </div>

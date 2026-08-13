@@ -26,7 +26,7 @@ const strategies = [
   {
     title: '语义防护',
     tag: '推荐',
-    desc: '干扰语义表示，降低语言系统理解准确率',
+    desc: '干扰语义，降低语言系统理解准确率',
     points: ['语义表示扰动', '多模型泛化'],
     icon: BrainCircuit,
     tone: 'green',
@@ -52,7 +52,7 @@ const metricTemplates = [
   { title: '声纹相似度下降', sub: '克隆相似度降低', tone: 'red' },
   { title: 'SNR 信噪比', sub: '高保真听感', tone: 'green' },
   { title: '综合防护评分', sub: '多维防护综合评估', tone: 'red' },
-  { title: '最高训练推理线程并发数', sub: '高效率高并发', tone: 'cyan' },
+  { title: '最高训练推理进程并行数', sub: '高效率', tone: 'cyan' },
   { title: '单步平均时长', sub: '平均耗时', tone: 'blue' },
 ] as const
 
@@ -177,7 +177,7 @@ function buildHomeMetrics(snapshot?: HomeMetricSnapshot): { metrics: HomeMetric[
 
 const capabilities = [
   { title: '双重防护机制', icon: ShieldCheck, desc: '语义及声音身份双通路协同，全面降低被克隆与滥用风险。', tone: 'green' },
-  { title: '多模型泛化', icon: Puzzle, desc: '覆盖主流 ASR / Tokenizer / LLM / TTS 模型，具备强迁移能力。', tone: 'blue' },
+  { title: '多模型泛化', icon: Puzzle, desc: '覆盖主流语音识别、内容分析、语言理解与语音克隆模型，具备强迁移能力。', tone: 'blue' },
   { title: '听感无感知', icon: Ear, desc: '基于心理声学约束，保障人耳听感质量与发布可用性。', tone: 'purple' },
   { title: '可解释可评估', icon: Gauge, desc: '全流程评估与可视化，风险可控，指标可追踪，效果可评估。', tone: 'amber' },
 ]
@@ -299,7 +299,7 @@ export function HomePage() {
               '面向新兴语音克隆技术的主动防护',
               '提出语义与声音身份双重防护框架，兼顾安全与可用',
               '引入心理声学约束，扰动不可感知，听感友好',
-              '在多种下游系统上实现显著性能劣化与迁移鲁棒',
+              '在多类语音处理模型上保持稳定防护效果',
             ].map((item) => (
               <p key={item} className="flex gap-3">
                 <span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-amber-300" />
@@ -343,7 +343,7 @@ function HeroScene({ impactValues }: { impactValues: string[] }) {
       </div>
       <div className="hero-impact-panel absolute inset-x-0 bottom-5 rounded-[8px] border border-cyan-300/22 bg-[#061426]/92 p-3">
         <div className="mb-2 text-center text-sm font-medium leading-5 text-slate-300">
-          下游系统影响
+          多类模型影响
         </div>
         <div className="hero-impact-content grid grid-cols-[minmax(260px,278px)_minmax(0,1fr)] gap-2.5 max-md:grid-cols-1">
           <div className="hero-audio-pair grid min-w-0 grid-cols-[minmax(0,1fr)_28px_minmax(0,1fr)] gap-2.5">
@@ -355,7 +355,7 @@ function HeroScene({ impactValues }: { impactValues: string[] }) {
             <div className="grid grid-cols-4 gap-2">
               {[
                 ['ASR', '语音识别', impactValues[0]],
-                ['Tokenizer', '分词器', impactValues[1]],
+                ['语音单元', '内容切分', impactValues[1]],
                 ['LLM', '语言模型', impactValues[2]],
                 ['TTS', '克隆系统', impactValues[3]],
               ].map(([name, sub, value]) => (

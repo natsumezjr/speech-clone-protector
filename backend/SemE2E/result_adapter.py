@@ -2663,8 +2663,8 @@ def runtime_config() -> dict[str, Any]:
     fields = {
         "epsilon": {"label": "扰动强度 ε", "path": "optimization.epsilon", "default": round(FORMAL_EPSILON, 9), "min": 0.001, "max": 0.08, "step": 0.001, "unit": "waveform amplitude", "description": "高保真默认值为 4/255。"},
         "steps": {"label": "优化步数", "path": "optimization.steps", "default": FORMAL_STEPS, "min": 1, "max": 500, "step": 1, "description": "默认 200，最大 500。"},
-        "weightIdentity": {"label": "Identity 权重", "path": "timbre.weightIdentity", "default": FORMAL_WEIGHT_FEATURE, "min": 0, "max": 1000, "step": 1},
-        "weightFeature": {"label": "Identity 权重（legacy）", "path": "timbre.weightFeature", "default": FORMAL_WEIGHT_FEATURE, "min": 0, "max": 1000, "step": 1},
+        "weightIdentity": {"label": "声音身份权重", "path": "timbre.weightIdentity", "default": FORMAL_WEIGHT_FEATURE, "min": 0, "max": 1000, "step": 1},
+        "weightFeature": {"label": "声音身份权重（legacy）", "path": "timbre.weightFeature", "default": FORMAL_WEIGHT_FEATURE, "min": 0, "max": 1000, "step": 1},
         "weightSemantic": {"label": "Semantic 权重", "path": "semantic.weightSemantic", "default": FORMAL_WEIGHT_SEMANTIC, "min": 0, "max": 500, "step": 1},
         "weightPsy": {"label": "心理声学权重", "path": "psychoacoustic.weightPsy", "default": FORMAL_WEIGHT_PSY, "min": 0, "max": 0.01, "step": 0.000001},
         "weightL2": {"label": "L2 权重", "path": "optimization.weightL2", "default": FORMAL_WEIGHT_L2, "min": 0, "max": 1, "step": 0.01},
@@ -3571,7 +3571,7 @@ def maybe_asr_eval(
                 clean_text,
                 protected_text,
                 reference_text=reference_text,
-                language=payload.get("language"),
+                language=worker_result.get("language") or payload.get("language"),
                 model=model,
             )
             item["gpu"] = selected_gpu
@@ -3665,6 +3665,36 @@ def create_asr_eval(
         refresh_result_scores(latest_result)
         save_result(TASK_DIR / task_id, latest_result)
     return response
+
+
+def create_automatic_filename_asr(
+    task_id: str,
+    *,
+    model: str = "openai-whisper:medium",
+    language: str = "auto",
+    cancel_event: Any | None = None,
+) -> dict[str, Any]:
+    """Transcribe a protected task for naming without changing ASR history."""
+
+    original_path, protected_path, result = _task_audio_paths(task_id)
+    request_semantic = ((result.get("request") or {}).get("semantic") or {}) if isinstance(result.get("request"), dict) else {}
+    asr = maybe_asr_eval(
+        original_path,
+        protected_path,
+        {
+            "language": language,
+            "semantic": {**request_semantic, "asrModel": model, "asrModels": [model]},
+            "forceAsrEval": True,
+        },
+        cancel_event=cancel_event,
+    )
+    return {
+        "taskId": task_id,
+        "status": asr.get("status") or "unavailable",
+        "asr": asr,
+        "request": {"model": model, "language": language},
+        "createdAt": utc_now_iso(),
+    }
 
 
 def maybe_speaker_eval(clean_path: Path, protected_path: Path) -> dict[str, Any]:

@@ -5,16 +5,11 @@ import type { AudioFileMeta } from '@/types/audio'
 import type { ApiErrorPayload, AsrEvalRequest, AsrEvalResponse, CapabilitiesResponse, CloneVoiceRequest, CloneVoiceResult, CreateEvaluationBatchRequest, EvaluationBatch, HistoryTask, MetricSource, ProtectionEvaluation, ProtectionEvaluationDimension, ProtectionEvaluationDimensionKey, ProtectionTaskRequest, PsychoacousticSliceResponse, TaskDetailsResponse, TaskResult, TaskStatusResponse } from '@/types/task'
 import { formatStructuredApiError } from '@/utils/apiError'
 import { layeredMetricNumber } from '@/utils/metricNormalization'
+import { filenameFromContentDisposition } from '@/utils/contentDisposition'
 
 const http = axios.create({
   baseURL: apiBaseUrl,
 })
-
-function filenameFromDisposition(header: string | undefined, fallback: string) {
-  if (!header) return fallback
-  const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(header)
-  return match ? decodeURIComponent(match[1]) : fallback
-}
 
 function numberOrNull(value: unknown) {
   if (value === null || value === undefined || value === '') return null
@@ -205,7 +200,7 @@ function absoluteUrl(value?: string) {
 
 function normalizeAudio(meta: unknown, fallbackName: string): AudioFileMeta {
   const data = asRecord(meta)
-  const filename = firstString(data, ['filename', 'name', 'fileName']) ?? fallbackName
+  const filename = firstString(data, ['displayFilename', 'filename', 'name', 'fileName']) ?? fallbackName
   const rawSrc = firstString(data, ['src', 'url', 'audioUrl', 'downloadUrl']) ?? undefined
   const rawAudioUrl = firstString(data, ['audioUrl', 'url', 'src', 'downloadUrl']) ?? rawSrc
   const rawDownloadUrl = firstString(data, ['downloadUrl', 'url', 'audioUrl', 'src']) ?? undefined
@@ -213,6 +208,8 @@ function normalizeAudio(meta: unknown, fallbackName: string): AudioFileMeta {
   return {
     fileId: typeof data.fileId === 'string' ? data.fileId : undefined,
     filename,
+    displayFilename: firstString(data, ['displayFilename']) ?? filename,
+    storedFilename: firstString(data, ['storedFilename']) ?? undefined,
     durationSec: firstNumber(data, ['durationSec', 'duration', 'duration_seconds']) ?? undefined,
     duration: firstNumber(data, ['duration', 'durationSec', 'duration_seconds']) ?? undefined,
     sampleRate: firstNumber(data, ['sampleRate', 'sample_rate']) ?? undefined,
@@ -830,7 +827,7 @@ function normalizeTaskResult(payload: unknown): TaskResult {
     submittedAt: typeof data.submittedAt === 'string' ? data.submittedAt : typeof data.createdAt === 'string' ? data.createdAt : undefined,
     completedAt: stringOr(data.completedAt ?? data.createdAt, '-'),
     elapsedSec,
-    inputSource: '服务接口',
+    inputSource: '已上传音频',
     language: stringOr(detailAsr.language, '未标注'),
     processingModel: stringOr(detailGeneration.source ?? backend.version, ''),
     optimizationTarget: stringOr(detailGeneration.mode ?? data.mode, 'joint'),
@@ -1056,7 +1053,7 @@ export const backendClient: ApiClient = {
     })
     return {
       blob: response.data,
-      filename: filenameFromDisposition(response.headers['content-disposition'], 'protected_voice.wav'),
+      filename: filenameFromContentDisposition(response.headers['content-disposition'], 'protected_voice.wav'),
     }
   },
   async exportReport(taskId: string): Promise<Blob> {

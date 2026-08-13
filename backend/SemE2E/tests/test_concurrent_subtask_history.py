@@ -50,7 +50,910 @@ def minimal_result(task_id: str) -> dict[str, object]:
     }
 
 
+def automatic_medium_result(task_id: str, *, status: str = "available", error: str | None = None) -> dict[str, object]:
+    asr: dict[str, object] = {
+        "status": status,
+        "model": "openai-whisper:medium",
+        "language": "en",
+        "originalText": "This is the presentation of our works for the competition.",
+        "protectedText": "This is a protected presentation for the competition.",
+        "wer": 0.75,
+        "cer": 0.65,
+    }
+    if error is not None:
+        asr["error"] = error
+    return {
+        "taskId": task_id,
+        "status": status,
+        "asr": asr,
+        "request": {"model": "openai-whisper:medium", "language": "auto"},
+        "createdAt": "2026-08-13T00:00:00+00:00",
+    }
+
+
+class InlineThread:
+    def __init__(self, *, target: object, **_: object) -> None:
+        self._target = target
+        self._alive = False
+
+    def start(self) -> None:
+        self._alive = True
+        try:
+            self._target()  # type: ignore[operator]
+        finally:
+            self._alive = False
+
+    def join(self, timeout: float | None = None) -> None:
+        del timeout
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+
+class HoldingThread:
+    starts = 0
+    instances: list["HoldingThread"] = []
+
+    def __init__(self, *, target: object, **_: object) -> None:
+        self._target = target
+        self._alive = False
+        self.join_calls = 0
+        type(self).instances.append(self)
+
+    def start(self) -> None:
+        type(self).starts += 1
+        self._alive = True
+
+    def join(self, timeout: float | None = None) -> None:
+        del timeout
+        self.join_calls += 1
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def run_late(self) -> None:
+        if not self._alive:
+            return
+        try:
+            self._target()  # type: ignore[operator]
+        finally:
+            self._alive = False
+
+
 class ConcurrentSubtaskHistoryTest(unittest.TestCase):
+    def test_transcript_display_filename_uses_three_words_ellipsis_and_last_word(self) -> None:
+        self.assertEqual(
+            api_server._transcript_filename_stem("This is the presentation of our works for the competition."),
+            "record_this_is_the……competition",
+        )
+        self.assertEqual(
+            api_server._transcript_filename_stem("语音保护效果十分优秀"),
+            "record_语音_保护_效果……优秀",
+        )
+        self.assertEqual(
+            api_server._transcript_filename_stem(
+                f"{'a' * 30} {'b' * 30} {'c' * 30} middle {'z' * 30}"
+            ),
+            f"record_{'a' * 20}_{'b' * 20}_{'c' * 20}……{'z' * 20}",
+        )
+
+    def test_frontend_audio_hides_uuid_before_automatic_asr_finishes(self) -> None:
+        original = api_server._frontend_audio(
+            {"filename": "record_ed8a1de8-cd02-4b93-9550-cf063f089764.wav"},
+            "record_audio.wav",
+        )
+        protected = api_server._frontend_audio(
+            {"filename": "record_ed8a1de8-cd02-4b93-9550-cf063f089764_protected.wav"},
+            "record_audio_protected.wav",
+        )
+        self.assertEqual(original["filename"], "record_audio.wav")
+        self.assertEqual(protected["filename"], "record_audio_protected.wav")
+
+    def test_details_replace_stored_uuid_names_without_mutating_result(self) -> None:
+        result = minimal_result("task_details_name")
+        result["audio"]["original"]["filename"] = "record_ed8a1de8-cd02-4b93-9550-cf063f089764.wav"  # type: ignore[index]
+        result["audio"]["protected"]["filename"] = "record_ed8a1de8-cd02-4b93-9550-cf063f089764_protected.wav"  # type: ignore[index]
+        frontend = api_server._frontend_details_result(result)
+        self.assertEqual(frontend["audio"]["original"]["filename"], "record_audio.wav")
+        self.assertEqual(frontend["audio"]["protected"]["filename"], "record_audio_protected.wav")
+        self.assertEqual(result["audio"]["original"]["filename"], "record_ed8a1de8-cd02-4b93-9550-cf063f089764.wav")  # type: ignore[index]
+
+    def test_display_filename_is_persisted_without_renaming_audio_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp)
+            task_id = "task_display_name"
+            task_dir = task_root / task_id
+            (task_dir / "original").mkdir(parents=True)
+            (task_dir / "protected").mkdir(parents=True)
+            result = minimal_result(task_id)
+            result["audio"]["original"]["filename"] = "record_ed8a1de8-cd02-4b93-9550-cf063f089764.wav"  # type: ignore[index]
+            result["audio"]["protected"]["filename"] = "record_ed8a1de8-cd02-4b93-9550-cf063f089764_protected.wav"  # type: ignore[index]
+            (task_dir / "result.json").write_text(json.dumps(result), encoding="utf-8")
+            (task_dir / "status.json").write_text(json.dumps({"taskId": task_id, "status": "completed"}), encoding="utf-8")
+
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "DELETED_TASK_DIR", task_root / "deleted"),
+            ):
+                names = api_server._apply_task_display_filenames(
+                    task_id,
+                    "This is the presentation of our works for the competition.",
+                )
+
+            persisted = json.loads((task_dir / "result.json").read_text(encoding="utf-8"))
+            self.assertEqual(names["filename"], "record_this_is_the……competition.wav")
+            self.assertEqual(persisted["displayFilename"], names["filename"])
+            self.assertEqual(persisted["audio"]["original"]["filename"], "record_ed8a1de8-cd02-4b93-9550-cf063f089764.wav")
+            self.assertEqual(persisted["audio"]["original"]["displayFilename"], names["filename"])
+
+    def test_concurrent_equal_transcripts_receive_unique_persisted_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp)
+            for task_id in ("task_one", "task_two"):
+                task_dir = task_root / task_id
+                task_dir.mkdir(parents=True)
+                (task_dir / "result.json").write_text(json.dumps(minimal_result(task_id)), encoding="utf-8")
+                (task_dir / "status.json").write_text(json.dumps({"taskId": task_id, "status": "completed"}), encoding="utf-8")
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "DELETED_TASK_DIR", task_root / "deleted"),
+            ):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    names = list(executor.map(
+                        lambda task_id: api_server._apply_task_display_filenames(task_id, "This is the competition"),
+                        ("task_one", "task_two"),
+                    ))
+            self.assertEqual(
+                {item["filename"] for item in names},
+                {"record_this_is_the……competition.wav", "record_this_is_the……competition（1）.wav"},
+            )
+
+    def test_reapplying_display_name_keeps_persisted_suffix_and_available_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp)
+            for task_id in ("task_one", "task_two"):
+                task_dir = task_root / task_id
+                task_dir.mkdir(parents=True)
+                (task_dir / "result.json").write_text(json.dumps(minimal_result(task_id)), encoding="utf-8")
+                (task_dir / "status.json").write_text(json.dumps({"taskId": task_id, "status": "completed"}), encoding="utf-8")
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "DELETED_TASK_DIR", task_root / "deleted"),
+            ):
+                api_server._apply_task_display_filenames("task_one", "This is the competition")
+                allocated = api_server._apply_task_display_filenames("task_two", "This is the competition")
+                (task_root / "task_one" / "result.json").unlink()
+                replayed = api_server._apply_task_display_filenames("task_two", "This is the competition")
+                fallback_attempt = api_server._apply_task_display_filenames("task_two", None)
+
+            self.assertEqual(allocated["filename"], "record_this_is_the……competition（1）.wav")
+            self.assertEqual(replayed, allocated)
+            self.assertEqual(fallback_attempt, allocated)
+
+    def test_automatic_filename_status_does_not_pollute_user_asr_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp)
+            task_id = "task_private_asr"
+            task_dir = task_root / task_id
+            task_dir.mkdir(parents=True)
+            initial = {"taskId": task_id, "status": "completed", "stage": "report_generation", "asrTasks": [{"asrSubId": "asr_user"}]}
+            (task_dir / "status.json").write_text(json.dumps(initial), encoding="utf-8")
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "DELETED_TASK_DIR", task_root / "deleted"),
+            ):
+                updated = api_server.write_automatic_asr_status(task_id, status="failed", progress=1, message="OOM")
+            self.assertEqual(updated["status"], "completed")
+            self.assertEqual(updated["stage"], "report_generation")
+            self.assertEqual(updated["asrTasks"], [{"asrSubId": "asr_user"}])
+            self.assertEqual(updated["automaticFilenameAsr"]["status"], "failed")
+
+    def test_automatic_filename_asr_forces_only_whisper_medium(self) -> None:
+        result = minimal_result("task_medium_only")
+        result["request"]["semantic"]["asrModels"] = ["openai-whisper:tiny", "openai-whisper:base"]  # type: ignore[index]
+        with (
+            mock.patch.object(result_adapter, "_task_audio_paths", return_value=(Path("original.wav"), Path("protected.wav"), result)),
+            mock.patch.object(result_adapter, "maybe_asr_eval", return_value={"status": "available"}) as evaluator,
+        ):
+            result_adapter.create_automatic_filename_asr("task_medium_only")
+        semantic = evaluator.call_args.args[2]["semantic"]
+        self.assertEqual(semantic["asrModel"], "openai-whisper:medium")
+        self.assertEqual(semantic["asrModels"], ["openai-whisper:medium"])
+
+    def test_automatic_medium_success_syncs_normal_asr_history_without_overwriting_protection_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp) / "tasks"
+            task_root.mkdir()
+            task_id = "task_auto_history_success"
+            task_dir = task_root / task_id
+            task_dir.mkdir()
+            result = minimal_result(task_id)
+            result["audio"]["original"]["filename"] = "record_ed8a1de8-cd02-4b93-9550-cf063f089764.wav"  # type: ignore[index]
+            result["audio"]["protected"]["filename"] = "record_ed8a1de8-cd02-4b93-9550-cf063f089764_protected.wav"  # type: ignore[index]
+            (task_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            protection_status = {
+                "taskId": task_id,
+                "status": "completed",
+                "progress": 1,
+                "stage": "report_generation",
+                "message": "保护任务已完成",
+                "elapsedSec": 12.34,
+                "error": None,
+            }
+            (task_dir / "status.json").write_text(json.dumps(protection_status, ensure_ascii=False), encoding="utf-8")
+
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "DELETED_TASK_DIR", Path(tmp) / "deleted"),
+                mock.patch.object(api_server, "DELETED_TASK_IDS", set()),
+                mock.patch.object(api_server, "DELETED_SUBTASK_KEYS", set()),
+                mock.patch.object(api_server, "EVALUATION_COLLECTION_DELETIONS", set()),
+                mock.patch.object(api_server, "AUTOMATIC_FILENAME_ACTIVE_TASK_IDS", set()),
+                mock.patch.object(api_server, "TASK_CANCEL_EVENTS", {}),
+                mock.patch.object(api_server, "TASK_THREADS", {}),
+                mock.patch.object(api_server, "TASK_PROCESSES", {}),
+                mock.patch.object(api_server.threading, "Thread", InlineThread),
+                mock.patch.object(
+                    api_server,
+                    "create_automatic_filename_asr",
+                    return_value=automatic_medium_result(task_id),
+                ),
+            ):
+                response = api_server._submit_automatic_filename_asr(
+                    task_id,
+                    api_server.AsrEvalRequest(model=api_server.AUTO_FILENAME_ASR_MODEL, language="auto"),
+                )
+                rows = api_server.list_tasks()
+
+            self.assertEqual(response.status_code, 200)
+            stored_result = json.loads((task_dir / "result.json").read_text(encoding="utf-8"))
+            stored_status = json.loads((task_dir / "status.json").read_text(encoding="utf-8"))
+            automatic_sidecar = json.loads((task_dir / "automatic_filename_asr.json").read_text(encoding="utf-8"))
+            latest_sidecar = json.loads((task_dir / "asr_result.json").read_text(encoding="utf-8"))
+            history_sidecar = json.loads(
+                (task_dir / "asr_results" / f"{api_server.AUTO_FILENAME_ASR_SUB_ID}.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(len(stored_result["asrResults"]), 1)
+            automatic_result = stored_result["asrResults"][0]
+            self.assertEqual(automatic_result["asrSubId"], api_server.AUTO_FILENAME_ASR_SUB_ID)
+            self.assertEqual(automatic_result["asr"]["model"], api_server.AUTO_FILENAME_ASR_MODEL)
+            self.assertTrue(automatic_result["automatic"])
+            self.assertTrue(automatic_result["automaticFilename"])
+            self.assertEqual([item["asrSubId"] for item in stored_status["asrTasks"]], [api_server.AUTO_FILENAME_ASR_SUB_ID])
+            self.assertEqual(stored_status["asrTask"]["asrSubId"], api_server.AUTO_FILENAME_ASR_SUB_ID)
+            self.assertEqual(latest_sidecar["asrSubId"], api_server.AUTO_FILENAME_ASR_SUB_ID)
+            self.assertEqual(history_sidecar, latest_sidecar)
+            self.assertTrue(automatic_sidecar["historySynced"])
+            self.assertEqual(automatic_sidecar["historyAsrSubId"], api_server.AUTO_FILENAME_ASR_SUB_ID)
+            self.assertEqual(stored_result["displayFilename"], "record_this_is_the……competition.wav")
+
+            for field, expected in protection_status.items():
+                self.assertEqual(stored_status[field], expected, field)
+            self.assertEqual(len(rows), 1)
+            self.assertTrue(rows[0]["hasAsrResult"])
+            self.assertEqual(rows[0]["asrModel"], api_server.AUTO_FILENAME_ASR_MODEL)
+            self.assertEqual(rows[0]["asrTaskCount"], 1)
+
+    def test_completed_automatic_medium_sidecar_replay_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp) / "tasks"
+            task_root.mkdir()
+            task_id = "task_auto_history_replay"
+            task_dir = task_root / task_id
+            task_dir.mkdir()
+            (task_dir / "result.json").write_text(json.dumps(minimal_result(task_id), ensure_ascii=False), encoding="utf-8")
+            (task_dir / "status.json").write_text(
+                json.dumps({"taskId": task_id, "status": "completed", "progress": 1, "stage": "report_generation"}),
+                encoding="utf-8",
+            )
+            completed = automatic_medium_result(task_id)
+            completed["status"] = "completed"
+            (task_dir / "automatic_filename_asr.json").write_text(json.dumps(completed, ensure_ascii=False), encoding="utf-8")
+
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "DELETED_TASK_DIR", Path(tmp) / "deleted"),
+                mock.patch.object(api_server, "DELETED_TASK_IDS", set()),
+                mock.patch.object(api_server, "DELETED_SUBTASK_KEYS", set()),
+                mock.patch.object(api_server, "EVALUATION_COLLECTION_DELETIONS", set()),
+                mock.patch.object(api_server, "AUTOMATIC_FILENAME_ACTIVE_TASK_IDS", set()),
+                mock.patch.object(api_server, "create_automatic_filename_asr") as evaluator,
+            ):
+                first = api_server._submit_automatic_filename_asr(
+                    task_id,
+                    api_server.AsrEvalRequest(model=api_server.AUTO_FILENAME_ASR_MODEL, language="auto"),
+                )
+                first_result = json.loads((task_dir / "result.json").read_text(encoding="utf-8"))
+                first_status = json.loads((task_dir / "status.json").read_text(encoding="utf-8"))
+                first_sidecar = json.loads((task_dir / "automatic_filename_asr.json").read_text(encoding="utf-8"))
+                first_latest_history = json.loads((task_dir / "asr_result.json").read_text(encoding="utf-8"))
+                first_history = json.loads(
+                    (task_dir / "asr_results" / f"{api_server.AUTO_FILENAME_ASR_SUB_ID}.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+
+                self.assertEqual(json.loads(first.body.decode("utf-8"))["status"], "completed")
+                self.assertEqual(len(first_result["asrResults"]), 1)
+                self.assertEqual(first_result["asrResults"][0], first_history)
+                self.assertEqual(len(first_status["asrTasks"]), 1)
+                self.assertEqual(first_status["asrTask"], first_status["asrTasks"][0])
+                self.assertTrue(first_sidecar["historySynced"])
+                self.assertEqual(first_sidecar["historyAsrSubId"], api_server.AUTO_FILENAME_ASR_SUB_ID)
+                self.assertTrue(first_sidecar.get("historySyncedAt"))
+                self.assertEqual(first_latest_history, first_history)
+
+                second = api_server._submit_automatic_filename_asr(
+                    task_id,
+                    api_server.AsrEvalRequest(model=api_server.AUTO_FILENAME_ASR_MODEL, language="auto"),
+                )
+
+                second_result = json.loads((task_dir / "result.json").read_text(encoding="utf-8"))
+                second_status = json.loads((task_dir / "status.json").read_text(encoding="utf-8"))
+                second_sidecar = json.loads((task_dir / "automatic_filename_asr.json").read_text(encoding="utf-8"))
+                second_latest_history = json.loads((task_dir / "asr_result.json").read_text(encoding="utf-8"))
+                second_history = json.loads(
+                    (task_dir / "asr_results" / f"{api_server.AUTO_FILENAME_ASR_SUB_ID}.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+
+            evaluator.assert_not_called()
+            self.assertEqual(json.loads(second.body.decode("utf-8"))["status"], "completed")
+            self.assertEqual(first_sidecar["historySyncedAt"], second_sidecar["historySyncedAt"])
+            self.assertEqual(first_sidecar, second_sidecar)
+            self.assertEqual(len(second_result["asrResults"]), 1)
+            self.assertEqual(second_result["asrResults"][0], first_result["asrResults"][0])
+            self.assertEqual(len(second_status["asrTasks"]), 1)
+            self.assertEqual(second_status["asrTasks"][0], first_status["asrTasks"][0])
+            self.assertEqual(second_latest_history, first_latest_history)
+            self.assertEqual(second_history, first_history)
+
+    def test_deleted_automatic_medium_history_does_not_revive_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp) / "tasks"
+            task_root.mkdir()
+            task_id = "task_auto_history_deleted_restart"
+            task_dir = task_root / task_id
+            task_dir.mkdir()
+            (task_dir / "result.json").write_text(json.dumps(minimal_result(task_id), ensure_ascii=False), encoding="utf-8")
+            (task_dir / "status.json").write_text(
+                json.dumps({"taskId": task_id, "status": "completed", "progress": 1, "stage": "report_generation"}),
+                encoding="utf-8",
+            )
+            completed = automatic_medium_result(task_id)
+            completed["status"] = "completed"
+            (task_dir / "automatic_filename_asr.json").write_text(json.dumps(completed, ensure_ascii=False), encoding="utf-8")
+
+            deleted_subtasks: set[str] = set()
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "DELETED_TASK_DIR", Path(tmp) / "deleted"),
+                mock.patch.object(api_server, "DELETED_SUBTASK_KEYS", deleted_subtasks),
+                mock.patch.object(api_server, "EVALUATION_COLLECTION_DELETIONS", set()),
+                mock.patch.object(api_server, "AUTOMATIC_FILENAME_ACTIVE_TASK_IDS", set()),
+            ):
+                api_server.delete_asr_evals(task_id)
+                stored_sidecar = json.loads((task_dir / "automatic_filename_asr.json").read_text(encoding="utf-8"))
+                self.assertTrue(stored_sidecar["historyDeleted"])
+                self.assertFalse(stored_sidecar["historySynced"])
+
+                # In-memory tombstones disappear when the API process restarts;
+                # the durable sidecar marker must still prevent resurrection.
+                deleted_subtasks.clear()
+                response = api_server._submit_automatic_filename_asr(
+                    task_id,
+                    api_server.AsrEvalRequest(model=api_server.AUTO_FILENAME_ASR_MODEL, language="auto"),
+                )
+
+            self.assertEqual(json.loads(response.body.decode("utf-8"))["status"], "deleted")
+            stored_result = json.loads((task_dir / "result.json").read_text(encoding="utf-8"))
+            stored_status = json.loads((task_dir / "status.json").read_text(encoding="utf-8"))
+            self.assertFalse(stored_result.get("asrResults"))
+            self.assertEqual(stored_status.get("asrTasks", []), [])
+            self.assertFalse((task_dir / "asr_result.json").exists())
+            self.assertFalse((task_dir / "asr_results").exists())
+
+    def test_automatic_medium_publish_tombstone_does_not_claim_history_synced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp) / "tasks"
+            task_root.mkdir()
+            task_id = "task_auto_history_publish_tombstone"
+            task_dir = task_root / task_id
+            task_dir.mkdir()
+            (task_dir / "result.json").write_text(json.dumps(minimal_result(task_id), ensure_ascii=False), encoding="utf-8")
+            (task_dir / "status.json").write_text(
+                json.dumps({"taskId": task_id, "status": "completed", "progress": 1, "stage": "report_generation"}),
+                encoding="utf-8",
+            )
+            completed = automatic_medium_result(task_id)
+            completed["status"] = "completed"
+            (task_dir / "automatic_filename_asr.json").write_text(json.dumps(completed, ensure_ascii=False), encoding="utf-8")
+
+            deleted_subtasks: set[str] = set()
+
+            def tombstone_before_publish(_: str, __: str | None) -> dict[str, str]:
+                api_server.mark_subtask_deleted(task_id, api_server.AUTO_FILENAME_ASR_SUB_ID)
+                return {
+                    "filename": "record_this_is_the……competition.wav",
+                    "protectedFilename": "record_this_is_the……competition_protected.wav",
+                    "status": "available",
+                }
+
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "DELETED_TASK_DIR", Path(tmp) / "deleted"),
+                mock.patch.object(api_server, "DELETED_SUBTASK_KEYS", deleted_subtasks),
+                mock.patch.object(api_server, "EVALUATION_COLLECTION_DELETIONS", set()),
+                mock.patch.object(api_server, "AUTOMATIC_FILENAME_ACTIVE_TASK_IDS", set()),
+                mock.patch.object(api_server, "_apply_task_display_filenames", side_effect=tombstone_before_publish),
+            ):
+                response = api_server._submit_automatic_filename_asr(
+                    task_id,
+                    api_server.AsrEvalRequest(model=api_server.AUTO_FILENAME_ASR_MODEL, language="auto"),
+                )
+
+            self.assertEqual(json.loads(response.body.decode("utf-8"))["status"], "completed")
+            stored_sidecar = json.loads((task_dir / "automatic_filename_asr.json").read_text(encoding="utf-8"))
+            stored_result = json.loads((task_dir / "result.json").read_text(encoding="utf-8"))
+            self.assertFalse(stored_sidecar["historySynced"])
+            self.assertFalse(stored_result.get("asrResults"))
+            self.assertFalse((task_dir / "asr_result.json").exists())
+            self.assertFalse((task_dir / "asr_results").exists())
+
+    def test_failed_automatic_medium_stays_private_and_keeps_fallback_display_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp) / "tasks"
+            task_root.mkdir()
+            task_id = "task_auto_history_failed"
+            task_dir = task_root / task_id
+            task_dir.mkdir()
+            result = minimal_result(task_id)
+            original_stored = "record_ed8a1de8-cd02-4b93-9550-cf063f089764.wav"
+            protected_stored = "record_ed8a1de8-cd02-4b93-9550-cf063f089764_protected.wav"
+            result["audio"]["original"]["filename"] = original_stored  # type: ignore[index]
+            result["audio"]["protected"]["filename"] = protected_stored  # type: ignore[index]
+            (task_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            protection_status = {
+                "taskId": task_id,
+                "status": "completed",
+                "progress": 1,
+                "stage": "report_generation",
+                "message": "保护任务已完成",
+            }
+            (task_dir / "status.json").write_text(json.dumps(protection_status, ensure_ascii=False), encoding="utf-8")
+
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "DELETED_TASK_DIR", Path(tmp) / "deleted"),
+                mock.patch.object(api_server, "DELETED_TASK_IDS", set()),
+                mock.patch.object(api_server, "DELETED_SUBTASK_KEYS", set()),
+                mock.patch.object(api_server, "EVALUATION_COLLECTION_DELETIONS", set()),
+                mock.patch.object(api_server, "AUTOMATIC_FILENAME_ACTIVE_TASK_IDS", set()),
+                mock.patch.object(api_server, "TASK_CANCEL_EVENTS", {}),
+                mock.patch.object(api_server, "TASK_THREADS", {}),
+                mock.patch.object(api_server, "TASK_PROCESSES", {}),
+                mock.patch.object(api_server.threading, "Thread", InlineThread),
+                mock.patch.object(
+                    api_server,
+                    "create_automatic_filename_asr",
+                    return_value=automatic_medium_result(task_id, status="unavailable", error="OOM"),
+                ),
+            ):
+                api_server._submit_automatic_filename_asr(
+                    task_id,
+                    api_server.AsrEvalRequest(model=api_server.AUTO_FILENAME_ASR_MODEL, language="auto"),
+                )
+
+            stored_result = json.loads((task_dir / "result.json").read_text(encoding="utf-8"))
+            stored_status = json.loads((task_dir / "status.json").read_text(encoding="utf-8"))
+            automatic_sidecar = json.loads((task_dir / "automatic_filename_asr.json").read_text(encoding="utf-8"))
+            self.assertFalse(stored_result.get("asrResults"))
+            self.assertEqual(stored_status.get("asrTasks", []), [])
+            self.assertNotIn("asrTask", stored_status)
+            self.assertFalse((task_dir / "asr_result.json").exists())
+            self.assertFalse((task_dir / "asr_results").exists())
+            self.assertEqual(stored_status["automaticFilenameAsr"]["status"], "failed")
+            self.assertEqual(stored_status["automaticFilenameAsr"]["displayFilename"], "record_audio.wav")
+            self.assertEqual(automatic_sidecar["status"], "failed")
+            self.assertEqual(automatic_sidecar["error"]["code"], "AUTOMATIC_FILENAME_ASR_FAILED")
+            self.assertEqual(stored_result["displayFilename"], "record_audio.wav")
+            self.assertEqual(stored_result["displayProtectedFilename"], "record_audio_protected.wav")
+            self.assertEqual(stored_result["audio"]["original"]["filename"], original_stored)
+            self.assertEqual(stored_result["audio"]["protected"]["filename"], protected_stored)
+            for field, expected in protection_status.items():
+                self.assertEqual(stored_status[field], expected, field)
+
+    def test_deleting_asr_history_cancels_queued_automatic_medium_and_blocks_late_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp) / "tasks"
+            task_root.mkdir()
+            task_id = "task_auto_history_delete_race"
+            task_dir = task_root / task_id
+            original_dir = task_dir / "original"
+            protected_dir = task_dir / "protected"
+            original_dir.mkdir(parents=True)
+            protected_dir.mkdir()
+            (original_dir / "original.wav").write_bytes(b"original")
+            (protected_dir / "protected.wav").write_bytes(b"protected")
+
+            result = minimal_result(task_id)
+            result.update({
+                "progress": 1,
+                "stage": "report_generation",
+                "message": "保护任务已完成",
+                "error": None,
+                "displayFilename": "record_saved_name.wav",
+                "displayProtectedFilename": "record_saved_name_protected.wav",
+            })
+            result["audio"]["original"].update({  # type: ignore[index]
+                "filename": "original.wav",
+                "displayFilename": "record_saved_name.wav",
+            })
+            result["audio"]["protected"].update({  # type: ignore[index]
+                "filename": "protected.wav",
+                "displayFilename": "record_saved_name_protected.wav",
+            })
+            (task_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            protection_status = {
+                "taskId": task_id,
+                "status": "completed",
+                "progress": 1,
+                "stage": "report_generation",
+                "message": "保护任务已完成",
+                "elapsedSec": 1,
+                "error": None,
+                "displayFilename": "record_saved_name.wav",
+                "displayProtectedFilename": "record_saved_name_protected.wav",
+            }
+            (task_dir / "status.json").write_text(json.dumps(protection_status, ensure_ascii=False), encoding="utf-8")
+            naming_sidecar = {
+                "taskId": task_id,
+                "status": "queued",
+                "displayFilename": "record_saved_name.wav",
+                "displayProtectedFilename": "record_saved_name_protected.wav",
+                "createdAt": "2026-08-13T00:00:00+00:00",
+            }
+            naming_sidecar_path = task_dir / "automatic_filename_asr.json"
+            naming_sidecar_path.write_text(json.dumps(naming_sidecar, ensure_ascii=False), encoding="utf-8")
+
+            runtime_id = f"{task_id}:{api_server.AUTO_FILENAME_ASR_SUB_ID}"
+            HoldingThread.starts = 0
+            HoldingThread.instances.clear()
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "DELETED_TASK_DIR", Path(tmp) / "deleted"),
+                mock.patch.object(api_server, "DELETED_TASK_IDS", set()),
+                mock.patch.object(api_server, "DELETED_SUBTASK_KEYS", set()),
+                mock.patch.object(api_server, "EVALUATION_COLLECTION_DELETIONS", set()),
+                mock.patch.object(api_server, "AUTOMATIC_FILENAME_ACTIVE_TASK_IDS", set()),
+                mock.patch.object(api_server, "TASK_CANCEL_EVENTS", {}),
+                mock.patch.object(api_server, "TASK_THREADS", {}),
+                mock.patch.object(api_server, "TASK_PROCESSES", {}),
+                mock.patch.object(api_server.threading, "Thread", HoldingThread),
+                mock.patch.object(api_server, "create_automatic_filename_asr") as evaluator,
+            ):
+                response = api_server._submit_automatic_filename_asr(
+                    task_id,
+                    api_server.AsrEvalRequest(model=api_server.AUTO_FILENAME_ASR_MODEL, language="auto"),
+                )
+                self.assertEqual(json.loads(response.body.decode("utf-8"))["status"], "queued")
+                queued_status = api_server.read_task_status(task_id)
+                self.assertEqual(
+                    [item["asrSubId"] for item in queued_status["asrTasks"]],
+                    [api_server.AUTO_FILENAME_ASR_SUB_ID],
+                )
+                self.assertIn(runtime_id, api_server.TASK_CANCEL_EVENTS)
+                self.assertIn(runtime_id, api_server.TASK_THREADS)
+                cancel_event = api_server.TASK_CANCEL_EVENTS[runtime_id]
+                worker = api_server.TASK_THREADS[runtime_id]
+
+                deleted = api_server.delete_asr_evals(task_id)
+
+                self.assertTrue(cancel_event.is_set())
+                self.assertEqual(deleted["deletedSubtaskIds"], [api_server.AUTO_FILENAME_ASR_SUB_ID])
+                self.assertEqual(deleted["cancelledCount"], 1)
+                self.assertNotIn(runtime_id, api_server.TASK_CANCEL_EVENTS)
+                self.assertNotIn(runtime_id, api_server.TASK_THREADS)
+                self.assertEqual(worker.join_calls, 1)
+
+                worker.run_late()
+                evaluator.assert_not_called()
+                self.assertNotIn(task_id, api_server.AUTOMATIC_FILENAME_ACTIVE_TASK_IDS)
+
+            stored_result = json.loads((task_dir / "result.json").read_text(encoding="utf-8"))
+            stored_status = json.loads((task_dir / "status.json").read_text(encoding="utf-8"))
+            stored_naming_sidecar = json.loads(naming_sidecar_path.read_text(encoding="utf-8"))
+            self.assertTrue(task_dir.exists())
+            self.assertTrue((original_dir / "original.wav").exists())
+            self.assertTrue((protected_dir / "protected.wav").exists())
+            self.assertFalse(stored_result.get("asrResults"))
+            self.assertEqual(stored_status.get("asrTasks", []), [])
+            self.assertNotIn("asrTask", stored_status)
+            self.assertFalse((task_dir / "asr_result.json").exists())
+            self.assertFalse((task_dir / "asr_results").exists())
+            self.assertEqual(
+                {key: stored_naming_sidecar.get(key) for key in naming_sidecar},
+                naming_sidecar,
+            )
+            self.assertTrue(stored_naming_sidecar["historyDeleted"])
+            self.assertFalse(stored_naming_sidecar["historySynced"])
+            self.assertEqual(stored_result["displayFilename"], "record_saved_name.wav")
+            self.assertEqual(stored_result["displayProtectedFilename"], "record_saved_name_protected.wav")
+            self.assertEqual(stored_status["displayFilename"], "record_saved_name.wav")
+            self.assertEqual(stored_status["displayProtectedFilename"], "record_saved_name_protected.wav")
+            for field in ("status", "progress", "stage", "message", "elapsedSec", "error"):
+                self.assertEqual(stored_status[field], protection_status[field], field)
+
+    def test_deleting_asr_history_while_automatic_medium_is_running_blocks_real_thread_late_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp) / "tasks"
+            task_root.mkdir()
+            task_id = "task_auto_history_real_thread_delete_race"
+            task_dir = task_root / task_id
+            original_dir = task_dir / "original"
+            protected_dir = task_dir / "protected"
+            original_dir.mkdir(parents=True)
+            protected_dir.mkdir()
+            (original_dir / "original.wav").write_bytes(b"original")
+            (protected_dir / "protected.wav").write_bytes(b"protected")
+
+            result = minimal_result(task_id)
+            result.update({
+                "progress": 1,
+                "stage": "report_generation",
+                "message": "保护任务已完成",
+                "error": None,
+                "displayFilename": "record_saved_name.wav",
+                "displayProtectedFilename": "record_saved_name_protected.wav",
+                "displayFilenameStatus": "available",
+            })
+            result["audio"]["original"].update({  # type: ignore[index]
+                "filename": "original.wav",
+                "displayFilename": "record_saved_name.wav",
+            })
+            result["audio"]["protected"].update({  # type: ignore[index]
+                "filename": "protected.wav",
+                "displayFilename": "record_saved_name_protected.wav",
+            })
+            (task_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            protection_status = {
+                "taskId": task_id,
+                "status": "completed",
+                "progress": 1,
+                "stage": "report_generation",
+                "message": "保护任务已完成",
+                "elapsedSec": 1,
+                "error": None,
+                "displayFilename": "record_saved_name.wav",
+                "displayProtectedFilename": "record_saved_name_protected.wav",
+            }
+            (task_dir / "status.json").write_text(json.dumps(protection_status, ensure_ascii=False), encoding="utf-8")
+
+            evaluator_entered = threading.Event()
+            release_evaluator = threading.Event()
+            evaluator_calls: list[str] = []
+            deletion_results: list[dict[str, object]] = []
+            deletion_errors: list[BaseException] = []
+            runtime_id = f"{task_id}:{api_server.AUTO_FILENAME_ASR_SUB_ID}"
+            worker: threading.Thread | None = None
+            deletion_thread: threading.Thread | None = None
+
+            def blocking_evaluator(received_task_id: str, **_: object) -> dict[str, object]:
+                evaluator_calls.append(received_task_id)
+                evaluator_entered.set()
+                if not release_evaluator.wait(timeout=10):
+                    raise TimeoutError("test did not release automatic Medium evaluator")
+                return automatic_medium_result(received_task_id)
+
+            def delete_history() -> None:
+                try:
+                    deletion_results.append(api_server.delete_asr_evals(task_id))
+                except BaseException as exc:
+                    deletion_errors.append(exc)
+
+            try:
+                with (
+                    mock.patch.object(api_server, "TASK_DIR", task_root),
+                    mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                    mock.patch.object(api_server, "DELETED_TASK_DIR", Path(tmp) / "deleted"),
+                    mock.patch.object(api_server, "DELETED_TASK_IDS", set()),
+                    mock.patch.object(api_server, "DELETED_SUBTASK_KEYS", set()),
+                    mock.patch.object(api_server, "EVALUATION_COLLECTION_DELETIONS", set()),
+                    mock.patch.object(api_server, "AUTOMATIC_FILENAME_ACTIVE_TASK_IDS", set()),
+                    mock.patch.object(api_server, "TASK_CANCEL_EVENTS", {}),
+                    mock.patch.object(api_server, "TASK_THREADS", {}),
+                    mock.patch.object(api_server, "TASK_PROCESSES", {}),
+                    mock.patch.object(api_server, "create_automatic_filename_asr", side_effect=blocking_evaluator),
+                ):
+                    response = api_server._submit_automatic_filename_asr(
+                        task_id,
+                        api_server.AsrEvalRequest(model=api_server.AUTO_FILENAME_ASR_MODEL, language="auto"),
+                    )
+                    self.assertEqual(json.loads(response.body.decode("utf-8"))["status"], "queued")
+                    self.assertTrue(evaluator_entered.wait(timeout=5), "automatic Medium evaluator did not start")
+                    self.assertIn(runtime_id, api_server.TASK_CANCEL_EVENTS)
+                    self.assertIn(runtime_id, api_server.TASK_THREADS)
+                    cancel_event = api_server.TASK_CANCEL_EVENTS[runtime_id]
+                    worker = api_server.TASK_THREADS[runtime_id]
+
+                    deletion_thread = threading.Thread(target=delete_history, name="delete-auto-medium-history")
+                    deletion_thread.start()
+                    self.assertTrue(cancel_event.wait(timeout=5), "ASR history deletion did not signal cancellation")
+                    release_evaluator.set()
+                    deletion_thread.join(timeout=10)
+                    self.assertFalse(deletion_thread.is_alive(), "ASR history deletion did not finish")
+                    worker.join(timeout=5)
+                    self.assertFalse(worker.is_alive(), "automatic Medium worker did not stop after cancellation")
+
+                    self.assertFalse(deletion_errors)
+                    self.assertEqual(len(deletion_results), 1)
+                    self.assertEqual(
+                        deletion_results[0]["deletedSubtaskIds"],
+                        [api_server.AUTO_FILENAME_ASR_SUB_ID],
+                    )
+                    self.assertEqual(deletion_results[0]["cancelledCount"], 1)
+                    self.assertNotIn(runtime_id, api_server.TASK_CANCEL_EVENTS)
+                    self.assertNotIn(runtime_id, api_server.TASK_THREADS)
+                    self.assertNotIn(task_id, api_server.AUTOMATIC_FILENAME_ACTIVE_TASK_IDS)
+            finally:
+                release_evaluator.set()
+                if deletion_thread is not None and deletion_thread.is_alive():
+                    deletion_thread.join(timeout=20)
+                if worker is not None and worker.is_alive():
+                    worker.join(timeout=20)
+
+            self.assertEqual(evaluator_calls, [task_id])
+            stored_result = json.loads((task_dir / "result.json").read_text(encoding="utf-8"))
+            stored_status = json.loads((task_dir / "status.json").read_text(encoding="utf-8"))
+            stored_sidecar = json.loads((task_dir / "automatic_filename_asr.json").read_text(encoding="utf-8"))
+            self.assertTrue(task_dir.exists())
+            self.assertTrue((original_dir / "original.wav").exists())
+            self.assertTrue((protected_dir / "protected.wav").exists())
+            self.assertFalse(stored_result.get("asrResults"))
+            self.assertEqual(stored_status.get("asrTasks", []), [])
+            self.assertNotIn("asrTask", stored_status)
+            self.assertFalse((task_dir / "asr_result.json").exists())
+            self.assertFalse((task_dir / "asr_results").exists())
+            self.assertTrue(stored_sidecar["historyDeleted"])
+            self.assertFalse(stored_sidecar["historySynced"])
+            self.assertEqual(stored_sidecar["historyAsrSubId"], api_server.AUTO_FILENAME_ASR_SUB_ID)
+            self.assertEqual(stored_result["displayFilename"], "record_saved_name.wav")
+            self.assertEqual(stored_result["displayProtectedFilename"], "record_saved_name_protected.wav")
+            self.assertEqual(stored_status["displayFilename"], "record_saved_name.wav")
+            self.assertEqual(stored_status["displayProtectedFilename"], "record_saved_name_protected.wav")
+            for field in ("status", "progress", "stage", "message", "elapsedSec", "error"):
+                self.assertEqual(stored_status[field], protection_status[field], field)
+
+    def test_download_uses_display_name_while_reading_stored_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp)
+            task_id = "task_download_name"
+            protected_dir = task_root / task_id / "protected"
+            protected_dir.mkdir(parents=True)
+            stored_name = "record_ed8a1de8-cd02-4b93-9550-cf063f089764_protected.wav"
+            (protected_dir / stored_name).write_bytes(b"wav")
+            result = minimal_result(task_id)
+            result["audio"]["protected"].update({  # type: ignore[index]
+                "filename": stored_name,
+                "displayFilename": "record_this_is_the……competition_protected.wav",
+            })
+            (task_root / task_id / "result.json").write_text(json.dumps(result), encoding="utf-8")
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+            ):
+                response = api_server.download_protected_audio(task_id)
+            self.assertEqual(Path(response.path).name, stored_name)
+            disposition = response.headers.get("content-disposition") or ""
+            self.assertIn("filename*=UTF-8''record_this_is_the", disposition)
+            self.assertIn("%E2%80%A6%E2%80%A6competition_protected.wav", disposition)
+
+    def test_download_hides_internal_uuid_before_display_name_is_generated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp)
+            task_id = "task_download_fallback"
+            protected_dir = task_root / task_id / "protected"
+            protected_dir.mkdir(parents=True)
+            stored_name = "record_ed8a1de8-cd02-4b93-9550-cf063f089764_protected.wav"
+            (protected_dir / stored_name).write_bytes(b"wav")
+            result = minimal_result(task_id)
+            result["audio"]["protected"]["filename"] = stored_name  # type: ignore[index]
+            (task_root / task_id / "result.json").write_text(json.dumps(result), encoding="utf-8")
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+            ):
+                response = api_server.download_protected_audio(task_id)
+
+            self.assertEqual(Path(response.path).name, stored_name)
+            disposition = response.headers.get("content-disposition") or ""
+            self.assertIn("filename*=UTF-8''record_audio_protected.wav", disposition)
+            self.assertNotIn("ed8a1de8", disposition)
+
+    def test_artifact_download_uses_display_name_but_keeps_stored_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp)
+            task_id = "task_artifact_name"
+            stored_name = "record_ed8a1de8-cd02-4b93-9550-cf063f089764.wav"
+            original_dir = task_root / task_id / "original"
+            original_dir.mkdir(parents=True)
+            (original_dir / stored_name).write_bytes(b"wav")
+            result = minimal_result(task_id)
+            result["audio"]["original"].update({  # type: ignore[index]
+                "filename": stored_name,
+                "displayFilename": "record_this_is_the……competition.wav",
+            })
+            (task_root / task_id / "result.json").write_text(json.dumps(result), encoding="utf-8")
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+            ):
+                response = api_server.artifact_file(task_id, "original", stored_name)
+            self.assertEqual(Path(response.path).name, stored_name)
+            self.assertIn("%E2%80%A6%E2%80%A6competition.wav", response.headers.get("content-disposition") or "")
+
+    def test_automatic_filename_submission_is_atomic_and_starts_one_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp)
+            task_id = "task_atomic_auto_name"
+            task_dir = task_root / task_id
+            task_dir.mkdir(parents=True)
+            (task_dir / "result.json").write_text(json.dumps(minimal_result(task_id)), encoding="utf-8")
+
+            real_thread = threading.Thread
+            barrier = threading.Barrier(3)
+            responses: list[object] = []
+            errors: list[BaseException] = []
+
+            def submit() -> None:
+                try:
+                    barrier.wait(timeout=5)
+                    responses.append(api_server._submit_automatic_filename_asr(
+                        task_id,
+                        api_server.AsrEvalRequest(model=api_server.AUTO_FILENAME_ASR_MODEL, language="auto"),
+                    ))
+                except BaseException as exc:
+                    errors.append(exc)
+
+            submit_threads = [real_thread(target=submit) for _ in range(2)]
+            runtime_id = f"{task_id}:{api_server.AUTO_FILENAME_ASR_SUB_ID}"
+            HoldingThread.starts = 0
+            HoldingThread.instances.clear()
+            with (
+                mock.patch.object(api_server, "TASK_DIR", task_root),
+                mock.patch.object(result_adapter, "TASK_DIR", task_root),
+                mock.patch.object(api_server, "TASK_CANCEL_EVENTS", {}),
+                mock.patch.object(api_server, "TASK_THREADS", {}),
+                mock.patch.object(api_server, "TASK_PROCESSES", {}),
+                mock.patch.object(api_server.threading, "Thread", HoldingThread),
+                mock.patch.object(api_server, "write_automatic_asr_status", return_value={}),
+            ):
+                api_server.AUTOMATIC_FILENAME_ACTIVE_TASK_IDS.discard(task_id)
+                for thread in submit_threads:
+                    thread.start()
+                barrier.wait(timeout=5)
+                for thread in submit_threads:
+                    thread.join(timeout=5)
+                    self.assertFalse(thread.is_alive())
+                self.assertFalse(errors)
+                self.assertIn(runtime_id, api_server.TASK_THREADS)
+                api_server.AUTOMATIC_FILENAME_ACTIVE_TASK_IDS.discard(task_id)
+                api_server.cleanup_task_runtime(task_id, runtime_id=runtime_id)
+            self.assertEqual(HoldingThread.starts, 1)
+            statuses = [json.loads(response.body.decode("utf-8"))["status"] for response in responses]  # type: ignore[attr-defined]
+            self.assertCountEqual(statuses, ["queued", "running"])
+
     def test_positive_env_int_uses_positive_values_and_falls_back_safely(self) -> None:
         name = "SEME2E_TEST_POSITIVE_ENV_INT"
         with mock.patch.dict(api_server.os.environ, {name: "3"}):

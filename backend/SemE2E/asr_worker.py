@@ -107,7 +107,11 @@ def execute(request: dict[str, Any]) -> dict[str, Any]:
     return {
         "ok": True,
         "model": str(getattr(transcriber, "model_name", model)),
-        "language": str(getattr(transcriber, "language", requested_language)),
+        "language": str(
+            getattr(transcriber, "detected_language", None)
+            or getattr(transcriber, "language", None)
+            or requested_language
+        ),
         "requestedLanguage": requested_language,
         "device": str(getattr(transcriber, "device", requested_device)),
         "requestedDevice": requested_device,

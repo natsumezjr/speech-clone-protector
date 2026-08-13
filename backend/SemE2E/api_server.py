@@ -11,8 +11,10 @@ import traceback
 import shutil
 import threading
 import time
+import unicodedata
 import uuid
 import zipfile
+from urllib.parse import quote
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -35,6 +37,7 @@ from result_adapter import (
     ProtectGenerationError,
     _worker_gpu_candidates,
     acquire_gpu_slot,
+    create_automatic_filename_asr,
     create_asr_eval,
     create_clone_voice,
     clone_worker_capacity_snapshot,
@@ -49,11 +52,17 @@ from result_adapter import (
     refresh_result_scores,
     release_gpu_slot,
     runtime_config,
+    save_result,
     update_result_safely,
     supported_tts_languages,
     tts_model_requires_reference_text,
 )
 from result_schema import utc_now_iso
+
+try:
+    import jieba
+except Exception:  # pragma: no cover - deterministic fallback remains below
+    jieba = None
 
 ensure_runtime_dirs()
 
@@ -83,6 +92,11 @@ SUBTASK_TOMBSTONE_LOCK = threading.RLock()
 TASK_STATUS_WRITE_LOCK = threading.RLock()
 EVALUATION_COORDINATION_LOCK = threading.RLock()
 EVALUATION_COLLECTION_DELETIONS: set[str] = set()
+DISPLAY_FILENAME_LOCK = threading.RLock()
+AUTOMATIC_FILENAME_SUBMISSION_LOCK = threading.RLock()
+AUTOMATIC_FILENAME_ACTIVE_TASK_IDS: set[str] = set()
+AUTO_FILENAME_ASR_MODEL = "openai-whisper:medium"
+AUTO_FILENAME_ASR_SUB_ID = "asr_auto_medium"
 
 
 def _positive_env_int(name: str, default: int) -> int:
@@ -669,6 +683,109 @@ def write_task_status(task_id: str, **updates: Any) -> dict[str, Any]:
         _sync_evaluation_batch(current, updates, "asr", now)
         _sync_evaluation_batch(current, updates, "clone", now)
         _save_task_status_document(task_id, current, path, now)
+        return current
+
+
+def write_automatic_asr_status(task_id: str, **updates: Any) -> dict[str, Any]:
+    """Persist automatic filename ASR without replacing protection status."""
+
+    if is_task_deleted(task_id):
+        raise TaskCancelledError(f"task deleted: {task_id}")
+    with TASK_STATUS_WRITE_LOCK:
+        path = task_status_path(task_id)
+        current = _load_task_status_document(path)
+        previous = current.get("automaticFilenameAsr")
+        automatic_asr = dict(previous) if isinstance(previous, dict) else {}
+        automatic_asr.update(updates)
+        automatic_asr.setdefault("createdAt", utc_now_iso())
+        automatic_asr["updatedAt"] = utc_now_iso()
+        current["automaticFilenameAsr"] = automatic_asr
+        _save_task_status_document(task_id, current, path, utc_now_iso())
+        return current
+
+
+def _automatic_filename_asr_sidecar_path(task_id: str) -> Path:
+    return TASK_DIR / task_id / "automatic_filename_asr.json"
+
+
+def _load_automatic_filename_asr_sidecar(task_id: str) -> dict[str, Any]:
+    path = _automatic_filename_asr_sidecar_path(task_id)
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _update_automatic_filename_asr_sidecar(task_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+    """Merge an automatic-ASR sidecar atomically without losing deletion markers."""
+
+    with AUTOMATIC_FILENAME_SUBMISSION_LOCK:
+        task_dir = TASK_DIR / task_id
+        if is_task_deleted(task_id) or not task_dir.exists():
+            raise TaskCancelledError(f"task deleted: {task_id}")
+        path = _automatic_filename_asr_sidecar_path(task_id)
+        current = _load_automatic_filename_asr_sidecar(task_id)
+        history_deleted = current.get("historyDeleted") is True
+        history_deleted_at = current.get("historyDeletedAt")
+        current.update(updates)
+        if history_deleted:
+            current["historyDeleted"] = True
+            current["historySynced"] = False
+            if history_deleted_at:
+                current["historyDeletedAt"] = history_deleted_at
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return current
+
+
+def _mark_automatic_filename_asr_history_deleted(task_id: str) -> None:
+    """Persist the user's ASR-history deletion across process restarts."""
+
+    try:
+        _update_automatic_filename_asr_sidecar(
+            task_id,
+            {
+                "taskId": task_id,
+                "historyAsrSubId": AUTO_FILENAME_ASR_SUB_ID,
+                "historySynced": False,
+                "historyDeleted": True,
+                "historyDeletedAt": utc_now_iso(),
+            },
+        )
+    except TaskCancelledError:
+        pass
+
+
+def write_asr_history_status(task_id: str, asr_sub_id: str, **updates: Any) -> dict[str, Any]:
+    """Persist an ASR history snapshot without replacing protection status."""
+
+    if is_task_deleted(task_id):
+        raise TaskCancelledError(f"task deleted: {task_id}")
+    if is_subtask_deleted(task_id, asr_sub_id):
+        return _load_task_status_document(task_status_path(task_id))
+    with TASK_STATUS_WRITE_LOCK:
+        if is_subtask_deleted(task_id, asr_sub_id):
+            return _load_task_status_document(task_status_path(task_id))
+        path = task_status_path(task_id)
+        current = _load_task_status_document(path)
+        merged_updates = {**updates, "asrSubId": asr_sub_id, "stage": "asr_eval"}
+        _merge_subtask_status(
+            current,
+            merged_updates,
+            stage="asr_eval",
+            key="asrTask",
+            history_key="asrTasks",
+            result_key="asrResult",
+            sub_id_key="asrSubId",
+        )
+        _save_task_status_document(task_id, current, path, utc_now_iso())
         return current
 
 
@@ -1610,10 +1727,13 @@ def _coalesce(*values: Any) -> Any:
 def _frontend_audio(meta: dict[str, Any] | None, fallback_name: str) -> dict[str, Any]:
     meta = meta or {}
     stored_filename = str(meta.get("filename") or fallback_name)
-    display_filename = re.sub(r"^(?:file_[0-9a-fA-F]{12}_)+", "", stored_filename) or stored_filename
+    display_filename = str(meta.get("displayFilename") or "").strip()
+    if not display_filename:
+        display_filename = _strip_internal_audio_name(stored_filename, fallback_name)
     return {
         "fileId": meta.get("fileId"),
         "filename": display_filename,
+        "displayFilename": display_filename,
         "durationSec": meta.get("durationSec") or meta.get("duration"),
         "duration": meta.get("duration") or meta.get("durationSec"),
         "sampleRate": meta.get("sampleRate"),
@@ -1627,6 +1747,202 @@ def _frontend_audio(meta: dict[str, Any] | None, fallback_name: str) -> dict[str
         "uploadedAt": meta.get("uploadedAt"),
         "fingerprint": meta.get("fingerprint"),
     }
+
+
+def _frontend_details_result(result: dict[str, Any]) -> dict[str, Any]:
+    payload = json.loads(json.dumps(result, ensure_ascii=False))
+    audio = payload.get("audio") if isinstance(payload, dict) else None
+    if isinstance(audio, dict):
+        for field, fallback in (("original", "record_audio.wav"), ("protected", "record_audio_protected.wav")):
+            meta = audio.get(field)
+            if isinstance(meta, dict):
+                frontend_meta = _frontend_audio(meta, fallback)
+                meta["filename"] = frontend_meta["filename"]
+                meta["displayFilename"] = frontend_meta["filename"]
+        original = audio.get("original") if isinstance(audio.get("original"), dict) else {}
+        protected = audio.get("protected") if isinstance(audio.get("protected"), dict) else {}
+        payload["displayFilename"] = original.get("displayFilename") or original.get("filename")
+        payload["displayProtectedFilename"] = protected.get("displayFilename") or protected.get("filename")
+    return payload
+
+
+def _strip_internal_audio_name(value: str | None, fallback: str) -> str:
+    name = Path(str(value or "")).name
+    name = re.sub(r"^(?:file_[0-9a-fA-F]{12}_)+", "", name)
+    uuid_recording = re.fullmatch(
+        r"(?i)(?:record(?:ing)?|audio|file)[_-][0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?:_protected)?\.[a-z0-9]+",
+        name,
+    )
+    internal_id_name = re.fullmatch(r"(?i)(?:record(?:ing)?|audio|file)[_-][0-9a-f]{12,}(?:_protected)?\.[a-z0-9]+", name)
+    return fallback if not name or uuid_recording or internal_id_name else name
+
+
+def _filename_tokens(transcript: str) -> list[str]:
+    normalized = unicodedata.normalize("NFKC", str(transcript or "")).strip()
+    if not normalized:
+        return []
+    if re.search(r"[\u3400-\u9fff]", normalized):
+        if jieba is not None:
+            words = [
+                item.strip()
+                for item in jieba.lcut(normalized, cut_all=False)
+                if re.search(r"[\u3400-\u9fffA-Za-z0-9]", item)
+            ]
+            if words:
+                return words
+        # The runtime normally includes jieba. This fallback still produces a
+        # short, safe name if the optional tokenizer cannot be imported.
+        return re.findall(r"[\u3400-\u9fff]{1,4}|[A-Za-z0-9]+", normalized)
+    return re.findall(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*", normalized)
+
+
+def _transcript_filename_stem(transcript: str) -> str | None:
+    tokens = _filename_tokens(transcript)
+    if not tokens:
+        return None
+    leading = tokens[:3]
+    trailing = tokens[-1] if len(tokens) > 3 and tokens[-1] != leading[-1] else None
+
+    def safe_token(token: str) -> str:
+        token = unicodedata.normalize("NFKC", token).lower()
+        token = re.sub(r"[^0-9a-z\u3400-\u9fff]+", "_", token).strip("_")
+        return token
+
+    # Bound each word instead of truncating the completed filename. This keeps
+    # all three leading words and, when present, the final word visible even
+    # for unusually long ASR tokens.
+    safe_parts = [safe_token(token)[:20] for token in leading]
+    safe_parts = [token for token in safe_parts if token]
+    if not safe_parts:
+        return None
+    stem = "record_" + "_".join(safe_parts)
+    safe_trailing = safe_token(trailing)[:20] if trailing else ""
+    if safe_trailing:
+        stem += f"……{safe_trailing}"
+    return stem.rstrip("_.") or None
+
+
+def _used_display_filenames(*, exclude_task_id: str | None = None) -> set[str]:
+    names: set[str] = set()
+    for task_dir in TASK_DIR.iterdir():
+        if not task_dir.is_dir() or task_dir.name == exclude_task_id:
+            continue
+        result_path = task_dir / "result.json"
+        if not result_path.exists():
+            continue
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        audio = result.get("audio") if isinstance(result, dict) else None
+        if not isinstance(audio, dict):
+            continue
+        for field in ("original", "protected"):
+            meta = audio.get(field)
+            if isinstance(meta, dict):
+                value = str(meta.get("displayFilename") or "").strip().casefold()
+                if value:
+                    names.add(value)
+    return names
+
+
+def _unique_display_filenames(task_id: str, stem: str) -> tuple[str, str]:
+    with DISPLAY_FILENAME_LOCK:
+        used = _used_display_filenames(exclude_task_id=task_id)
+        suffix = 0
+        while True:
+            numbered_stem = stem if suffix == 0 else f"{stem}（{suffix}）"
+            original = f"{numbered_stem}.wav"
+            protected = f"{numbered_stem}_protected.wav"
+            if original.casefold() not in used and protected.casefold() not in used:
+                return original, protected
+            suffix += 1
+
+
+def _apply_task_display_filenames(task_id: str, transcript: str | None) -> dict[str, str]:
+    task_dir = TASK_DIR / task_id
+    result_path = task_dir / "result.json"
+    if not result_path.exists():
+        raise FileNotFoundError(f"task {task_id} result.json is missing")
+    with DISPLAY_FILENAME_LOCK:
+        result = load_result(task_id)
+        audio = result.setdefault("audio", {})
+        original = audio.setdefault("original", {})
+        protected = audio.setdefault("protected", {})
+        stem = _transcript_filename_stem(str(transcript or ""))
+        existing_original = str(original.get("displayFilename") or result.get("displayFilename") or "").strip()
+        existing_protected = str(protected.get("displayFilename") or result.get("displayProtectedFilename") or "").strip()
+        existing_status = str(result.get("displayFilenameStatus") or "").strip()
+        # A missing transcript is a fallback request, never a request to undo
+        # an already generated name. Likewise, replaying a completed automatic
+        # ASR result must keep the exact persisted name (including its suffix)
+        # instead of reallocating it after another task is removed.
+        if existing_original and existing_protected and (not stem or existing_status != "fallback"):
+            original_display = existing_original
+            protected_display = existing_protected
+            naming_status = existing_status or ("available" if stem else "fallback")
+        else:
+            naming_status = "available" if stem else "fallback"
+            if not stem:
+                fallback_name = _strip_internal_audio_name(original.get("filename"), "record_audio.wav")
+                stem = Path(fallback_name).stem or "record_audio"
+            original_display, protected_display = _unique_display_filenames(task_id, stem)
+            original["displayFilename"] = original_display
+            protected["displayFilename"] = protected_display
+            result["displayFilename"] = original_display
+            result["displayProtectedFilename"] = protected_display
+            result["displayFilenameStatus"] = naming_status
+            result["updatedAt"] = utc_now_iso()
+            save_result(task_dir, result)
+    try:
+        write_task_status(
+            task_id,
+            filename=original_display,
+            protectedFilename=protected_display,
+            displayFilename=original_display,
+            displayProtectedFilename=protected_display,
+            displayFilenameStatus=naming_status,
+        )
+    except TaskCancelledError:
+        pass
+    return {"filename": original_display, "protectedFilename": protected_display, "status": naming_status}
+
+
+def _current_or_fallback_display_filenames(task_id: str) -> dict[str, str]:
+    try:
+        result = load_result(task_id)
+    except Exception:
+        result = {}
+    audio = result.get("audio") if isinstance(result, dict) else None
+    original = audio.get("original") if isinstance(audio, dict) and isinstance(audio.get("original"), dict) else {}
+    protected = audio.get("protected") if isinstance(audio, dict) and isinstance(audio.get("protected"), dict) else {}
+    original_display = str(original.get("displayFilename") or result.get("displayFilename") or "").strip()
+    protected_display = str(protected.get("displayFilename") or result.get("displayProtectedFilename") or "").strip()
+    if original_display and protected_display:
+        return {
+            "filename": original_display,
+            "protectedFilename": protected_display,
+            "status": str(result.get("displayFilenameStatus") or "fallback"),
+        }
+    return _apply_task_display_filenames(task_id, None)
+
+
+def _download_content_disposition(filename: str) -> str:
+    ascii_name = re.sub(r"[^A-Za-z0-9._-]+", "_", filename).strip("_") or "audio.wav"
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"
+
+
+def _artifact_display_filename(task_id: str, kind: str, stored_filename: str) -> str:
+    if kind not in {"original", "protected"}:
+        return _strip_internal_audio_name(stored_filename, stored_filename)
+    try:
+        result = load_result(task_id)
+    except Exception:
+        result = {}
+    meta = ((result.get("audio") or {}).get(kind) or {}) if isinstance(result, dict) else {}
+    display = str(meta.get("displayFilename") or "").strip() if isinstance(meta, dict) else ""
+    fallback = "record_audio_protected.wav" if kind == "protected" else "record_audio.wav"
+    return display or _strip_internal_audio_name(stored_filename, fallback)
 
 
 def _frontend_clone(clone: dict[str, Any]) -> dict[str, Any]:
@@ -1773,11 +2089,14 @@ def frontend_result(result: dict[str, Any]) -> dict[str, Any]:
         if has_clone_metric or detail_clone_eval.get("status") not in {None, "unavailable", "not_run"}:
             clone_eval = detail_clone_eval
 
-    original_audio = _frontend_audio(audio.get("original"), "original.wav")
-    protected_audio = _frontend_audio(audio.get("protected"), "protected.wav")
+    original_audio = _frontend_audio(audio.get("original"), "record_audio.wav")
+    protected_audio = _frontend_audio(audio.get("protected"), "record_audio_protected.wav")
 
     return {
         "taskId": result.get("taskId"),
+        "displayFilename": original_audio["filename"],
+        "displayProtectedFilename": protected_audio["filename"],
+        "displayFilenameStatus": result.get("displayFilenameStatus"),
         "status": result.get("status", "completed"),
         "mode": result.get("mode", "joint"),
         "dataMode": result.get("dataMode", "backend"),
@@ -2386,6 +2705,7 @@ def _watch_protect_process(
     cancel_event: Any,
     gpu_slot: threading.BoundedSemaphore | None = None,
 ) -> None:
+    start_automatic_asr = False
     try:
         process.join()
         if not is_task_deleted(task_id):
@@ -2409,6 +2729,11 @@ def _watch_protect_process(
                         "details": {"exitCode": exit_code},
                     },
                 )
+            elif process.exitcode == 0 and status.get("status") in {"completed", "success"}:
+                # Protection runs in a short-lived child process. Schedule the
+                # automatic filename ASR from this long-lived API process only
+                # after the child has persisted a successful result.
+                start_automatic_asr = True
     finally:
         if gpu_slot is not None:
             release_gpu_slot(gpu_slot)
@@ -2416,6 +2741,24 @@ def _watch_protect_process(
             PROTECT_ACTIVE_TASK_IDS.discard(task_id)
             cleanup_protect_process_runtime(task_id, process, cancel_event)
             _dispatch_protect_tasks_locked()
+    if start_automatic_asr and not is_task_deleted(task_id):
+        try:
+            _apply_task_display_filenames(task_id, None)
+        except Exception as exc:
+            write_task_log(
+                task_id,
+                {
+                    "taskId": task_id,
+                    "currentStage": "automatic_filename",
+                    "exceptionType": type(exc).__name__,
+                    "exceptionMessage": str(exc),
+                    "stackTrace": traceback.format_exc(),
+                },
+            )
+        _submit_automatic_filename_asr(
+            task_id,
+            AsrEvalRequest(model=AUTO_FILENAME_ASR_MODEL, language="auto"),
+        )
 
 
 def _start_protect_job_locked(
@@ -2679,6 +3022,7 @@ def protect_task(payload: ProtectTaskRequest) -> dict[str, Any]:
         return validation_error
     uploaded = find_uploaded_file(payload.fileId)
     task_id = new_task_id()
+    initial_display_filename = _strip_internal_audio_name(uploaded.get("filename"), "record_audio.wav")
     write_task_status(
         task_id,
         status="queued",
@@ -2686,7 +3030,9 @@ def protect_task(payload: ProtectTaskRequest) -> dict[str, Any]:
         stage="file_preprocess",
         message="任务已排入队列",
         fileId=payload.fileId,
-        filename=uploaded.get("filename"),
+        filename=initial_display_filename,
+        displayFilename=initial_display_filename,
+        displayFilenameStatus="fallback",
         mode=payload.mode,
         payload=payload.model_dump(),
         maxConcurrency=PROTECT_MAX_CONCURRENCY,
@@ -3099,8 +3445,11 @@ def list_tasks() -> list[dict[str, Any]]:
         rows.append(
             {
                 "taskId": payload.get("taskId", task_id),
-                "filename": (frontend_payload.get("originalAudio") or {}).get("filename") or (audio.get("original") or {}).get("filename") or payload.get("filename") or "-",
-                "protectedFilename": (frontend_payload.get("protectedAudio") or {}).get("filename") or (audio.get("protected") or {}).get("filename") or "-",
+                "filename": frontend_payload.get("displayFilename") or (frontend_payload.get("originalAudio") or {}).get("filename") or payload.get("displayFilename") or (audio.get("original") or {}).get("filename") or payload.get("filename") or "-",
+                "protectedFilename": frontend_payload.get("displayProtectedFilename") or (frontend_payload.get("protectedAudio") or {}).get("filename") or payload.get("displayProtectedFilename") or (audio.get("protected") or {}).get("filename") or "-",
+                "displayFilename": frontend_payload.get("displayFilename") or payload.get("displayFilename"),
+                "displayProtectedFilename": frontend_payload.get("displayProtectedFilename") or payload.get("displayProtectedFilename"),
+                "displayFilenameStatus": frontend_payload.get("displayFilenameStatus") or payload.get("displayFilenameStatus"),
                 "mode": request_payload.get("mode") or payload.get("mode", "joint"),
                 "targetMode": target_mode,
                 "parameters": {
@@ -3268,7 +3617,7 @@ def task_details(task_id: str) -> JSONResponse:
         )
     result = ensure_protection_dnsmos(task_id, load_result(task_id))
     refresh_result_scores(result)
-    return JSONResponse(result)
+    return JSONResponse(_frontend_details_result(result))
 
 
 @app.post("/api/tasks/{task_id}/evaluation-batches")
@@ -3432,6 +3781,282 @@ def create_evaluation_batch(task_id: str, payload: EvaluationBatchRequest) -> JS
 
 @app.post("/api/tasks/{task_id}/asr-eval")
 def run_asr_eval(task_id: str, payload: AsrEvalRequest) -> JSONResponse:
+    return _submit_asr_eval(task_id, payload)
+
+
+def _submit_automatic_filename_asr(task_id: str, payload: AsrEvalRequest) -> JSONResponse:
+    """Start the automatic Medium transcription used for naming and ASR history."""
+
+    task_result_path(task_id)
+    sidecar_path = _automatic_filename_asr_sidecar_path(task_id)
+    asr_sub_id = AUTO_FILENAME_ASR_SUB_ID
+    runtime_id = _subtask_runtime_key(task_id, asr_sub_id)
+    cancel_event = threading.Event()
+    started_at = time.time()
+
+    def persist_asr_history(result: dict[str, Any]) -> bool:
+        """Mirror a successful automatic Medium result into normal ASR history once."""
+
+        history_result = {
+            **result,
+            "taskId": task_id,
+            "asrSubId": asr_sub_id,
+            "automatic": True,
+            "automaticFilename": True,
+        }
+        history_result.setdefault("createdAt", utc_now_iso())
+
+        def update(current: dict[str, Any]) -> bool:
+            values = [item for item in current.get("asrResults", []) if isinstance(item, dict)]
+            existing = next((item for item in values if str(item.get("asrSubId") or "") == asr_sub_id), None)
+            if existing == history_result:
+                return False
+            current["asrResults"] = [item for item in values if str(item.get("asrSubId") or "") != asr_sub_id] + [history_result]
+            details = current.setdefault("details", {})
+            asr_payload = history_result.get("asr") if isinstance(history_result.get("asr"), dict) else {}
+            details["asr"] = asr_payload
+            primary = current.setdefault("summary", {}).setdefault("primaryMetrics", {})
+            for key in ("wer", "cer"):
+                if asr_payload.get(key) is not None:
+                    primary[key] = asr_payload.get(key)
+            metric_sources = current.setdefault("summary", {}).setdefault("metricSources", {})
+            metric_sources.update(asr_payload.get("_metricSources") or {})
+            current["asrModel"] = asr_payload.get("model") or payload.model
+            current["updatedAt"] = utc_now_iso()
+            refresh_result_scores(current)
+            return True
+
+        serialized = json.dumps(history_result, ensure_ascii=False, indent=2)
+
+        def write_json_atomic(path: Path) -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                temporary.write_text(serialized, encoding="utf-8")
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+        def write_sidecars() -> None:
+            write_json_atomic(TASK_DIR / task_id / "asr_results" / f"{asr_sub_id}.json")
+            write_json_atomic(TASK_DIR / task_id / "asr_result.json")
+
+        with EVALUATION_COORDINATION_LOCK:
+            _begin_evaluation_submission(task_id, "asr")
+            with SUBTASK_TOMBSTONE_LOCK:
+                if is_subtask_deleted(task_id, asr_sub_id):
+                    return False
+                update_result_safely(task_id, update)
+                write_sidecars()
+            write_asr_history_status(
+                task_id,
+                asr_sub_id,
+                status="completed",
+                progress=1,
+                message="Whisper Medium 自动标注已完成",
+                error=None,
+                asrRequest={"model": payload.model, "language": payload.language or "auto", "automatic": True},
+                asrResult=history_result,
+                elapsedSec=round(time.time() - started_at, 3),
+            )
+            return True
+
+    with AUTOMATIC_FILENAME_SUBMISSION_LOCK:
+        if sidecar_path.exists():
+            persisted = _load_automatic_filename_asr_sidecar(task_id)
+            if persisted.get("historyDeleted") is True or is_subtask_deleted(task_id, asr_sub_id):
+                return JSONResponse(
+                    {
+                        "taskId": task_id,
+                        "asrSubId": asr_sub_id,
+                        "status": "deleted",
+                        "automaticFilename": True,
+                    }
+                )
+            if isinstance(persisted, dict) and persisted.get("status") == "completed":
+                asr = persisted.get("asr") if isinstance(persisted.get("asr"), dict) else {}
+                original_text = str(asr.get("originalText") or asr.get("cleanTranscription") or "").strip()
+                display_names = _apply_task_display_filenames(task_id, original_text)
+                if persisted.get("historySynced") is not True:
+                    history_synced = persist_asr_history(persisted)
+                    persisted["historyAsrSubId"] = asr_sub_id
+                    persisted["historySynced"] = history_synced
+                    if history_synced:
+                        persisted["historySyncedAt"] = utc_now_iso()
+                    _update_automatic_filename_asr_sidecar(task_id, persisted)
+                return JSONResponse(
+                    {
+                        "taskId": task_id,
+                        "asrSubId": asr_sub_id,
+                        "status": "completed",
+                        "automaticFilename": True,
+                        "displayFilename": display_names["filename"],
+                    }
+                )
+        if task_id in AUTOMATIC_FILENAME_ACTIVE_TASK_IDS:
+            return JSONResponse({"taskId": task_id, "asrSubId": asr_sub_id, "status": "running", "automaticFilename": True})
+        AUTOMATIC_FILENAME_ACTIVE_TASK_IDS.add(task_id)
+
+    def persist_sidecar(result: dict[str, Any]) -> None:
+        _update_automatic_filename_asr_sidecar(task_id, result)
+
+    def run_background() -> None:
+        try:
+            ensure_task_not_cancelled(task_id, cancel_event)
+            write_asr_history_status(
+                task_id,
+                asr_sub_id,
+                status="running",
+                progress=0.15,
+                message="正在执行 Whisper Medium 自动标注",
+                error=None,
+                asrRequest={"model": payload.model, "language": payload.language or "auto", "automatic": True},
+                asrResult=None,
+                elapsedSec=round(time.time() - started_at, 3),
+            )
+            write_automatic_asr_status(
+                task_id,
+                status="running",
+                progress=0.15,
+                model=payload.model,
+                language=payload.language or "auto",
+                message="正在生成便于识别的音频名称",
+                error=None,
+                elapsedSec=round(time.time() - started_at, 3),
+            )
+            result = create_automatic_filename_asr(
+                task_id,
+                model=payload.model,
+                language=payload.language or "auto",
+                cancel_event=cancel_event,
+            )
+            ensure_task_not_cancelled(task_id, cancel_event)
+            asr = result.get("asr") if isinstance(result.get("asr"), dict) else {}
+            asr_status = str(asr.get("status") or "unavailable")
+            if asr_status not in {"available", "computed", "partial"}:
+                reason = str(asr.get("error") or asr.get("reason") or "Whisper Medium 未生成转写")
+                result["status"] = "failed"
+                result["error"] = {"code": "AUTOMATIC_FILENAME_ASR_FAILED", "message": reason}
+                persist_sidecar(result)
+                display_names = _current_or_fallback_display_filenames(task_id)
+                write_automatic_asr_status(
+                    task_id,
+                    status="failed",
+                    progress=1,
+                    model=payload.model,
+                    language=payload.language or "auto",
+                    message=reason,
+                    error=result["error"],
+                    displayFilename=display_names["filename"],
+                    elapsedSec=round(time.time() - started_at, 3),
+                )
+                _remove_subtask_status(task_id, "asr", asr_sub_id)
+                return
+            original_text = str(asr.get("originalText") or asr.get("cleanTranscription") or "").strip()
+            display_names = _apply_task_display_filenames(task_id, original_text)
+            result["status"] = "completed"
+            result["displayFilename"] = display_names["filename"]
+            result["displayProtectedFilename"] = display_names["protectedFilename"]
+            history_synced = persist_asr_history(result)
+            result["historyAsrSubId"] = asr_sub_id
+            result["historySynced"] = history_synced
+            if history_synced:
+                result["historySyncedAt"] = utc_now_iso()
+            persist_sidecar(result)
+            write_automatic_asr_status(
+                task_id,
+                status="completed",
+                progress=1,
+                model=payload.model,
+                language=asr.get("language") or payload.language or "auto",
+                message="音频名称已生成",
+                error=None,
+                originalText=original_text,
+                displayFilename=display_names["filename"],
+                displayProtectedFilename=display_names["protectedFilename"],
+                elapsedSec=round(time.time() - started_at, 3),
+            )
+        except (TaskCancelledError, RuntimeError) as exc:
+            if not (isinstance(exc, RuntimeError) and str(exc) == "TASK_CANCELLED") and not isinstance(exc, TaskCancelledError):
+                raise
+            if (TASK_DIR / task_id).exists():
+                _remove_subtask_status(task_id, "asr", asr_sub_id)
+        except Exception as exc:
+            if not is_task_deleted(task_id):
+                display_names = _apply_task_display_filenames(task_id, None)
+                write_automatic_asr_status(
+                    task_id,
+                    status="failed",
+                    progress=1,
+                    model=payload.model,
+                    language=payload.language or "auto",
+                    message=str(exc),
+                    error={"code": "AUTOMATIC_FILENAME_ASR_FAILED", "message": str(exc)},
+                    displayFilename=display_names["filename"],
+                    displayProtectedFilename=display_names["protectedFilename"],
+                    elapsedSec=round(time.time() - started_at, 3),
+                )
+                write_task_log(
+                    task_id,
+                    {
+                        "taskId": task_id,
+                        "currentStage": "automatic_filename",
+                        "exceptionType": type(exc).__name__,
+                        "exceptionMessage": str(exc),
+                        "stackTrace": traceback.format_exc(),
+                    },
+                )
+                _remove_subtask_status(task_id, "asr", asr_sub_id)
+        finally:
+            cleanup_task_runtime(task_id, runtime_id=runtime_id)
+            with AUTOMATIC_FILENAME_SUBMISSION_LOCK:
+                AUTOMATIC_FILENAME_ACTIVE_TASK_IDS.discard(task_id)
+
+    try:
+        with EVALUATION_COORDINATION_LOCK:
+            _begin_evaluation_submission(task_id, "asr")
+            if is_subtask_deleted(task_id, asr_sub_id):
+                return JSONResponse(
+                    {
+                        "taskId": task_id,
+                        "asrSubId": asr_sub_id,
+                        "status": "deleted",
+                        "automaticFilename": True,
+                    }
+                )
+            write_asr_history_status(
+                task_id,
+                asr_sub_id,
+                status="queued",
+                progress=0.05,
+                message="Whisper Medium 自动标注正在排队",
+                error=None,
+                asrRequest={"model": payload.model, "language": payload.language or "auto", "automatic": True},
+                asrResult=None,
+                elapsedSec=0.0,
+            )
+            write_automatic_asr_status(
+                task_id,
+                status="queued",
+                progress=0.05,
+                model=payload.model,
+                language=payload.language or "auto",
+                message="等待生成便于识别的音频名称",
+                error=None,
+                elapsedSec=0.0,
+            )
+            thread = threading.Thread(target=run_background, name=f"automatic-filename-asr-{task_id}", daemon=True)
+            register_task_runtime(task_id, cancel_event, thread, runtime_id=runtime_id)
+            thread.start()
+    except Exception:
+        cleanup_task_runtime(task_id, runtime_id=runtime_id)
+        with AUTOMATIC_FILENAME_SUBMISSION_LOCK:
+            AUTOMATIC_FILENAME_ACTIVE_TASK_IDS.discard(task_id)
+        raise
+    return JSONResponse({"taskId": task_id, "asrSubId": asr_sub_id, "status": "queued", "automaticFilename": True})
+
+
+def _submit_asr_eval(task_id: str, payload: AsrEvalRequest) -> JSONResponse:
     req_id = request_id()
     validation_error = validate_asr_eval_config(payload, req_id, task_id)
     if validation_error is not None:
@@ -3576,14 +4201,11 @@ def run_asr_eval(task_id: str, payload: AsrEvalRequest) -> JSONResponse:
             finally:
                 cleanup_task_runtime(task_id, runtime_id=asr_runtime_id)
 
-        write_task_status(
-            task_id,
+        write_asr_status(
             status="queued",
             progress=0.05,
-            stage="asr_eval",
             message="后端已排入 ASR 评估队列",
             error=None,
-            asrSubId=asr_sub_id,
             asrRequest=payload.model_dump(),
             asrResult=None,
             elapsedSec=0.0,
@@ -3668,6 +4290,8 @@ def _delete_evaluation_subtask(task_id: str, batch_type: str, subtask_id: str) -
                 )
         mark_subtask_deleted(task_id, normalized_subtask_id)
         cancel_event, thread, process = request_subtask_cancel(task_id, normalized_subtask_id)
+    if batch_type == "asr" and normalized_subtask_id == AUTO_FILENAME_ASR_SUB_ID:
+        _mark_automatic_filename_asr_history_deleted(task_id)
     process_pid = process.pid if process is not None else None
     if process is not None and process.is_alive():
         process.terminate()
@@ -3741,8 +4365,13 @@ def _delete_evaluation_collection(task_id: str, batch_type: str) -> dict[str, An
         delete_subtask_ids = all_subtask_ids - keep_subtask_ids
         for subtask_id in delete_subtask_ids:
             mark_subtask_deleted(task_id, subtask_id)
+        block_automatic_asr_history = batch_type == "asr" and AUTO_FILENAME_ASR_SUB_ID not in keep_subtask_ids
+        if block_automatic_asr_history:
+            mark_subtask_deleted(task_id, AUTO_FILENAME_ASR_SUB_ID)
 
     try:
+        if block_automatic_asr_history:
+            _mark_automatic_filename_asr_history_deleted(task_id)
         cancelled_count = _cancel_evaluation_runtimes(task_id, delete_subtask_ids)
         status_ids, _ = _retain_evaluation_status(task_id, batch_type, keep_subtask_ids)
         result_ids, updated_result = _retain_evaluation_results(task_id, batch_type, keep_subtask_ids)
@@ -3776,11 +4405,21 @@ def delete_clone_voices(task_id: str) -> dict[str, Any]:
 @app.get("/api/tasks/{task_id}/download/protected-audio")
 def download_protected_audio(task_id: str) -> FileResponse:
     result = load_result(task_id)
-    filename = ((result.get("audio") or {}).get("protected") or {}).get("filename")
+    protected_meta = ((result.get("audio") or {}).get("protected") or {})
+    filename = protected_meta.get("filename")
+    display_filename = (
+        protected_meta.get("displayFilename")
+        or result.get("displayProtectedFilename")
+        or _artifact_display_filename(task_id, "protected", str(filename or ""))
+    )
     path = TASK_DIR / task_id / "protected" / filename if filename else None
     if not path or not path.exists():
         raise HTTPException(status_code=404, detail="protected audio not found")
-    return FileResponse(path, media_type="audio/wav", filename=filename)
+    return FileResponse(
+        path,
+        media_type="audio/wav",
+        headers={"Content-Disposition": _download_content_disposition(str(display_filename))},
+    )
 
 
 @app.get("/api/tasks/{task_id}/download")
@@ -4030,7 +4669,12 @@ def artifact_file(task_id: str, kind: str, filename: str) -> FileResponse:
     if not path.exists():
         raise HTTPException(status_code=404, detail="artifact not found")
     media_type = "audio/wav" if path.suffix.lower() == ".wav" else "application/octet-stream"
-    return FileResponse(path, media_type=media_type, filename=filename)
+    display_filename = _artifact_display_filename(task_id, kind, filename)
+    return FileResponse(
+        path,
+        media_type=media_type,
+        headers={"Content-Disposition": _download_content_disposition(display_filename)},
+    )
 
 
 @app.get("/api/artifacts/{task_id}/clones/{clone_id}/{filename}")

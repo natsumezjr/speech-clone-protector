@@ -1,6 +1,8 @@
 export interface AudioFileMeta {
   fileId?: string
   filename: string
+  displayFilename?: string
+  storedFilename?: string
   durationSec?: number
   duration?: number
   sampleRate?: number
