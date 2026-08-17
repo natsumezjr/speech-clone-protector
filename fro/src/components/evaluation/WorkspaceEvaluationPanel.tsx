@@ -15,6 +15,7 @@ import { defaultCloneTextForLanguage, translateDefaultCloneText } from '@/utils/
 
 type ModelOption = RuntimeModelOption & { label: string }
 type CloneDialogMode = 'single' | 'all'
+type CloneAnnotationSource = 'manual' | 'asr'
 
 const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))
 
@@ -210,6 +211,7 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
   const [asrRunning, setAsrRunning] = useState(false)
   const [cloneRunning, setCloneRunning] = useState(false)
   const [cloneDialogMode, setCloneDialogMode] = useState<CloneDialogMode | null>(null)
+  const [cloneAnnotationSource, setCloneAnnotationSource] = useState<CloneAnnotationSource>('manual')
   const [cloneText, setCloneText] = useState(() => defaultCloneTextForLanguage('en'))
   const cloneTextUsesDefaultRef = useRef(true)
   const [manualAnnotation, setManualAnnotation] = useState('')
@@ -298,7 +300,7 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
     }
     const models = dialogMode === 'single' && effectiveClone ? [effectiveClone] : availableClone
     const referenceTextModels = models.filter(cloneModelRequiresReferenceText)
-    if (dialogMode === 'single' && referenceTextModels.length && !manualAnnotation.trim()) {
+    if (dialogMode === 'single' && referenceTextModels.length && cloneAnnotationSource === 'manual' && !manualAnnotation.trim()) {
       pushToast({ kind: 'error', title: '请填写人工标注', description: `${shortModelName(referenceTextModels[0].value)} 需要参考音频对应文本。` })
       return
     }
@@ -308,7 +310,8 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
       setCloneDialogMode(null)
       let annotation: AsrEvalResponse | null = null
       let annotationError: string | null = null
-      if (dialogMode === 'all' && referenceTextModels.length) {
+      const useAsrAnnotation = referenceTextModels.length > 0 && (dialogMode === 'all' || cloneAnnotationSource === 'asr')
+      if (useAsrAnnotation) {
         try {
           const annotationModel = defaultAsrModel(asrModels, cloneLanguage)
           if (!annotationModel) throw new Error(`${cloneLanguage === 'zh-cn' ? '中文' : '英文'}自动标注模型当前不可用。`)
@@ -327,6 +330,7 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
           if (!evaluatedAsr || !originalText || !protectedText) throw new Error('自动标注未同时生成原始音频和保护音频文本。')
         } catch (error) {
           annotationError = error instanceof Error ? error.message : '自动标注未完成。'
+          if (dialogMode === 'single') throw new Error(`ASR 自动标注失败：${annotationError}`, { cause: error })
         }
       }
 
@@ -336,14 +340,16 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
         const base = { text: cloneText.trim(), model: model.value, language: cloneLanguage, speed: 1 }
         if (cloneModelRequiresReferenceText(model)) {
           let requestCount = 0
-          if (manualAnnotation.trim()) {
+          const includeManual = dialogMode === 'all' || cloneAnnotationSource === 'manual'
+          const includeAsr = dialogMode === 'all' || cloneAnnotationSource === 'asr'
+          if (includeManual && manualAnnotation.trim()) {
             requests.push(normalizeCloneReferenceTextRequest({ ...base, annotationSource: 'manual', speakerPrompt: manualAnnotation.trim() }, model))
             requestCount += 1
           }
           const evaluatedAsr = annotation?.asr
           const originalText = evaluatedAsr?.originalText?.trim() ?? ''
           const protectedText = evaluatedAsr?.protectedText?.trim() ?? ''
-          if (dialogMode === 'all' && annotation?.asrSubId && evaluatedAsr && originalText && protectedText) {
+          if (includeAsr && annotation?.asrSubId && evaluatedAsr && originalText && protectedText) {
             requests.push(normalizeCloneReferenceTextRequest({ ...base, annotationSource: 'asr', annotationAsrSubId: annotation.asrSubId, annotationAsrModel: evaluatedAsr.model, annotationCreatedAt: annotation.createdAt ?? undefined, speakerPrompt: originalText, originalSpeakerPrompt: originalText, protectedSpeakerPrompt: protectedText }, model))
             requestCount += 1
           }
@@ -435,7 +441,21 @@ export function WorkspaceEvaluationPanel({ runtimeConfig, modelTypes }: { runtim
               <button type="button" onClick={() => setCloneDialogMode(null)} className="grid h-9 w-9 place-items-center rounded-full border border-cyan-300/14 text-slate-300 hover:text-white" aria-label="关闭"><X className="h-4 w-4" /></button>
             </div>
             <label className="mt-5 block text-sm font-black text-slate-200">目标测试文本<textarea value={cloneText} onChange={(event) => { cloneTextUsesDefaultRef.current = false; setCloneText(event.target.value) }} className="mt-2 min-h-24 w-full resize-none rounded-[7px] border border-cyan-300/14 bg-slate-950/70 p-3 text-sm leading-6 text-slate-100 outline-none focus:border-cyan-300" /></label>
-            {dialogNeedsReferenceText ? <label className="mt-4 block text-sm font-black text-slate-200">人工标注{cloneDialogMode === 'single' ? '（必填）' : '（仅需要参考文本的模型使用）'}<textarea value={manualAnnotation} onChange={(event) => setManualAnnotation(event.target.value)} placeholder="输入人工核对后的原始音频文本" className="mt-2 min-h-20 w-full resize-none rounded-[7px] border border-violet-300/16 bg-slate-950/70 p-3 text-sm leading-6 text-slate-100 outline-none focus:border-violet-300" /></label> : null}
+            {dialogNeedsReferenceText && cloneDialogMode === 'single' ? (
+              <div className="mt-4">
+                <p className="text-sm font-black text-slate-200">参考音频标注来源</p>
+                <div className="mt-2 grid grid-cols-2 gap-2 rounded-[8px] border border-violet-300/12 bg-slate-950/38 p-1.5">
+                  <button type="button" onClick={() => setCloneAnnotationSource('manual')} className={cn('h-10 rounded-[6px] text-sm font-black transition', cloneAnnotationSource === 'manual' ? 'bg-emerald-600 text-white shadow-[0_0_16px_rgba(5,150,105,0.18)]' : 'text-emerald-300 hover:bg-emerald-500/12 hover:text-emerald-200')}>人工标注</button>
+                  <button type="button" onClick={() => setCloneAnnotationSource('asr')} className={cn('h-10 rounded-[6px] text-sm font-black transition', cloneAnnotationSource === 'asr' ? 'bg-violet-600 text-white shadow-[0_0_16px_rgba(124,58,237,0.2)]' : 'text-violet-300 hover:bg-violet-500/12 hover:text-violet-200')}>ASR 自动标注</button>
+                </div>
+              </div>
+            ) : null}
+            {dialogNeedsReferenceText && (cloneDialogMode === 'all' || cloneAnnotationSource === 'manual') ? <label className="mt-4 block text-sm font-black text-slate-200">人工标注{cloneDialogMode === 'single' ? '（必填）' : '（仅需要参考文本的模型使用）'}<textarea value={manualAnnotation} onChange={(event) => setManualAnnotation(event.target.value)} placeholder="输入人工核对后的原始音频文本" className="mt-2 min-h-20 w-full resize-none rounded-[7px] border border-violet-300/16 bg-slate-950/70 p-3 text-sm leading-6 text-slate-100 outline-none focus:border-violet-300" /></label> : null}
+            {dialogNeedsReferenceText && cloneDialogMode === 'single' && cloneAnnotationSource === 'asr' ? (
+              <div className="mt-4 rounded-[8px] border border-cyan-300/14 bg-cyan-400/[0.06] px-4 py-3 text-xs leading-6 text-slate-300">
+                系统会优先复用当前保护任务最近的同语言 ASR 标注；若没有可用结果，将自动运行默认 ASR 模型，并分别使用原始音频和保护音频的转写结果进行克隆。
+              </div>
+            ) : null}
             <div className="mt-5 flex justify-end gap-3">
               <button type="button" onClick={() => setCloneDialogMode(null)} className="h-10 rounded-[7px] border border-cyan-300/14 px-4 text-sm font-bold text-slate-300">取消</button>
               <button type="button" onClick={() => void queueCloneRequests()} className="cyan-button inline-flex h-10 items-center gap-2 rounded-[7px] px-4 text-sm font-black"><TestTube2 className="h-4 w-4" />开始测试</button>

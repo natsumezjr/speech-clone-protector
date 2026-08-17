@@ -2273,6 +2273,13 @@ GPT_SOVITS_PRETRAINED_DIR = Path(
 GPT_SOVITS_PRETRAINED_S1 = GPT_SOVITS_PRETRAINED_DIR / "s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt"
 GPT_SOVITS_PRETRAINED_S2G = GPT_SOVITS_PRETRAINED_DIR / "s2G2333k.pth"
 GPT_SOVITS_PRETRAINED_S2D = GPT_SOVITS_PRETRAINED_DIR / "s2D2333k.pth"
+GPT_SOVITS_FAST_LANGDETECT_MODEL = Path(
+    os.getenv(
+        "SEME2E_GPT_SOVITS_FAST_LANGDETECT_MODEL",
+        GPT_SOVITS_REPO_DIR / "GPT_SoVITS" / "pretrained_models" / "fast_langdetect" / "lid.176.bin",
+    )
+)
+GPT_SOVITS_FAST_LANGDETECT_MIN_BYTES = 100_000_000
 
 
 def _tts_cache_dir() -> Path:
@@ -2342,10 +2349,17 @@ def _gpt_sovits_model_status() -> tuple[str, str | None, str]:
         GPT_SOVITS_PRETRAINED_S1,
         GPT_SOVITS_PRETRAINED_S2G,
         GPT_SOVITS_PRETRAINED_S2D,
+        GPT_SOVITS_FAST_LANGDETECT_MODEL,
     ]
     missing = [str(path) for path in required_paths if not path.exists()]
     if missing:
         return "unavailable", "missing isolated GPT-SoVITS training runtime: " + ", ".join(missing), str(GPT_SOVITS_RUNTIME_DIR)
+    if not GPT_SOVITS_FAST_LANGDETECT_MODEL.is_file() or GPT_SOVITS_FAST_LANGDETECT_MODEL.stat().st_size < GPT_SOVITS_FAST_LANGDETECT_MIN_BYTES:
+        return (
+            "unavailable",
+            "incomplete GPT-SoVITS language detection model: " + str(GPT_SOVITS_FAST_LANGDETECT_MODEL),
+            str(GPT_SOVITS_RUNTIME_DIR),
+        )
     return "available", None, str(GPT_SOVITS_RUNTIME_DIR)
 
 

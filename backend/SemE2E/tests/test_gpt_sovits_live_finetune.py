@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
@@ -14,6 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import gpt_sovits_live_finetune as live_finetune
+import gpt_sovits_worker
 
 
 def write_silent_wav(path: Path, *, duration_sec: float, sample_rate: int = 1000) -> None:
@@ -26,6 +28,16 @@ def write_silent_wav(path: Path, *, duration_sec: float, sample_rate: int = 1000
 
 
 class GptSovitsLiveFineTuneTests(unittest.TestCase):
+    def test_inference_configures_absolute_bert_path_before_runtime_imports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bert = Path(tmp) / "bert"
+            bert.mkdir()
+            args = SimpleNamespace(bert=bert)
+            with mock.patch.dict(os.environ, {}, clear=True):
+                gpt_sovits_worker._configure_runtime_environment(args)
+                self.assertEqual(os.environ["bert_path"], str(bert.resolve()))
+                self.assertEqual(os.environ["bert_pretrained_dir"], str(bert.resolve()))
+
     def test_reference_language_is_detected_independently_from_target_language(self) -> None:
         self.assertEqual(
             live_finetune._reference_language("Ladies and gentlemen, good afternoon.", fallback="zh-cn"),

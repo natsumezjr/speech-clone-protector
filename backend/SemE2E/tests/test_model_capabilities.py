@@ -151,7 +151,8 @@ class ModelCapabilitiesTest(unittest.TestCase):
             pretrained_s1 = root / "pretrained" / "s1.ckpt"
             pretrained_s2g = root / "pretrained" / "s2G.pth"
             pretrained_s2d = root / "pretrained" / "s2D.pth"
-            for path in (python_path, tts_path, worker, infer_worker, pretrained_s1, pretrained_s2g, pretrained_s2d):
+            language_model = root / "runtime" / "repo" / "GPT_SoVITS" / "pretrained_models" / "fast_langdetect" / "lid.176.bin"
+            for path in (python_path, tts_path, worker, infer_worker, pretrained_s1, pretrained_s2g, pretrained_s2d, language_model):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("ready", encoding="utf-8")
             cnhubert.mkdir(parents=True)
@@ -168,12 +169,24 @@ class ModelCapabilitiesTest(unittest.TestCase):
                 GPT_SOVITS_PRETRAINED_S1=pretrained_s1,
                 GPT_SOVITS_PRETRAINED_S2G=pretrained_s2g,
                 GPT_SOVITS_PRETRAINED_S2D=pretrained_s2d,
+                GPT_SOVITS_FAST_LANGDETECT_MODEL=language_model,
+                GPT_SOVITS_FAST_LANGDETECT_MIN_BYTES=1,
             ):
                 status, reason, local_path = result_adapter._gpt_sovits_model_status()
 
             self.assertEqual(status, "available")
             self.assertIsNone(reason)
             self.assertEqual(local_path, str(root / "runtime"))
+
+    def test_gpt_sovits_status_rejects_missing_language_detection_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            missing_model = root / "fast_langdetect" / "lid.176.bin"
+            with patch.object(result_adapter, "GPT_SOVITS_FAST_LANGDETECT_MODEL", missing_model):
+                status, reason, _ = result_adapter._gpt_sovits_model_status()
+
+            self.assertEqual(status, "unavailable")
+            self.assertIn(str(missing_model), reason or "")
 
     def test_asr_and_independent_evaluator_are_declared(self) -> None:
         asr_values = {option["value"] for option in self.config["models"]["asr"]}
@@ -356,6 +369,9 @@ class ModelCapabilitiesTest(unittest.TestCase):
         self.assertIn('export SEME2E_COSYVOICE_CUDA_VISIBLE_DEVICES="$gpu_pool"', script)
         self.assertIn('export SEME2E_GPT_SOVITS_GPU_POOL="$gpu_pool"', script)
         self.assertIn("export SEME2E_PROTECT_GPU_SHARED_WITH_WORKERS=1", script)
+        self.assertIn("Ensure-RemoteGptSovitsDependencies", script)
+        self.assertIn("GPT_SoVITS/pretrained_models/fast_langdetect", script)
+        self.assertIn("01810bc59c6a3d2b79c79e6336612f65", script)
         self.assertNotIn('export CUDA_VISIBLE_DEVICES="$protect_gpu"', script)
         self.assertNotIn("export SEME2E_TOKENIZER_DEVICE='cuda:0'", script)
         self.assertNotIn("export SEME2E_SEMANTIC_ENCODER_DEVICE='cuda:0'", script)

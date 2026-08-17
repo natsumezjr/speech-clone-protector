@@ -304,9 +304,15 @@ html[data-theme='light'] .fine-tune-select {
 }
 
 html[data-theme='light'] .manual-annotation-chip {
-  color: #065f46;
-  border-color: rgba(5, 150, 105, 0.34);
-  background-color: rgba(16, 185, 129, 0.16);
+  color: #064e3b;
+  border-color: rgba(4, 120, 87, 0.55);
+  background-color: rgba(5, 150, 105, 0.26);
+}
+
+html[data-theme='light'] .asr-annotation-chip {
+  color: #4c1d95;
+  border-color: rgba(109, 40, 217, 0.55);
+  background-color: rgba(124, 58, 237, 0.24);
 }
 
 html[data-theme='light'] [class*='border-cyan-300'],

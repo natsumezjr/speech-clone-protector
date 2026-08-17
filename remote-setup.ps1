@@ -126,6 +126,53 @@ function Get-RemoteHealth {
   return $health
 }
 
+function Ensure-RemoteGptSovitsDependencies {
+  param([string]$SshPath)
+
+  $dependencyScript = @'
+set -eu
+project="$HOME/VoiceSheild"
+repo="$project/.runtime/gpt-sovits/GPT-SoVITS"
+model_dir="$repo/GPT_SoVITS/pretrained_models/fast_langdetect"
+model="$model_dir/lid.176.bin"
+model_url="https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin"
+expected_md5="01810bc59c6a3d2b79c79e6336612f65"
+
+[ "$(readlink -f "$project")" = "$HOME/VoiceSheild" ]
+[ -d "$repo/GPT_SoVITS" ]
+
+model_is_valid() {
+  [ -f "$model" ] && [ "$(md5sum "$model" | awk '{print $1}')" = "$expected_md5" ]
+}
+
+if model_is_valid; then
+  printf 'GPT-SoVITS fast-langdetect model is ready: %s\n' "$model"
+  exit 0
+fi
+
+mkdir -p "$model_dir"
+temporary_model="$model.part.$$"
+trap 'rm -f "$temporary_model"' EXIT HUP INT TERM
+printf 'Downloading GPT-SoVITS fast-langdetect model to %s\n' "$model"
+curl --fail --location --retry 3 --retry-all-errors --connect-timeout 20 --max-time 1800 \
+  --output "$temporary_model" "$model_url"
+actual_md5="$(md5sum "$temporary_model" | awk '{print $1}')"
+if [ "$actual_md5" != "$expected_md5" ]; then
+  printf 'GPT-SoVITS fast-langdetect checksum mismatch: expected %s, got %s\n' "$expected_md5" "$actual_md5" >&2
+  exit 31
+fi
+mv -f "$temporary_model" "$model"
+trap - EXIT HUP INT TERM
+printf 'GPT-SoVITS fast-langdetect model installed: %s\n' "$model"
+exit 0
+'@
+
+  ($dependencyScript.Replace("`r", "") + "`n") | & $SshPath -o BatchMode=yes -o ConnectTimeout=15 $SshHost bash -s
+  if ($LASTEXITCODE -ne 0) {
+    throw "Remote GPT-SoVITS dependency setup failed."
+  }
+}
+
 function Start-RemoteBackend {
   param([string]$SshPath)
 
@@ -456,6 +503,9 @@ if (-not $SkipFrontend) {
 
 Write-Host "Stopping local project frontend/backend/tunnel processes..."
 Stop-LocalProjectProcesses
+
+Write-Host "Checking remote GPT-SoVITS language detection dependency..."
+Ensure-RemoteGptSovitsDependencies -SshPath $ssh
 
 Write-Host "Checking remote API through ssh $SshHost..."
 $remoteHealth = if ($ForceRemoteRestart) { $null } else { Get-RemoteHealth -SshPath $ssh }

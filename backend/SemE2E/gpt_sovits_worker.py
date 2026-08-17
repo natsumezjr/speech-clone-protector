@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
 
 
 INFER_RESULT_MARKER = "VOICE_SHIELD_GPT_SOVITS_INFER_RESULT="
+
+
+def _configure_runtime_environment(args: argparse.Namespace) -> None:
+    """Configure paths consumed while GPT-SoVITS modules are imported."""
+    bert_path = str(args.bert.resolve())
+    os.environ["bert_path"] = bert_path
+    os.environ["bert_pretrained_dir"] = bert_path
 
 
 def _language(value: str, *, fallback: str = "en") -> str:
@@ -23,6 +31,7 @@ def infer(args: argparse.Namespace) -> dict[str, object]:
     repo = args.repo.resolve()
     sys.path.insert(0, str(repo / "GPT_SoVITS"))
     sys.path.insert(0, str(repo))
+    _configure_runtime_environment(args)
 
     import numpy as np
     import soundfile as sf

@@ -2384,7 +2384,7 @@ function CloneHistoryPanel({ history, batches, modelOptions, selectedCloneKey, o
                   </td>
                   <td className={cn('truncate px-2 py-3 text-center font-bold', failed ? 'text-rose-200' : 'text-slate-100')} title={request?.model}>{shortCloneModelName(request?.model)}</td>
                   <td className="px-2 py-3 text-center">
-                    {hasAnnotation ? <button type="button" onClick={(event) => { event.stopPropagation(); openAnnotation() }} className={cn('rounded-full border px-2 py-1 font-bold underline-offset-2 hover:underline', asrAnnotation ? 'border-violet-300/20 bg-violet-400/10 text-violet-200' : 'manual-annotation-chip border-emerald-400/30 bg-emerald-500/15 text-emerald-300')}>{annotationSourceLabel(annotationSource)}</button> : '—'}
+                    {hasAnnotation ? <button type="button" onClick={(event) => { event.stopPropagation(); openAnnotation() }} className={cn('rounded-full border px-2 py-1 font-bold underline-offset-2 hover:underline', asrAnnotation ? 'asr-annotation-chip border-violet-600/45 bg-violet-600/25 text-violet-200' : 'manual-annotation-chip border-emerald-600/45 bg-emerald-600/25 text-emerald-300')}>{annotationSourceLabel(annotationSource)}</button> : '—'}
                   </td>
                   <td className="px-2 py-2" title={item.taskStatus?.message ?? lifecycleStatusLabel(lifecycleStatus)}>
                     <div className="history-progress-track mx-auto h-1.5 max-w-[110px] overflow-hidden rounded-full bg-slate-800"><div className={cn('h-full rounded-full transition-all duration-300', tone.fill)} style={{ width: `${progressPercent}%` }} /></div>
@@ -2555,7 +2555,7 @@ function CloneVoiceModal({
               <p className="text-sm font-bold text-slate-300">参考音频标注（必填）</p>
               <div className="flex gap-2">
                 {(['manual', 'asr'] as const).map((source) => (
-                  <button key={source} type="button" onClick={() => onChange({ ...form, annotationSource: source, annotationAsrSubId: source === 'manual' ? undefined : form.annotationAsrSubId, annotationAsrModel: source === 'manual' ? undefined : form.annotationAsrModel, originalSpeakerPrompt: source === 'manual' ? undefined : form.originalSpeakerPrompt, protectedSpeakerPrompt: source === 'manual' ? undefined : form.protectedSpeakerPrompt })} className={cn('h-8 rounded-[6px] border px-3 text-xs font-black', (form.annotationSource ?? 'manual') === source ? 'border-cyan-300 bg-cyan-400/14 text-cyan-100' : 'border-cyan-300/12 text-slate-400')}>{annotationSourceLabel(source)}</button>
+                  <button key={source} type="button" onClick={() => onChange({ ...form, annotationSource: source, annotationAsrSubId: source === 'manual' ? undefined : form.annotationAsrSubId, annotationAsrModel: source === 'manual' ? undefined : form.annotationAsrModel, originalSpeakerPrompt: source === 'manual' ? undefined : form.originalSpeakerPrompt, protectedSpeakerPrompt: source === 'manual' ? undefined : form.protectedSpeakerPrompt })} className={cn('h-8 rounded-[6px] border px-3 text-xs font-black transition', (form.annotationSource ?? 'manual') === source ? (source === 'manual' ? 'border-emerald-600 bg-emerald-600 text-white' : 'border-violet-600 bg-violet-600 text-white') : (source === 'manual' ? 'border-emerald-600/25 text-emerald-300 hover:bg-emerald-500/10' : 'border-violet-600/25 text-violet-300 hover:bg-violet-500/10'))}>{annotationSourceLabel(source)}</button>
                 ))}
               </div>
             </div>
